@@ -791,16 +791,16 @@ type adapterRegisterRequest struct {
 // replyInstructionsTemplate is the Tier-1 reply instruction block gc renders
 // into the inbound-message <system-reminder> nudge in place of its generic
 // "gc slack reply-current ..." fallback, which does not exist at Tier 1
-// (hq-fh9). gc substitutes {conversation_id}, {message_ts}, {thread_ts}
-// (the inbound message's thread, falling back to the message itself), and
-// {handle}; the [bracketed segment] is dropped when no thread id is
-// available. Agents write standard Markdown — handlePostMessage converts it
-// to Slack mrkdwn on the way out.
+// (hq-fh9). gc substitutes {conversation_id}, {message_ts}, and {thread_ts}
+// (the inbound message's thread, falling back to the message itself); the
+// [bracketed segment] is dropped when no thread id is available. Agents
+// write standard Markdown — handlePostMessage converts it to Slack mrkdwn
+// on the way out. No handle prefix: the bot posts under its own Slack
+// identity, so a "**{handle}:**" prefix would be redundant (hq-dy6).
 const replyInstructionsTemplate = "To reply in Slack, run:\n" +
 	"  gc slack-mini post-message --channel {conversation_id}[ --thread-ts {thread_ts}] --text '<your reply>'\n" +
 	"Keep --thread-ts so the reply lands in the thread. Write the reply in standard Markdown " +
-	"(it is converted to Slack formatting on post) and prefix it with your agent handle in bold " +
-	"(e.g., **{handle}:** your message)."
+	"(it is converted to Slack formatting on post)."
 
 // postInbound bridges a verified Slack mention into gc.
 func postInbound(ctx context.Context, cfg config, msg externalInboundMessage) error {

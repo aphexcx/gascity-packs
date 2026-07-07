@@ -877,7 +877,7 @@ func TestRegisterAdapterSendsReplyInstructions(t *testing.T) {
 	if !strings.Contains(got.ReplyInstructions, "gc slack-mini post-message --channel {conversation_id}[ --thread-ts {thread_ts}]") {
 		t.Errorf("reply_instructions missing Tier-1 reply command: %q", got.ReplyInstructions)
 	}
-	if !strings.Contains(got.ReplyInstructions, "{handle}") {
-		t.Errorf("reply_instructions missing handle placeholder: %q", got.ReplyInstructions)
+	if strings.Contains(strings.ToLower(got.ReplyInstructions), "prefix") {
+		t.Errorf("reply_instructions must not mandate a handle prefix (hq-dy6): %q", got.ReplyInstructions)
 	}
 }
