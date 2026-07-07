@@ -5,7 +5,12 @@
 //   - Inbound: a public HTTPS receiver for the Slack Events API. Only
 //     `app_mention` is handled. Each verified mention is bridged to gc by
 //     POSTing /v0/city/{city}/extmsg/inbound, addressed to the mayor
-//     session (override with SLACK_MINI_INBOUND_TARGET).
+//     session (override with SLACK_MINI_INBOUND_TARGET). The mention is
+//     spooled to disk before the first forward attempt and the POST is
+//     retried with backoff, because Slack has already been 200-acked and
+//     will never redeliver: a dropped forward is a lost message. Exhausted
+//     retries dead-letter the spool entry for manual replay; entries left
+//     mid-retry by a crash are re-delivered at startup.
 //
 //   - Outbound: a UDS endpoint (/post-message) that posts plain text to a
 //     Slack channel via chat.postMessage using the workspace bot token.
@@ -46,6 +51,10 @@
 //	ADAPTER_PROVIDER           extmsg provider name (default "slack").
 //	SLACK_MINI_INBOUND_TARGET  Session handle inbound mentions address (default "mayor").
 //	SLACK_API_BASE             Slack web API base (default https://slack.com/api).
+//	SLACK_MINI_SPOOL_DIR       Directory for the inbound persist-and-retry spool
+//	                           (default $GC_SERVICE_STATE_ROOT/data/inbound-spool
+//	                           in proxy_process mode; unset otherwise, which
+//	                           disables spooling but keeps in-memory retries).
 package main
 
 import (
@@ -64,6 +73,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -98,6 +108,16 @@ const defaultSlackAPIBase = "https://slack.com/api"
 // pin an inbound-bridge goroutine (or block startup registration) forever.
 const gcCallTimeout = 15 * time.Second
 
+// inboundRetryDelays spaces the forward retries after a failed inbound POST
+// to gc: 5 attempts total over ~2 minutes, then dead-letter (bug hq-1q1).
+// Package-level var so tests can compress the schedule.
+var inboundRetryDelays = []time.Duration{
+	5 * time.Second,
+	15 * time.Second,
+	30 * time.Second,
+	60 * time.Second,
+}
+
 type config struct {
 	publicListen        string
 	internalListen      string
@@ -111,6 +131,7 @@ type config struct {
 	signingSecret       string
 	inboundTarget       string
 	slackAPIBase        string
+	spoolDir            string
 	registerOnStart     bool
 }
 
@@ -155,6 +176,10 @@ func main() {
 		log.Printf("registered with gc as provider=%s account=%s callback=%s/post-message",
 			cfg.provider, cfg.workspaceID, cfg.internalCallbackURL)
 	}
+
+	// Re-deliver any inbound events a previous run spooled but never
+	// confirmed forwarded (bug hq-1q1: Slack was already 200-acked).
+	replaySpool(cfg)
 
 	errCh := make(chan error, 2)
 	go func() {
@@ -222,7 +247,17 @@ func loadConfigFromEnv(getenv func(string) string) (config, error) {
 		signingSecret:   getenv("SLACK_SIGNING_SECRET"),
 		inboundTarget:   envOr("SLACK_MINI_INBOUND_TARGET", defaultInboundTarget),
 		slackAPIBase:    strings.TrimRight(envOr("SLACK_API_BASE", defaultSlackAPIBase), "/"),
+		spoolDir:        getenv("SLACK_MINI_SPOOL_DIR"),
 		registerOnStart: envOr("REGISTER_ON_START", "true") == "true",
+	}
+
+	// Default the persist-and-retry spool into the controller-provided state
+	// root (proxy_process mode). Standalone runs without an explicit
+	// SLACK_MINI_SPOOL_DIR get in-memory retries only.
+	if cfg.spoolDir == "" {
+		if stateRoot := getenv("GC_SERVICE_STATE_ROOT"); stateRoot != "" {
+			cfg.spoolDir = filepath.Join(stateRoot, "data", "inbound-spool")
+		}
 	}
 
 	// proxy_process mode: gc reaches the adapter via GC_API_BASE_URL +
@@ -343,11 +378,11 @@ func handleSlackEvents(cfg config) http.HandlerFunc {
 	}
 }
 
-// bridgeEvent decodes an app_mention and POSTs it to gc's extmsg inbound.
+// bridgeEvent decodes an app_mention and hands it to deliverInbound.
 // Non-app_mention events, bot/system messages, and empty bodies are
 // dropped — Tier 1 handles only direct human mentions. It runs in its own
-// goroutine; the gc call is bounded by gcCallTimeout so a stalled gc
-// cannot leak goroutines under sustained traffic.
+// goroutine; each gc call is bounded by gcCallTimeout and the retry
+// schedule bounds the goroutine's total lifetime to ~2 minutes.
 func bridgeEvent(cfg config, env slackEventEnvelope) {
 	if env.Type != "event_callback" || len(env.Event) == 0 {
 		return
@@ -368,6 +403,11 @@ func bridgeEvent(cfg config, env slackEventEnvelope) {
 		return
 	}
 
+	// Log receipt before the first forward attempt so a message that later
+	// fails every retry is still identifiable (and replayable from Slack).
+	log.Printf("inbound received: chan=%s user=%s ts=%s thread=%s target=%s text=%dch",
+		msg.Channel, msg.User, msg.TS, msg.ThreadTS, cfg.inboundTarget, len(text))
+
 	inbound := externalInboundMessage{
 		ProviderMessageID: msg.TS,
 		Conversation: conversationRef{
@@ -387,14 +427,134 @@ func bridgeEvent(cfg config, env slackEventEnvelope) {
 		DedupKey:         "slack-" + msg.TS,
 		ReceivedAt:       time.Now().UTC(),
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), gcCallTimeout)
-	defer cancel()
-	if err := postInbound(ctx, cfg, inbound); err != nil {
-		log.Printf("inbound POST failed: %v", err)
+	deliverInbound(cfg, inbound, spoolInbound(cfg.spoolDir, inbound))
+}
+
+// spoolInbound persists a decoded inbound event before the first forward
+// attempt, so a crash mid-retry cannot silently lose a Slack-acked message.
+// Returns the spool file path, or "" when spooling is disabled (no spool
+// dir) or the write fails — persistence is best-effort and never blocks
+// the bridge.
+func spoolInbound(spoolDir string, msg externalInboundMessage) string {
+	if spoolDir == "" {
+		return ""
+	}
+	if err := os.MkdirAll(spoolDir, 0o700); err != nil {
+		log.Printf("spool: mkdir %s: %v", spoolDir, err)
+		return ""
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		log.Printf("spool: marshal: %v", err)
+		return ""
+	}
+	name := fmt.Sprintf("%d-%s.json", time.Now().UnixNano(), sanitizeSpoolName(msg.DedupKey))
+	path := filepath.Join(spoolDir, name)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		log.Printf("spool: write %s: %v", path, err)
+		return ""
+	}
+	return path
+}
+
+// spoolNameRE matches characters unsafe in a spool filename.
+var spoolNameRE = regexp.MustCompile(`[^a-zA-Z0-9._-]+`)
+
+func sanitizeSpoolName(s string) string {
+	return spoolNameRE.ReplaceAllString(s, "_")
+}
+
+// deliverInbound forwards one inbound message to gc, retrying failures per
+// inboundRetryDelays. On success the spool entry is removed; when every
+// attempt fails the entry moves to the dead-letter directory. The final
+// failure line deliberately contains "inbound POST failed" — external
+// log-watchers (slack-nudge-bridge) key on that exact substring.
+func deliverInbound(cfg config, msg externalInboundMessage, spoolPath string) {
+	attempts := len(inboundRetryDelays) + 1
+	var lastErr error
+	for i := range attempts {
+		if i > 0 {
+			time.Sleep(inboundRetryDelays[i-1])
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), gcCallTimeout)
+		err := postInbound(ctx, cfg, msg)
+		cancel()
+		if err == nil {
+			if spoolPath != "" {
+				_ = os.Remove(spoolPath)
+			}
+			log.Printf("inbound: chan=%s user=%s ts=%s thread=%s target=%s text=%dch",
+				msg.Conversation.ConversationID, msg.Actor.ID, msg.ProviderMessageID,
+				msg.ReplyToMessageID, msg.ExplicitTarget, len(msg.Text))
+			return
+		}
+		lastErr = err
+		if i < attempts-1 {
+			log.Printf("inbound forward attempt %d/%d failed (retry in %s): %v",
+				i+1, attempts, inboundRetryDelays[i], err)
+		}
+	}
+	log.Printf("inbound POST failed after %d attempts (dead-letter=%s) chan=%s ts=%s: %v",
+		attempts, moveToDeadLetter(spoolPath), msg.Conversation.ConversationID,
+		msg.ProviderMessageID, lastErr)
+}
+
+// moveToDeadLetter quarantines an exhausted spool entry in the sibling
+// "dead" directory so it can be replayed by hand; returns the new path, or
+// "none" when spooling was disabled for this message. If the move fails the
+// entry stays in the spool, where startup replay will retry it.
+func moveToDeadLetter(spoolPath string) string {
+	if spoolPath == "" {
+		return "none"
+	}
+	deadDir := filepath.Join(filepath.Dir(spoolPath), "dead")
+	if err := os.MkdirAll(deadDir, 0o700); err != nil {
+		log.Printf("dead-letter: mkdir: %v", err)
+		return spoolPath
+	}
+	dest := filepath.Join(deadDir, filepath.Base(spoolPath))
+	if err := os.Rename(spoolPath, dest); err != nil {
+		log.Printf("dead-letter: rename: %v", err)
+		return spoolPath
+	}
+	return dest
+}
+
+// replaySpool re-delivers inbound events a previous run persisted but never
+// confirmed forwarded (crash mid-retry). Redelivery may duplicate an event
+// gc already accepted — the message DedupKey makes that safe. Dead-lettered
+// entries are NOT replayed automatically; they stay under spool/dead for
+// manual replay.
+func replaySpool(cfg config) {
+	if cfg.spoolDir == "" {
 		return
 	}
-	log.Printf("inbound: chan=%s user=%s ts=%s thread=%s target=%s text=%dch",
-		msg.Channel, msg.User, msg.TS, msg.ThreadTS, cfg.inboundTarget, len(text))
+	entries, err := os.ReadDir(cfg.spoolDir)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Printf("spool replay: %v", err)
+		}
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(cfg.spoolDir, e.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			log.Printf("spool replay: read %s: %v", path, err)
+			continue
+		}
+		var msg externalInboundMessage
+		if err := json.Unmarshal(data, &msg); err != nil {
+			log.Printf("spool replay: decode %s: %v (dead-letter=%s)", path, err, moveToDeadLetter(path))
+			continue
+		}
+		log.Printf("spool replay: re-delivering %s (chan=%s ts=%s)",
+			e.Name(), msg.Conversation.ConversationID, msg.ProviderMessageID)
+		go deliverInbound(cfg, msg, path)
+	}
 }
 
 // leadingMentionRE matches one or more leading Slack user-mention tokens
