@@ -700,3 +700,184 @@ func TestPostJSONSurfacesErrorStatus(t *testing.T) {
 		t.Fatalf("expected error surfacing body, got %v", err)
 	}
 }
+
+func TestSlackifyMarkdown(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"bold stars", "deploy **now** please", "deploy *now* please"},
+		{"bold underscores", "deploy __now__ please", "deploy *now* please"},
+		{"multiple bolds", "**a** and **b**", "*a* and *b*"},
+		{"strike", "~~gone~~", "~gone~"},
+		{"link", "see [the PR](https://example.com/pr/42) here", "see <https://example.com/pr/42|the PR> here"},
+		{"heading", "# Status\nall green", "*Status*\nall green"},
+		{"mrkdwn bold untouched", "*mayor:* on it", "*mayor:* on it"},
+		{"italic untouched", "_soon_", "_soon_"},
+		{"inline code protected", "run `gc status --json **not bold**`", "run `gc status --json **not bold**`"},
+		{"fenced code protected", "```\n**not bold**\n# not a heading\n```", "```\n**not bold**\n# not a heading\n```"},
+		{"unterminated fence protected", "before **bold**\n```\n**raw**", "before *bold*\n```\n**raw**"},
+		{"handle prefix example", "**mayor:** build is green", "*mayor:* build is green"},
+		{"empty", "", ""},
+		{"plain multiplication untouched", "2 * 3 * 4 = 24", "2 * 3 * 4 = 24"},
+	}
+	for _, tc := range cases {
+		if got := slackifyMarkdown(tc.in); got != tc.want {
+			t.Errorf("%s: slackifyMarkdown(%q) = %q, want %q", tc.name, tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestHandlePostMessageConvertsMarkdown(t *testing.T) {
+	var gotBody slackPostMessageReq
+	slack := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"ts":"1","channel":"C1"}`))
+	}))
+	defer slack.Close()
+
+	cfg := config{slackAPIBase: slack.URL, botToken: "xoxb-test"}
+	reqBody := `{"channel":"C1","text":"**mayor:** deploy [PR](https://example.com/42) done"}`
+	req := httptest.NewRequest(http.MethodPost, "/post-message", strings.NewReader(reqBody))
+	rec := httptest.NewRecorder()
+	handlePostMessage(cfg)(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	want := "*mayor:* deploy <https://example.com/42|PR> done"
+	if gotBody.Text != want {
+		t.Errorf("posted text = %q, want %q", gotBody.Text, want)
+	}
+}
+
+func TestResolveUserDisplayNameCachesSuccesses(t *testing.T) {
+	calls := 0
+	slack := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.URL.Path != "/users.info" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		if got := r.URL.Query().Get("user"); got != "U123" {
+			t.Errorf("user param = %q", got)
+		}
+		if auth := r.Header.Get("Authorization"); auth != "Bearer xoxb-test" {
+			t.Errorf("auth = %q", auth)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"user":{"name":"afik","real_name":"Afik Cohen","profile":{"display_name":"Afik","real_name":"Afik Cohen"}}}`))
+	}))
+	defer slack.Close()
+
+	cfg := config{slackAPIBase: slack.URL, botToken: "xoxb-test"}
+	cache := newUserNameCache()
+	if got := resolveUserDisplayName(context.Background(), cache, cfg, "U123"); got != "Afik" {
+		t.Fatalf("resolved = %q, want Afik (profile.display_name preferred)", got)
+	}
+	if got := resolveUserDisplayName(context.Background(), cache, cfg, "U123"); got != "Afik" {
+		t.Fatalf("second resolve = %q", got)
+	}
+	if calls != 1 {
+		t.Errorf("users.info calls = %d, want 1 (cached)", calls)
+	}
+}
+
+func TestResolveUserDisplayNameFallsBackToRawID(t *testing.T) {
+	calls := 0
+	slack := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":false,"error":"missing_scope"}`))
+	}))
+	defer slack.Close()
+
+	cfg := config{slackAPIBase: slack.URL, botToken: "xoxb-test"}
+	cache := newUserNameCache()
+	if got := resolveUserDisplayName(context.Background(), cache, cfg, "U404"); got != "U404" {
+		t.Fatalf("resolved = %q, want raw id fallback", got)
+	}
+	// Failures are negative-cached (a token without users:read fails on
+	// every mention) but expire on the shorter failure TTL, so the fix
+	// heals without a restart once the scope is granted.
+	if got := resolveUserDisplayName(context.Background(), cache, cfg, "U404"); got != "U404" {
+		t.Fatalf("second resolve = %q, want raw id fallback", got)
+	}
+	if calls != 1 {
+		t.Errorf("users.info calls = %d, want 1 (failure negative-cached)", calls)
+	}
+	if _, ok := cache.get("U404", time.Now().Add(userNameFailureTTL+time.Second)); ok {
+		t.Error("negative cache entry should expire after userNameFailureTTL")
+	}
+}
+
+func TestBridgeEventResolvesDisplayName(t *testing.T) {
+	var got externalInboundMessage
+	gc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var wrap struct {
+			Message externalInboundMessage `json:"message"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&wrap)
+		got = wrap.Message
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer gc.Close()
+	slack := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"user":{"name":"afik","profile":{"display_name":"Afik"}}}`))
+	}))
+	defer slack.Close()
+
+	cfg := config{
+		gcAPIBase:     gc.URL,
+		slackAPIBase:  slack.URL,
+		botToken:      "xoxb-test",
+		cityName:      "mycity",
+		provider:      "slack",
+		workspaceID:   "T123",
+		inboundTarget: "mayor",
+	}
+	event := slackMessageEvent{
+		Type: "app_mention", User: "U777", Text: "<@U0BOT> hello",
+		Channel: "C42", TS: "1700000000.0001", ChannelType: "channel",
+	}
+	raw, _ := json.Marshal(event)
+	bridgeEvent(cfg, slackEventEnvelope{Type: "event_callback", Event: raw})
+
+	if got.Actor.DisplayName != "Afik" {
+		t.Errorf("DisplayName = %q, want resolved 'Afik'", got.Actor.DisplayName)
+	}
+	if got.Actor.ID != "U777" {
+		t.Errorf("Actor.ID = %q, want raw id preserved", got.Actor.ID)
+	}
+}
+
+func TestRegisterAdapterSendsReplyInstructions(t *testing.T) {
+	var got adapterRegisterRequest
+	gc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/extmsg/adapters") {
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer gc.Close()
+
+	cfg := config{
+		gcAPIBase:           gc.URL,
+		cityName:            "mycity",
+		provider:            "slack",
+		workspaceID:         "T123",
+		internalCallbackURL: "http://127.0.0.1:1/cb",
+	}
+	if err := registerAdapter(context.Background(), cfg); err != nil {
+		t.Fatalf("registerAdapter: %v", err)
+	}
+	if !strings.Contains(got.ReplyInstructions, "gc slack-mini post-message --channel {conversation_id}[ --thread-ts {thread_ts}]") {
+		t.Errorf("reply_instructions missing Tier-1 reply command: %q", got.ReplyInstructions)
+	}
+	if !strings.Contains(got.ReplyInstructions, "{handle}") {
+		t.Errorf("reply_instructions missing handle placeholder: %q", got.ReplyInstructions)
+	}
+}

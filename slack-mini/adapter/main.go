@@ -77,6 +77,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -419,7 +420,7 @@ func bridgeEvent(cfg config, env slackEventEnvelope) {
 		},
 		Actor: externalActor{
 			ID:          msg.User,
-			DisplayName: msg.User, // resolving a display name needs users.info — defer to Tier 2
+			DisplayName: resolveUserDisplayName(context.Background(), userNames, cfg, msg.User),
 		},
 		Text:             text,
 		ExplicitTarget:   cfg.inboundTarget,
@@ -557,6 +558,134 @@ func replaySpool(cfg config) {
 	}
 }
 
+// --- inbound: Slack user display-name resolution ---------------------------
+
+// userNameCacheTTL bounds how long a resolved display name is reused before
+// users.info is consulted again. Names change rarely; an hour keeps the
+// per-mention lookup cost near zero without pinning stale names forever.
+const userNameCacheTTL = time.Hour
+
+// userNameFailureTTL negative-caches a failed lookup (missing_scope on a
+// bot token without users:read, transient Slack errors) so a burst of
+// mentions does not hammer users.info, while healing quickly once the
+// scope is granted or the outage passes.
+const userNameFailureTTL = 5 * time.Minute
+
+// userInfoTimeout bounds the users.info call on the inbound bridge path.
+const userInfoTimeout = 5 * time.Second
+
+type cachedUserName struct {
+	name      string
+	expiresAt time.Time
+}
+
+// userNameCache is an in-memory users.info result cache. Tier 1 keeps no
+// on-disk registries by design, so entries live for the process lifetime.
+type userNameCache struct {
+	mu      sync.Mutex
+	entries map[string]cachedUserName
+}
+
+func newUserNameCache() *userNameCache {
+	return &userNameCache{entries: make(map[string]cachedUserName)}
+}
+
+func (c *userNameCache) get(userID string, now time.Time) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[userID]
+	if !ok || now.After(entry.expiresAt) {
+		return "", false
+	}
+	return entry.name, true
+}
+
+func (c *userNameCache) put(userID, name string, now time.Time, ttl time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries[userID] = cachedUserName{name: name, expiresAt: now.Add(ttl)}
+}
+
+// userNames caches users.info lookups across inbound mentions.
+var userNames = newUserNameCache()
+
+// slackUserInfoResp is the subset of a users.info response Tier 1 reads.
+type slackUserInfoResp struct {
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+	User  struct {
+		Name     string `json:"name"`
+		RealName string `json:"real_name"`
+		Profile  struct {
+			DisplayName string `json:"display_name"`
+			RealName    string `json:"real_name"`
+		} `json:"profile"`
+	} `json:"user"`
+}
+
+// resolveUserDisplayName resolves a Slack user id to a human-readable name
+// via users.info so the injected gc reminder shows "Afik Cohen (human)"
+// instead of a raw "U0AN32RPBFT" (hq-fh9). Successes are cached for
+// userNameCacheTTL; failures fall back to the raw id and are
+// negative-cached for userNameFailureTTL (a bot token without users:read
+// fails on every mention — see manifest/app.json, which grants the scope
+// for fresh installs; existing installs must re-approve it).
+func resolveUserDisplayName(ctx context.Context, cache *userNameCache, cfg config, userID string) string {
+	if userID == "" {
+		return userID
+	}
+	now := time.Now()
+	if name, ok := cache.get(userID, now); ok {
+		return name
+	}
+	name := fetchUserDisplayName(ctx, cfg, userID)
+	if name == "" {
+		cache.put(userID, userID, now, userNameFailureTTL)
+		return userID
+	}
+	cache.put(userID, name, now, userNameCacheTTL)
+	return name
+}
+
+// fetchUserDisplayName performs the users.info call, returning "" on any
+// failure (logged with the reason).
+func fetchUserDisplayName(ctx context.Context, cfg config, userID string) string {
+	ctx, cancel := context.WithTimeout(ctx, userInfoTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		cfg.slackAPIBase+"/users.info?user="+url.QueryEscape(userID), nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.botToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("users.info %s failed (using raw id): %v", userID, err)
+		return ""
+	}
+	defer func() { _ = resp.Body.Close() }()
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("users.info %s: http %d (using raw id)", userID, resp.StatusCode)
+		return ""
+	}
+	var info slackUserInfoResp
+	if err := json.Unmarshal(respBody, &info); err != nil || !info.OK {
+		log.Printf("users.info %s: ok=false error=%q (using raw id)", userID, info.Error)
+		return ""
+	}
+	return firstNonEmpty(info.User.Profile.DisplayName, info.User.Profile.RealName, info.User.RealName, info.User.Name)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 // leadingMentionRE matches one or more leading Slack user-mention tokens
 // (`<@U…>`) and surrounding whitespace. Slack delivers app_mention text
 // with the bot mention inline (e.g. "<@U0BOT> status?"); stripping it
@@ -651,12 +780,27 @@ type adapterCapabilities struct {
 }
 
 type adapterRegisterRequest struct {
-	Provider     string              `json:"provider"`
-	AccountID    string              `json:"account_id"`
-	Name         string              `json:"name,omitempty"`
-	CallbackURL  string              `json:"callback_url,omitempty"`
-	Capabilities adapterCapabilities `json:"capabilities,omitempty"`
+	Provider          string              `json:"provider"`
+	AccountID         string              `json:"account_id"`
+	Name              string              `json:"name,omitempty"`
+	CallbackURL       string              `json:"callback_url,omitempty"`
+	Capabilities      adapterCapabilities `json:"capabilities,omitempty"`
+	ReplyInstructions string              `json:"reply_instructions,omitempty"`
 }
+
+// replyInstructionsTemplate is the Tier-1 reply instruction block gc renders
+// into the inbound-message <system-reminder> nudge in place of its generic
+// "gc slack reply-current ..." fallback, which does not exist at Tier 1
+// (hq-fh9). gc substitutes {conversation_id}, {message_ts}, {thread_ts}
+// (the inbound message's thread, falling back to the message itself), and
+// {handle}; the [bracketed segment] is dropped when no thread id is
+// available. Agents write standard Markdown — handlePostMessage converts it
+// to Slack mrkdwn on the way out.
+const replyInstructionsTemplate = "To reply in Slack, run:\n" +
+	"  gc slack-mini post-message --channel {conversation_id}[ --thread-ts {thread_ts}] --text '<your reply>'\n" +
+	"Keep --thread-ts so the reply lands in the thread. Write the reply in standard Markdown " +
+	"(it is converted to Slack formatting on post) and prefix it with your agent handle in bold " +
+	"(e.g., **{handle}:** your message)."
 
 // postInbound bridges a verified Slack mention into gc.
 func postInbound(ctx context.Context, cfg config, msg externalInboundMessage) error {
@@ -684,6 +828,7 @@ func registerAdapter(ctx context.Context, cfg config) error {
 			SupportsAttachments:        false,
 			MaxMessageLength:           40000, // Slack's chat.postMessage limit
 		},
+		ReplyInstructions: replyInstructionsTemplate,
 	})
 	if err != nil {
 		return err
@@ -747,6 +892,7 @@ func handlePostMessage(cfg config) http.HandlerFunc {
 			writeJSONError(w, http.StatusBadRequest, "text is required")
 			return
 		}
+		req.Text = slackifyMarkdown(req.Text)
 		resp, err := postToSlack(r.Context(), cfg.slackAPIBase, cfg.botToken, req)
 		if err != nil {
 			writeJSONError(w, http.StatusBadGateway, err.Error())
@@ -769,6 +915,52 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": msg})
+}
+
+// --- outbound: GitHub Markdown → Slack mrkdwn -------------------------------
+
+var (
+	fencedCodeRE = regexp.MustCompile("(?s)```.*?```")
+	inlineCodeRE = regexp.MustCompile("`[^`\n]+`")
+	boldStarsRE  = regexp.MustCompile(`\*\*(.+?)\*\*`)
+	boldUnderRE  = regexp.MustCompile(`__(.+?)__`)
+	strikeRE     = regexp.MustCompile(`~~(.+?)~~`)
+	mdLinkRE     = regexp.MustCompile(`\[([^\]\n]+)\]\((https?://[^)\s]+)\)`)
+	headingRE    = regexp.MustCompile(`(?m)^#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$`)
+)
+
+// slackifyMarkdown converts the GitHub-flavored Markdown constructs agents
+// habitually write into Slack mrkdwn, which renders **bold** as literal
+// asterisks (hq-fh9). Conservative by design: fenced code blocks and inline
+// code spans pass through verbatim; only **bold**/__bold__ → *bold*,
+// ~~strike~~ → ~strike~, [text](url) → <url|text>, and #-headings →
+// *bold lines* are rewritten. Single-asterisk/underscore emphasis is left
+// untouched so text already written as mrkdwn survives unchanged.
+func slackifyMarkdown(text string) string {
+	if text == "" {
+		return text
+	}
+	var protected []string
+	protect := func(s string) string {
+		protected = append(protected, s)
+		return fmt.Sprintf("\x00%d\x00", len(protected)-1)
+	}
+	out := fencedCodeRE.ReplaceAllStringFunc(text, protect)
+	// An unterminated fence swallows the rest of the message: protect it
+	// whole rather than reformatting half a code block.
+	if idx := strings.Index(out, "```"); idx >= 0 {
+		out = out[:idx] + protect(out[idx:])
+	}
+	out = inlineCodeRE.ReplaceAllStringFunc(out, protect)
+	out = headingRE.ReplaceAllString(out, "*$1*")
+	out = boldStarsRE.ReplaceAllString(out, "*$1*")
+	out = boldUnderRE.ReplaceAllString(out, "*$1*")
+	out = strikeRE.ReplaceAllString(out, "~$1~")
+	out = mdLinkRE.ReplaceAllString(out, "<$2|$1>")
+	for i := len(protected) - 1; i >= 0; i-- {
+		out = strings.Replace(out, fmt.Sprintf("\x00%d\x00", i), protected[i], 1)
+	}
+	return out
 }
 
 // postToSlack posts a message via chat.postMessage using the bot token.
