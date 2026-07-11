@@ -15,6 +15,10 @@ contract = "graph.v2"
 description = "Role target used to apply starter review findings."
 default = "gc.implementation-worker"
 
+[vars.interaction_mode]
+description = "Workflow interaction posture: interactive, autonomous, or headless."
+default = "interactive"
+
 [[template]]
 id = "{target}.setup-build-basic-review"
 title = "Prepare build-basic starter review"

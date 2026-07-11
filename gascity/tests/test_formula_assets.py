@@ -1348,6 +1348,62 @@ class FormulaAssetTests(unittest.TestCase):
                         self.assertIn(default, vocabulary)
                     self.assertIn(f"{{{{{var_name}}}}}", text)
 
+    def test_build_interactive_checkpoints_use_passive_human_gate(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        shared_fragments = (
+            "passive wait + mail",
+            "timeout-driven task",
+            "waiting-human",
+            "gc session wait",
+            "gc mail send human",
+            "mail_sent=true",
+            "revision_requested",
+            "never ask questions",
+            "gc.blocked_reason",
+            "silence",
+        )
+
+        gate_text = (
+            root / "assets/workflows/build-base/interactive-human-gate.md"
+        ).read_text(encoding="utf-8")
+        for fragment in shared_fragments:
+            with self.subTest(asset="interactive-human-gate", fragment=fragment):
+                self.assertIn(fragment, gate_text)
+
+        stage_gate_keys = {
+            "assets/workflows/build-basic/plan-review.md": "gc.build.plan_review_gate",
+            "assets/workflows/build-from-plan-base/plan-review.md": "gc.build.plan_review_gate",
+            "assets/workflows/build-basic-review/{target}.build-basic-review-loop.md": "gc.build.review_gate",
+        }
+        for relative_path, gate_key in stage_gate_keys.items():
+            text = (root / relative_path).read_text(encoding="utf-8")
+            for fragment in (
+                "{{interaction_mode}}",
+                f"{gate_key}=waiting-human",
+                f"{gate_key}_bead_id",
+                f"{gate_key}_mail_sent=true",
+                f"{gate_key}_mail_to=human",
+                f"{gate_key}=approved`, `rejected`, or",
+                *shared_fragments,
+            ):
+                with self.subTest(asset=relative_path, fragment=fragment):
+                    self.assertIn(fragment, text)
+
+        base_plan_review = (
+            root / "assets/workflows/build-base/plan-review.md"
+        ).read_text(encoding="utf-8")
+        for fragment in (
+            "{{interaction_mode}}",
+            "passive wait + mail",
+            "gc.build.plan_review_gate",
+            "gc.blocked_reason",
+        ):
+            with self.subTest(asset="build-base/plan-review.md", fragment=fragment):
+                self.assertIn(fragment, base_plan_review)
+
+        review = load_formula(root, "build-basic-review")
+        self.assertEqual(review["vars"]["interaction_mode"]["default"], "interactive")
+
     def test_github_adapters_validate_methodology_compatibility(self) -> None:
         root = pathlib.Path(__file__).resolve().parents[1]
         issue_snapshot = (
@@ -1718,6 +1774,7 @@ class FormulaAssetTests(unittest.TestCase):
             review_step["expand_vars"],
             {
                 "implementation_target": "{{implementation_target}}",
+                "interaction_mode": "{{interaction_mode}}",
             },
         )
         self.assertEqual(review_step["needs"], ["summarize-implementation"])
