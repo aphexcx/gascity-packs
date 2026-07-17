@@ -98,6 +98,16 @@
 //   - INBOUND_FILE_SWEEP_INTERVAL  Default "1h". How often the janitor
 //     wakes to scan INBOUND_FILE_STORE. "0"
 //     disables the janitor.
+//   - INBOUND_SPOOL_DIR            Default "<GC_SERVICE_STATE_ROOT>/data/inbound-spool"
+//     when GC_SERVICE_STATE_ROOT is set,
+//     otherwise unset. Directory where decoded
+//     inbound events are persisted before the
+//     first forward attempt to gc, retried with
+//     backoff on failure, dead-lettered to
+//     <dir>/dead on exhaustion, and replayed at
+//     startup (hq-xizo). Empty disables
+//     spooling; forward retries still happen
+//     in-memory.
 //   - SLACK_CHANNEL_MAPPING_PATH    Default "<GC_CITY_PATH>/.gc/slack/channel_mappings.json"
 //     when GC_CITY_PATH is set, otherwise
 //     "/tmp/gc-slack-adapter/channel_mappings.json".
@@ -323,6 +333,17 @@ type config struct {
 	// (no bot-token leak). Files are organized as
 	// <store>/<channel>/<ts>-<safe-filename>.
 	inboundFileStore string
+	// inboundSpoolDir is the directory where decoded inbound events are
+	// persisted before the first forward attempt to gc (hq-xizo).
+	// handleSlackEvents 200-acks Slack before processSlackEvent runs,
+	// so without the spool a forward that failed every retry silently
+	// lost the event. Entries are removed on successful forward,
+	// dead-lettered to <dir>/dead on retry exhaustion, and replayed at
+	// startup by replaySpool. Sourced from INBOUND_SPOOL_DIR,
+	// defaulting to <GC_SERVICE_STATE_ROOT>/data/inbound-spool when
+	// GC_SERVICE_STATE_ROOT is set (proxy_process mode). Empty
+	// disables spooling; forward retries still happen in-memory.
+	inboundSpoolDir string
 	// inboundFileTTL is the maximum age (mtime-based) of files in
 	// inboundFileStore before the in-process janitor deletes them.
 	// Empty or zero disables the janitor entirely.
@@ -560,7 +581,18 @@ func loadConfigFromEnv(getenv func(string) string) (config, error) {
 		handlePrefix:         envOrFn("HANDLE_PREFIX", "@"),
 		handleAliasStorePath: envOrFn("HANDLE_ALIAS_STORE_PATH", "/tmp/gc-slack-adapter/handle-aliases.json"),
 		inboundFileStore:     envOrFn("INBOUND_FILE_STORE", "/tmp/gc-slack-adapter/inbound"),
+		inboundSpoolDir:      getenv("INBOUND_SPOOL_DIR"),
 		fileUploadRoot:       getenv("FILE_UPLOAD_ROOT"),
+	}
+
+	// Default the inbound persist-and-retry spool into the
+	// controller-provided state root (proxy_process mode). Standalone
+	// runs without an explicit INBOUND_SPOOL_DIR get in-memory retries
+	// only (hq-xizo).
+	if cfg.inboundSpoolDir == "" {
+		if stateRoot := getenv("GC_SERVICE_STATE_ROOT"); stateRoot != "" {
+			cfg.inboundSpoolDir = filepath.Join(stateRoot, "data", "inbound-spool")
+		}
 	}
 
 	// channelMappingPath default: prefer the city-rooted path when
@@ -1269,6 +1301,12 @@ func main() {
 		log.Printf("registered with gc as provider=%s account=%s callback=%s/publish (%s)",
 			cfg.provider, cfg.accountID, cfg.internalCallbackURL, mode)
 	}
+
+	// Re-deliver any inbound events a previous run spooled but never
+	// confirmed forwarded (hq-xizo: Slack was already 200-acked, so
+	// dropping them on crash would lose messages). Runs before the
+	// listeners start serving; delivery itself is async per entry.
+	replaySpool(cfg)
 
 	janitorCtx, janitorCancel := context.WithCancel(context.Background())
 	defer janitorCancel()
@@ -2574,12 +2612,17 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 		DedupKey:         "slack-" + msg.TS,
 		ReceivedAt:       time.Now().UTC(),
 	}
-	if err := postInbound(cfg, inbound); err != nil {
-		log.Printf("inbound POST failed: %v", err)
+	// Persist-and-retry forward (hq-xizo): Slack was 200-acked before
+	// this goroutine ran, so a failed POST here would otherwise lose
+	// the event silently — Slack never redelivers after a 200. Spool
+	// first (best-effort; "" when disabled or the write fails), then
+	// forward with retries per inboundRetryDelays; on exhaustion the
+	// entry dead-letters under <spool>/dead and startup replay covers
+	// a crash mid-retry. deliverInbound logs the outcome either way,
+	// including the one-time success line.
+	if !deliverInbound(cfg, inbound, spoolInbound(cfg.inboundSpoolDir, inbound)) {
 		return
 	}
-	log.Printf("inbound: chan=%s user=%s ts=%s thread=%s target=%q files=%d text=%dch",
-		msg.Channel, msg.User, msg.TS, msg.ThreadTS, target, len(attachments), len(text))
 
 	// "Eyes" reaction signals to the human that an agent was explicitly
 	// addressed (via `@handle:` prefix or a Slack User Group mention

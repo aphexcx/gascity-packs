@@ -75,6 +75,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Build flow simplified to a single command:
   `cd examples/slack-pack/adapter && go build -o gc-slack-adapter`.
 
+### Fixed
+
+- Inbound Slack events are no longer lost when the forward to gc's
+  `extmsg/inbound` endpoint fails (`hq-xizo`). The adapter 200-acks
+  Slack before forwarding, so a failed POST used to drop the message
+  silently — Slack never redelivers after a 200. Each decoded inbound
+  is now persisted to a disk spool (`INBOUND_SPOOL_DIR`, defaulting to
+  `$GC_SERVICE_STATE_ROOT/data/inbound-spool` in proxy_process mode)
+  with atomic fsync'd writes before the first attempt, retried with
+  backoff (5 attempts over ~2 minutes), dead-lettered to the spool's
+  `dead/` subdirectory on exhaustion (the final log line keeps the
+  `inbound POST failed` substring external log-watchers key on), and
+  replayed at startup if a crash interrupted the retries. Duplicate
+  redelivery is safe — gc dedups on the message's `dedup_key`.
+
 ### Security
 
 - Default adapter state under `/tmp/gc-slack-adapter/*` is no longer
