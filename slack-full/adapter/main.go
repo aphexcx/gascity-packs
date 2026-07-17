@@ -533,6 +533,16 @@ type config struct {
 	// every inbound then flows through the legacy path byte-for-byte.
 	// Wired in main() before any handler closes over the cfg value.
 	companyGateway *companyGateway
+	// dmGate is the DM privacy gate (hq-xizo): before processing a
+	// kind=="dm" inbound, processSlackEvent verifies via
+	// conversations.info that the bot can actually access the
+	// conversation, because Slack (notably with Assistant/Agent mode
+	// enabled) can deliver message.im events for DMs between two
+	// humans that the bot is not a member of. NOT nil-safe in the
+	// permissive sense: a nil gate fails closed and drops every DM,
+	// so tests exercising DM inbounds must construct one (newDMGate).
+	// Initialized in main().
+	dmGate *dmGate
 }
 
 func loadConfig() (config, error) {
@@ -1104,6 +1114,10 @@ func main() {
 	// Wire the process-wide thread-context cache. Nil-safe consumer
 	// path; only the production main() initializes it. gc-px8.5.
 	cfg.threadContextCache = newThreadContextCache()
+	// Wire the DM privacy gate. Unlike threadContextCache, a nil gate
+	// is fail-closed (drops every DM), so production wiring is
+	// mandatory here, before any handler closes over cfg. hq-xizo.
+	cfg.dmGate = newDMGate()
 	internalDescr := cfg.internalListen
 	if cfg.serviceSocket != "" {
 		internalDescr = "uds:" + cfg.serviceSocket
@@ -2491,6 +2505,29 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 		return
 	}
 
+	// DM privacy gate (hq-xizo). Slack can deliver message.im events
+	// for DM conversations the bot is not actually a member of —
+	// notably with Assistant/Agent mode enabled, the events feed
+	// includes DMs between two humans. Forwarding those would leak a
+	// private human↔human conversation to agents, so before ANY real
+	// processing (launcher dispatch, thread-context fetch, file
+	// download, forward) a kind=="dm" inbound must pass the
+	// conversations.info membership check. Drops are silent toward
+	// Slack — no reaction, no reply, nothing that reveals the bot saw
+	// the message — and the log line carries channel id + reason
+	// only, never the body. Fail closed: API errors also drop (the
+	// gate does not cache those, so the next event retries). Non-DM
+	// kinds skip the gate entirely — channels/groups/mpims are
+	// governed by explicit operator bindings.
+	kind := slackKindFromChannelType(msg.ChannelType, msg.Channel)
+	if kind == "dm" {
+		if allowed, reason := cfg.dmGate.allow(cfg.slackBotToken, msg.Channel); !allowed {
+			log.Printf("dropping dm inbound: membership gate chan=%s ts=%s reason=%s",
+				msg.Channel, msg.TS, reason)
+			return
+		}
+	}
+
 	// Launcher-mode address parser runs FIRST (cby.5.b). A `@@<handle>`
 	// head means "spawn a new thread-bound session" (5.3 wires the
 	// spawn) or "the handle is already a long-lived alias — instruct
@@ -2616,7 +2653,7 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 			Provider:       cfg.provider,
 			AccountID:      cfg.accountID,
 			ConversationID: msg.Channel,
-			Kind:           slackKindFromChannelType(msg.ChannelType, msg.Channel),
+			Kind:           kind,
 		},
 		Actor: externalActor{
 			ID:          msg.User,

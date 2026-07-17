@@ -77,6 +77,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- DM inbounds now pass a fail-closed membership gate before any
+  processing (`hq-xizo`). Slack can deliver `message.im` events for DM
+  conversations the bot is not actually a member of — notably with
+  Assistant/Agent mode enabled — which would forward a private
+  human-to-human conversation to agents. The adapter now verifies the
+  bot can access the conversation via `conversations.info` and
+  silently drops the event otherwise (never revealing the bot saw it);
+  the drop log carries channel id and reason only, never the body.
+  Verdicts are cached per channel (allowed: 5 minutes,
+  `channel_not_found`: 30 seconds); transient API failures also drop
+  the event but are never cached, so the next event retries.
+  Channel/group/mpim inbounds skip the gate — they are governed by
+  explicit operator bindings.
 - The attachments block injected into the address-by-handle
   system-reminder now instructs the receiving agent to Read a
   `file://` path only if relevant and to never paste the paths into
