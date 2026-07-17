@@ -36,6 +36,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Busy-reaction lifecycle on targeted inbounds plus `reactions.remove`
+  support (`hq-xizo`). When an inbound message explicitly addresses an
+  agent (`@handle:` prefix or a mapped User Group mention) and is
+  successfully dispatched, the adapter now adds a busy reaction to the
+  inbound Slack message (`BUSY_REACTION`, default `hourglass`;
+  set-but-empty disables) instead of the previous `eyes`, and removes
+  it when the agent's reply is published back into the same
+  conversation/thread — the channel-native replacement for Slack
+  Assistant-mode `assistant.threads.setStatus`, which this adapter
+  deliberately does not use. Pending marks live in a bounded in-memory
+  registry keyed by (conversation, thread) and expire after 30 minutes.
+  The `/react` endpoint gains an optional `"remove": true` field that
+  issues `reactions.remove` instead of `reactions.add`
+  (backward-compatible; `no_reaction` is treated as benign delivery,
+  mirroring `already_reacted` on add). The ⚠️ alias-dispatch-failure
+  reaction is unchanged.
 - `gc slack retry-peer-fanout` — operational recovery for peer-fanout.
   Walks recent `extmsg.peer_fanout_failed` events (added in this change
   too), filters by `--since` / `--conversation` / `--max`, deduplicates

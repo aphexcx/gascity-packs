@@ -78,6 +78,15 @@
 //     recognized on inbound messages for
 //     keyword routing (e.g. "@name: text").
 //     Empty string disables routing.
+//   - BUSY_REACTION                Default "hourglass". Emoji name (no
+//     colons) added to a targeted inbound
+//     message when it is dispatched and removed
+//     when the agent's reply is published back
+//     into the same conversation/thread — the
+//     channel-native replacement for Slack
+//     Assistant-mode assistant.threads.setStatus
+//     (hq-xizo). Set-but-empty (BUSY_REACTION=)
+//     disables the lifecycle entirely.
 //   - IDENTITY_STORE_PATH          Default "/tmp/gc-slack-adapter/identities.json".
 //     JSON file backing the per-session
 //     chat:write.customize identity registry.
@@ -543,10 +552,28 @@ type config struct {
 	// so tests exercising DM inbounds must construct one (newDMGate).
 	// Initialized in main().
 	dmGate *dmGate
+	// busyReaction is the emoji name (no colons) added to a targeted
+	// inbound message when it is dispatched and removed when the
+	// agent's reply is published back into the same conversation/
+	// thread — the channel-native busy affordance replacing Slack
+	// Assistant-mode assistant.threads.setStatus (hq-xizo). Sourced
+	// from BUSY_REACTION, defaulting to busyReactionDefault
+	// ("hourglass"); the set-but-empty form (BUSY_REACTION=) yields ""
+	// here and disables the lifecycle entirely — no reaction is added
+	// and no mark is recorded. Replaces the previous unconditional
+	// "eyes" reaction on targeted inbounds.
+	busyReaction string
+	// busyMarks is the in-memory registry of pending busy reactions,
+	// keyed by (conversation id, thread key). processSlackEvent
+	// records a mark when it adds the busy reaction; handlePublish
+	// consumes it (and removes the reaction) when the reply lands.
+	// Nil-safe: mark/take on a nil registry are no-ops reporting no
+	// pending mark. Initialized in main(). hq-xizo.
+	busyMarks *busyReactionRegistry
 }
 
 func loadConfig() (config, error) {
-	return loadConfigFromEnv(os.Getenv)
+	return loadConfigFromLookup(os.LookupEnv)
 }
 
 // companyStateDirDefault resolves a Phase 2 shared-state directory default:
@@ -561,13 +588,31 @@ func companyStateDirDefault(cityPath, leaf string) string {
 	return filepath.Join("/tmp/gc-slack-adapter", leaf)
 }
 
-// loadConfigFromEnv reads adapter configuration from a getenv function. When
-// $GC_SERVICE_SOCKET is set, the adapter switches to proxy_process mode: it
-// binds a Unix domain socket for /publish (and /healthz) instead of an
-// internal TCP listener, and registers the callback URL gc routes through
-// its /svc/{name} mount. This keeps a single binary serving both the legacy
-// nohup-managed deployment and the proxy_process deployment.
+// loadConfigFromEnv reads adapter configuration from a plain getenv
+// function (os.Getenv shape: missing keys read as ""). It cannot
+// distinguish set-but-empty from unset, so vars whose empty form is
+// meaningful (BUSY_REACTION=) behave as unset through this entry
+// point; callers that need presence information use
+// loadConfigFromLookup directly.
 func loadConfigFromEnv(getenv func(string) string) (config, error) {
+	return loadConfigFromLookup(func(key string) (string, bool) {
+		v := getenv(key)
+		return v, v != ""
+	})
+}
+
+// loadConfigFromLookup reads adapter configuration from a lookup function
+// (os.LookupEnv shape). When $GC_SERVICE_SOCKET is set, the adapter switches
+// to proxy_process mode: it binds a Unix domain socket for /publish (and
+// /healthz) instead of an internal TCP listener, and registers the callback
+// URL gc routes through its /svc/{name} mount. This keeps a single binary
+// serving both the legacy nohup-managed deployment and the proxy_process
+// deployment.
+func loadConfigFromLookup(lookup func(string) (string, bool)) (config, error) {
+	getenv := func(key string) string {
+		v, _ := lookup(key)
+		return v
+	}
 	envOrFn := func(key, fallback string) string {
 		if v := getenv(key); v != "" {
 			return v
@@ -603,6 +648,19 @@ func loadConfigFromEnv(getenv func(string) string) (config, error) {
 		if stateRoot := getenv("GC_SERVICE_STATE_ROOT"); stateRoot != "" {
 			cfg.inboundSpoolDir = filepath.Join(stateRoot, "data", "inbound-spool")
 		}
+	}
+
+	// BUSY_REACTION: emoji added to a targeted inbound while the agent
+	// works, removed when the reply publishes back (hq-xizo). Read
+	// through lookup (not envOrFn) because the set-but-empty form
+	// (BUSY_REACTION=) means "disable the lifecycle" and must not fall
+	// back to the default. Surrounding colons are stripped so operators
+	// can write ":hourglass:" or "hourglass" interchangeably, matching
+	// /react's emoji handling.
+	if v, ok := lookup("BUSY_REACTION"); ok {
+		cfg.busyReaction = strings.Trim(v, ":")
+	} else {
+		cfg.busyReaction = busyReactionDefault
 	}
 
 	// channelMappingPath default: prefer the city-rooted path when
@@ -984,6 +1042,10 @@ type reactRequest struct {
 	Conversation conversationRef `json:"conversation"`
 	MessageID    string          `json:"message_id"`
 	Emoji        string          `json:"emoji"`
+	// Remove selects reactions.remove instead of reactions.add
+	// (hq-xizo). Absent or false preserves the historical add-only
+	// behavior, so existing callers are unaffected.
+	Remove bool `json:"remove,omitempty"`
 }
 
 type reactReceipt struct {
@@ -1118,6 +1180,11 @@ func main() {
 	// is fail-closed (drops every DM), so production wiring is
 	// mandatory here, before any handler closes over cfg. hq-xizo.
 	cfg.dmGate = newDMGate()
+	// Wire the busy-reaction registry before the event and publish
+	// handlers close over cfg — both sides of the add-on-dispatch /
+	// remove-on-reply lifecycle must see the same map. Nil-safe
+	// consumer path (a nil registry just disables removal). hq-xizo.
+	cfg.busyMarks = newBusyReactionRegistry()
 	internalDescr := cfg.internalListen
 	if cfg.serviceSocket != "" {
 		internalDescr = "uds:" + cfg.serviceSocket
@@ -1631,6 +1698,40 @@ func handlePublish(cfg config, reg *identityRegistry, userAliases *userAliasMap,
 			receipt.Delivered = true
 			receipt.MessageID = slackResp.TS
 		}
+		// Busy-reaction lifecycle, remove side (hq-xizo): a delivered
+		// publish into a conversation/thread carrying a pending busy mark
+		// means the agent's reply has landed — clear the busy emoji from
+		// the inbound message it was added to. ReplyToMessageID is the
+		// publish's thread ts and matches the registry thread key in both
+		// inbound shapes: a thread-reply inbound was marked under its
+		// thread_ts, and a channel-root inbound was marked under its own
+		// ts, which is exactly what a threaded reply to it carries here.
+		// A publish with no ReplyToMessageID posts at channel root and
+		// identifies no thread, so there is nothing to look up; publishes
+		// with no registry hit are untouched. Best-effort and async —
+		// removal failures are logged and never affect the receipt. The
+		// dedup-replay path above returns earlier without re-checking:
+		// the original delivery already consumed the mark.
+		if receipt.Delivered && cfg.busyReaction != "" && req.ReplyToMessageID != "" {
+			if markedTS, ok := cfg.busyMarks.take(req.Conversation.ConversationID, req.ReplyToMessageID); ok {
+				go func(channel, ts, emoji string) {
+					resp, err := removeReactionFromSlack(cfg.slackBotToken, slackReactionsAddReq{
+						Channel:   channel,
+						Name:      emoji,
+						Timestamp: ts,
+					})
+					if err != nil {
+						log.Printf("busy reaction remove failed: chan=%s ts=%s emoji=%s: %v", channel, ts, emoji, err)
+						return
+					}
+					// "no_reaction" is benign: the emoji already came off
+					// (human removed it, or the add never landed).
+					if !resp.OK && resp.Error != "no_reaction" {
+						log.Printf("busy reaction remove: chan=%s ts=%s emoji=%s: slack error=%s", channel, ts, emoji, resp.Error)
+					}
+				}(req.Conversation.ConversationID, markedTS, cfg.busyReaction)
+			}
+		}
 		// Remember delivered receipts so a subsequent retry with the same
 		// idempotency key replays this receipt instead of re-posting. Put
 		// ignores empty keys and non-delivered receipts.
@@ -2049,8 +2150,9 @@ func slackCompleteUpload(token string, req slackCompleteUploadReq) (*slackComple
 }
 
 // handleReact serves POST /react. It maps reactRequest → Slack
-// reactions.add. Emoji name is forwarded verbatim minus surrounding
-// colons (clients can send "eyes" or ":eyes:").
+// reactions.add, or reactions.remove when the request sets
+// remove:true (hq-xizo). Emoji name is forwarded verbatim minus
+// surrounding colons (clients can send "eyes" or ":eyes:").
 func handleReact(cfg config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -2067,9 +2169,18 @@ func handleReact(cfg config) http.HandlerFunc {
 			http.Error(w, "conversation.conversation_id, message_id, and emoji are required", http.StatusBadRequest)
 			return
 		}
-		log.Printf("react: conv=%s ts=%s emoji=%s", req.Conversation.ConversationID, req.MessageID, emoji)
+		// Benign no-op errors mirror each other across the two ops:
+		// adding an emoji that is already on the message
+		// ("already_reacted") and removing one that is not there
+		// ("no_reaction") both leave the message in the requested
+		// state, so both count as delivered.
+		method, benignErr := "reactions.add", "already_reacted"
+		if req.Remove {
+			method, benignErr = "reactions.remove", "no_reaction"
+		}
+		log.Printf("react: op=%s conv=%s ts=%s emoji=%s", method, req.Conversation.ConversationID, req.MessageID, emoji)
 
-		slackResp, err := postReactionToSlack(cfg.slackBotToken, slackReactionsAddReq{
+		slackResp, err := postReactionMethod(http.DefaultClient, cfg.slackBotToken, method, slackReactionsAddReq{
 			Channel:   req.Conversation.ConversationID,
 			Name:      emoji,
 			Timestamp: req.MessageID,
@@ -2077,14 +2188,13 @@ func handleReact(cfg config) http.HandlerFunc {
 		receipt := reactReceipt{}
 		switch {
 		case err != nil:
-			log.Printf("slack reactions.add error: %v", err)
+			log.Printf("slack %s error: %v", method, err)
 			receipt.FailureKind = "transient"
 		case !slackResp.OK:
-			// "already_reacted" is benign: the emoji is already on the message.
-			if slackResp.Error == "already_reacted" {
+			if slackResp.Error == benignErr {
 				receipt.Delivered = true
 			} else {
-				log.Printf("slack reactions.add returned error: %s", slackResp.Error)
+				log.Printf("slack %s returned error: %s", method, slackResp.Error)
 				switch slackResp.Error {
 				case "channel_not_found", "not_in_channel", "message_not_found":
 					receipt.FailureKind = "not_found"
@@ -2104,15 +2214,23 @@ func handleReact(cfg config) http.HandlerFunc {
 	}
 }
 
+// postReactionToSlack calls reactions.add for req.
 func postReactionToSlack(token string, req slackReactionsAddReq) (*slackReactionsAddResp, error) {
 	return postReactionMethod(http.DefaultClient, token, "reactions.add", req)
 }
 
+// removeReactionFromSlack calls reactions.remove for req — same
+// request shape, auth, and slackAPIBase as reactions.add (hq-xizo).
+func removeReactionFromSlack(token string, req slackReactionsAddReq) (*slackReactionsAddResp, error) {
+	return postReactionMethod(http.DefaultClient, token, "reactions.remove", req)
+}
+
 // postReactionMethod is the single Slack reactions POST path, parameterized by
 // method ("reactions.add" | "reactions.remove") and HTTP client. handleReact
-// (add, DefaultClient) and the company visible-ack path (add/remove over the
-// gateway's timeout-bounded client) both route through here, so there is no
-// second reactions POST implementation.
+// (add, DefaultClient), the busy-reaction lifecycle (add/remove, hq-xizo), and
+// the company visible-ack path (add/remove over the gateway's timeout-bounded
+// client) all route through here, so there is no second reactions POST
+// implementation.
 func postReactionMethod(client *http.Client, token, method string, req slackReactionsAddReq) (*slackReactionsAddResp, error) {
 	if client == nil {
 		client = http.DefaultClient
@@ -2679,29 +2797,41 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 		return
 	}
 
-	// "Eyes" reaction signals to the human that an agent was explicitly
-	// addressed (via `@handle:` prefix or a Slack User Group mention
-	// resolved via subteamAliasMap) and is processing the message. Only
-	// fires when a target was parsed — generic channel chatter that
-	// merely lands on the bound session via postInbound does NOT trigger
-	// the eye, because most channel messages aren't intentionally
-	// directed at an agent. Fires once per inbound (the alias-dispatch
-	// fanout below targets the same Slack TS, so a duplicate react would
-	// be a Slack no-op). If alias dispatch later fails, reactAliasDispatchFailure
-	// posts ⚠️ on the same TS — that is semantically distinct (transport-layer
-	// ack vs. delivery failure) and not a duplicate. Best-effort: errors are
-	// logged and don't block the dispatch path.
-	if target != "" && cfg.slackBotToken != "" {
-		go func(channel, ts string) {
+	// Busy-reaction lifecycle, add side (hq-xizo; replaces the earlier
+	// unconditional "eyes" reaction). The reaction signals to the human
+	// that an agent was explicitly addressed (via `@handle:` prefix or
+	// a Slack User Group mention resolved via subteamAliasMap) and is
+	// working on the message; handlePublish removes it when the agent's
+	// reply lands in the same conversation/thread — the channel-native
+	// replacement for Slack Assistant-mode assistant.threads.setStatus,
+	// which this adapter deliberately does not use. Only fires when a
+	// target was parsed — generic channel chatter that merely lands on
+	// the bound session via postInbound does NOT trigger it, because
+	// most channel messages aren't intentionally directed at an agent
+	// — and only after deliverInbound succeeded (a busy mark on a
+	// dropped inbound would never clear: nothing is coming). Fires once
+	// per inbound (the alias-dispatch fanout below targets the same
+	// Slack TS, so a duplicate react would be a Slack no-op). The mark
+	// is recorded synchronously before the async reactions.add so a
+	// fast reply cannot race the registry; a mark whose reply never
+	// arrives expires after busyReactionTTL. If alias dispatch later
+	// fails, reactAliasDispatchFailure posts ⚠️ on the same TS — that
+	// is semantically distinct (busy affordance vs. delivery failure)
+	// and not a duplicate. Best-effort: errors are logged and don't
+	// block the dispatch path. BUSY_REACTION= (set-but-empty) disables
+	// this block entirely — no reaction, no mark.
+	if target != "" && cfg.slackBotToken != "" && cfg.busyReaction != "" {
+		cfg.busyMarks.mark(msg.Channel, busyThreadKey(msg.ThreadTS, msg.TS), msg.TS)
+		go func(channel, ts, emoji string) {
 			_, err := postReactionToSlack(cfg.slackBotToken, slackReactionsAddReq{
 				Channel:   channel,
-				Name:      "eyes",
+				Name:      emoji,
 				Timestamp: ts,
 			})
 			if err != nil {
-				log.Printf("react eyes failed: chan=%s ts=%s: %v", channel, ts, err)
+				log.Printf("react busy %s failed: chan=%s ts=%s: %v", emoji, channel, ts, err)
 			}
-		}(msg.Channel, msg.TS)
+		}(msg.Channel, msg.TS, cfg.busyReaction)
 	}
 
 	// Cross-channel address-by-handle: if the parsed target matches a
