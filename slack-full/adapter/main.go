@@ -3928,10 +3928,15 @@ func dispatchToAliasedSession(cfg config, sessionID string, msg externalInboundM
 	// path (cby.33) so a forged </system-reminder> in a filename cannot break
 	// out of the reminder envelope. Empty string when there are no
 	// attachments, leaving the body byte-identical to the text-only form.
+	// The attachments header carries the gt-slack guard semantics: Read
+	// only if relevant, and NEVER paste the paths into the reply. A bare
+	// or pasted local image path triggers Claude Code auto-attach, which
+	// re-reads the image every turn and can wedge the session with
+	// Anthropic HTTP 400s.
 	attachmentsBlock := ""
 	if len(msg.Attachments) > 0 {
 		var ab strings.Builder
-		fmt.Fprintf(&ab, "\nAttachments (%d) — saved to local disk; Read the file:// path to view:\n", len(msg.Attachments))
+		fmt.Fprintf(&ab, "\nAttachments (%d) — saved to local disk. Read a file:// path only if relevant; never paste these paths into your reply:\n", len(msg.Attachments))
 		for i, att := range msg.Attachments {
 			name := filepath.Base(strings.TrimPrefix(att.URL, "file://"))
 			fmt.Fprintf(&ab, "  %d. %s (%s): %s\n",

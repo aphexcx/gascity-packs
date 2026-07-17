@@ -77,6 +77,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The attachments block injected into the address-by-handle
+  system-reminder now instructs the receiving agent to Read a
+  `file://` path only if relevant and to never paste the paths into
+  its reply (`hq-xizo`). Bare or pasted local image paths trigger
+  Claude Code auto-attach, which re-reads the image every turn and
+  can wedge the session with Anthropic HTTP 400s. Count and per-file
+  lines are unchanged.
 - Inbound messages whose text carries the `*Sent using* <@USER_ID>`
   trailer that Slack appends to user-token MCP-integration posts are
   now dropped before the forward to gc (`hq-xizo`). Those posts arrive

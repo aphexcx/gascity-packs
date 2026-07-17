@@ -1531,9 +1531,14 @@ func TestDispatchToAliasedSessionIncludesAttachments(t *testing.T) {
 	}
 	body := msg.Message
 
-	// (a) attachments header carries the count.
-	if !strings.Contains(body, "Attachments (2)") {
-		t.Errorf("body missing \"Attachments (2)\" header:\n%s", body)
+	// (a) attachments header carries the count and the auto-attach guard
+	//     wording: Read only if relevant, never paste the paths into the
+	//     reply — bare local image paths trigger Claude Code auto-attach,
+	//     which re-reads the image every turn and can wedge the session
+	//     with Anthropic HTTP 400s.
+	wantHeader := "Attachments (2) — saved to local disk. Read a file:// path only if relevant; never paste these paths into your reply:"
+	if !strings.Contains(body, wantHeader) {
+		t.Errorf("body missing attachments header %q:\n%s", wantHeader, body)
 	}
 	// (b) the clean attachment's file:// path, basename and both MIME types
 	//     surface verbatim (no '<' so neutralization is a no-op for them).
