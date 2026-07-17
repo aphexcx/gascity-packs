@@ -77,6 +77,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Inbound messages whose text carries the `*Sent using* <@USER_ID>`
+  trailer that Slack appends to user-token MCP-integration posts are
+  now dropped before the forward to gc (`hq-xizo`). Those posts arrive
+  with an empty `bot_id` and no subtype, so the existing bot/system
+  guard did not catch them; without this check a bound channel can
+  loop agent→Slack→adapter→agent (observed live 2026-07-16). The drop
+  is logged with channel, ts, and text length only — never the body.
 - Inbound Slack events are no longer lost when the forward to gc's
   `extmsg/inbound` endpoint fails (`hq-xizo`). The adapter 200-acks
   Slack before forwarding, so a failed POST used to drop the message

@@ -2436,6 +2436,12 @@ func slackKindFromChannelType(channelType, channelID string) string {
 	return "dm"
 }
 
+// mcpEchoSignature is the trailer Slack appends to messages posted by
+// user-token MCP integrations ("*Sent using* <@USER_ID>"). Single
+// asterisks — Slack mrkdwn bold — exactly as delivered in event text.
+// processSlackEvent drops any inbound whose text contains it (hq-xizo).
+const mcpEchoSignature = "*Sent using* <@"
+
 // processSlackEvent runs the per-inbound-event work (signature parse,
 // postInbound to gc, optional alias dispatch). It owns the dispatch
 // slot supplied by handleSlackEvents: the slot is released either on
@@ -2467,6 +2473,18 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 	}
 	// Skip bot/system messages.
 	if msg.BotID != "" || msg.Subtype != "" || msg.User == "" {
+		return
+	}
+	// Skip messages bearing the MCP-integration echo signature. Other
+	// Slack MCP integrations post via user tokens, and Slack appends
+	// "*Sent using* <@USER_ID>" (mrkdwn, single asterisks) to those
+	// messages — they arrive with an empty bot_id and no subtype, so
+	// the guard above does not catch them. Without this check a bound
+	// channel can loop agent→Slack→adapter→agent (observed live
+	// 2026-07-16 in this workspace).
+	if strings.Contains(msg.Text, mcpEchoSignature) {
+		log.Printf("dropping inbound bearing MCP echo signature chan=%s ts=%s text=%dch",
+			msg.Channel, msg.TS, len(msg.Text))
 		return
 	}
 	if strings.TrimSpace(msg.Text) == "" {

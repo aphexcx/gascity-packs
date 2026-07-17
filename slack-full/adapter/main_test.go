@@ -4175,6 +4175,58 @@ func TestProcessSlackEventReleasesSlotOnNoAliasPath(t *testing.T) {
 	}
 }
 
+// TestProcessSlackEventDropsMCPEchoSignature verifies the echo/loop
+// guard (hq-xizo): a message whose text carries the "*Sent using* <@"
+// trailer that Slack appends to user-token MCP-integration posts must
+// be dropped before the forward to gc — such messages have an empty
+// bot_id and no subtype, so only this text check prevents a bound
+// channel from looping agent→Slack→adapter→agent. A normal message
+// through the same harness must still be forwarded, proving the stub
+// detects forwards.
+func TestProcessSlackEventDropsMCPEchoSignature(t *testing.T) {
+	var inboundPosts int32
+	gcStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		if strings.Contains(r.URL.Path, "/extmsg/inbound") {
+			atomic.AddInt32(&inboundPosts, 1)
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	t.Cleanup(gcStub.Close)
+
+	cfg := config{
+		gcAPIBase:    gcStub.URL,
+		cityName:     "test-city",
+		provider:     "slack",
+		accountID:    "T1",
+		handlePrefix: "@",
+		dispatchSem:  defaultTestDispatchSem,
+	}
+	aliasReg := newTestHandleAliasRegistry(t)
+
+	mk := func(ts, text string) slackEventEnvelope {
+		raw, _ := json.Marshal(slackMessageEvent{
+			Type: "message", Channel: "C1", User: "U1", TS: ts,
+			Text: text,
+		})
+		return slackEventEnvelope{Type: "event_callback", Event: raw}
+	}
+
+	// Marker anywhere in the text → dropped, no POST to gc.
+	processSlackEvent(cfg, aliasReg, nil, nil, nil, nil,
+		mk("1.0", "deploy done!\n\n*Sent using* <@U099LNBUAML|mcp-user>"), func() {})
+	if got := atomic.LoadInt32(&inboundPosts); got != 0 {
+		t.Fatalf("marker message forwarded to gc %d times; want 0", got)
+	}
+
+	// Normal message through the identical harness → forwarded exactly once.
+	processSlackEvent(cfg, aliasReg, nil, nil, nil, nil,
+		mk("2.0", "deploy done, no marker here"), func() {})
+	if got := atomic.LoadInt32(&inboundPosts); got != 1 {
+		t.Fatalf("normal message forwarded to gc %d times; want exactly 1", got)
+	}
+}
+
 // TestProcessSlackEventTransfersSlotToAliasGoroutine verifies the
 // alias-dispatch path takes ownership of the caller-supplied slot
 // (no separate acquire) and the release fires exactly once after
