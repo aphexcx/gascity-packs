@@ -70,7 +70,13 @@ func TestOpenBeneathRejectsInvalidRel(t *testing.T) {
 }
 
 func TestReadConfinedFileStillReadsAndStillConfines(t *testing.T) {
-	root := t.TempDir()
+	// Canonicalize: readConfinedFile's contract is an EvalSymlinks-resolved
+	// path, and on darwin t.TempDir() sits under the /var -> /private/var
+	// symlink.
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
 	sub := filepath.Join(root, "files")
 	if err := os.MkdirAll(sub, 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)

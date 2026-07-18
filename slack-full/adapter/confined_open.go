@@ -9,20 +9,23 @@ import (
 )
 
 // openBeneath opens rel (a Clean, root-relative path containing no
-// "..") beneath rootAbs by walking one path component at a time: each
-// step is an openat(2) relative to the fd of the already-opened parent,
-// with O_NOFOLLOW set. The parent fd pins the verified directory inode,
-// so a directory swapped for a symlink mid-walk cannot redirect the
-// traversal — the userspace equivalent of openat2(RESOLVE_BENEATH),
-// which stdlib syscall does not expose (and the adapter's
-// zero-dependency go.mod keeps us from importing x/sys for).
+// "..") beneath rootAbs via os.Root, the stdlib's openat(2)-backed
+// traversal-confined API: every component resolves relative to the
+// pinned root fd, so a directory swapped for a symlink mid-walk cannot
+// redirect the open outside rootAbs — the portable equivalent of
+// openat2(RESOLVE_BENEATH). The previous hand-rolled walk used raw
+// syscall.Openat, which does not exist on darwin and made the adapter
+// linux-only.
 //
-// O_NOFOLLOW applies to every component, not just the leaf, so any
-// symlink anywhere beneath root is a hard failure (ELOOP / ENOTDIR).
-// That matches the caller's contract: realPath is EvalSymlinks-resolved
-// before it gets here, so every component of a legitimate path is a
-// real directory or file and the walk succeeds; only a mid-flight swap
-// trips it.
+// O_NOFOLLOW on the leaf preserves the old walk's swap detection where
+// it matters most: realPath is EvalSymlinks-resolved before it gets
+// here, so a symlink at the leaf means the inode was swapped in the
+// race window, and the open fails with ELOOP rather than silently
+// reading the link target. Intermediate components differ from the old
+// per-component O_NOFOLLOW in one way: a symlink whose target stays
+// inside the root is followed rather than rejected. The caller's
+// contract — confinement to rootAbs — holds either way; any link that
+// would resolve outside the root fails the open.
 func openBeneath(rootAbs, rel string) (*os.File, error) {
 	if rel == "" || rel == "." || filepath.IsAbs(rel) {
 		return nil, fmt.Errorf("openBeneath: invalid relative path %q", rel)
@@ -33,22 +36,14 @@ func openBeneath(rootAbs, rel string) (*os.File, error) {
 			return nil, fmt.Errorf("openBeneath: invalid path component %q in %q", c, rel)
 		}
 	}
-	dirFlags := syscall.O_RDONLY | syscall.O_DIRECTORY | syscall.O_NOFOLLOW | syscall.O_CLOEXEC
-	fd, err := syscall.Open(rootAbs, dirFlags, 0)
+	root, err := os.OpenRoot(rootAbs)
 	if err != nil {
 		return nil, fmt.Errorf("openBeneath: open root %q: %w", rootAbs, err)
 	}
-	for i, c := range comps {
-		flags := syscall.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_CLOEXEC
-		if i < len(comps)-1 {
-			flags |= syscall.O_DIRECTORY
-		}
-		next, err := syscall.Openat(fd, c, flags, 0)
-		syscall.Close(fd)
-		if err != nil {
-			return nil, fmt.Errorf("openBeneath: open component %q of %q: %w", c, rel, err)
-		}
-		fd = next
+	defer root.Close()
+	f, err := root.OpenFile(rel, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, fmt.Errorf("openBeneath: open %q beneath %q: %w", rel, rootAbs, err)
 	}
-	return os.NewFile(uintptr(fd), filepath.Join(rootAbs, rel)), nil
+	return f, nil
 }
