@@ -2236,7 +2236,13 @@ func TestHandlePublishFile(t *testing.T) {
 // reading a regular file inside the upload root must succeed and return
 // the file's bytes verbatim.
 func TestReadConfinedFileReadsRealFile(t *testing.T) {
-	dir := t.TempDir()
+	// Canonicalize: readConfinedFile's contract is an EvalSymlinks-resolved
+	// path, and on darwin t.TempDir() sits under the /var -> /private/var
+	// symlink.
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
 	path := filepath.Join(dir, "real.txt")
 	want := []byte("hello world")
 	if err := os.WriteFile(path, want, 0o600); err != nil {
@@ -2256,12 +2262,18 @@ func TestReadConfinedFileReadsRealFile(t *testing.T) {
 // In production the call site has already EvalSymlinks-resolved the path
 // to a canonical target with no symlinks; if a symlink appears at the leaf
 // between the confinement re-check and the read, an attacker would have
-// swapped the inode in the race window. O_NOFOLLOW makes that swap visible
-// as ELOOP rather than silent arbitrary-read. Both Linux and macOS return
-// ELOOP from open(2) with O_NOFOLLOW on a symlink — errors.Is unwraps
-// through *os.PathError to the underlying syscall.Errno.
+// swapped the inode in the race window. The open must fail rather than
+// silently read through the link. The exact error depends on which layer
+// trips first: O_NOFOLLOW on the leaf yields ELOOP, while os.Root's
+// resolution reports an absolute-target symlink as escaping the root
+// before the leaf open happens. Either way the swap is detected.
 func TestReadConfinedFileRejectsSymlink(t *testing.T) {
-	dir := t.TempDir()
+	// Canonical dir, non-canonical leaf: the symlink at the leaf is the
+	// simulated race-window inode swap and must stay unresolved.
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
 	target := filepath.Join(dir, "target.txt")
 	if err := os.WriteFile(target, []byte("secret"), 0o600); err != nil {
 		t.Fatalf("write target: %v", err)
@@ -2271,12 +2283,12 @@ func TestReadConfinedFileRejectsSymlink(t *testing.T) {
 		t.Fatalf("symlink: %v", err)
 	}
 
-	_, err := readConfinedFile(dir, link)
+	_, err = readConfinedFile(dir, link)
 	if err == nil {
 		t.Fatal("readConfinedFile(symlink): want error, got nil — TOCTOU window unclosed")
 	}
-	if !errors.Is(err, syscall.ELOOP) {
-		t.Errorf("readConfinedFile(symlink) error = %v, want ELOOP", err)
+	if !errors.Is(err, syscall.ELOOP) && !strings.Contains(err.Error(), "escapes") {
+		t.Errorf("readConfinedFile(symlink) error = %v, want ELOOP or root-escape rejection", err)
 	}
 }
 
