@@ -65,6 +65,19 @@ as more issue ids and may fuzzy-match unrelated beads.
 gc bd close "$CLAIMED_BEAD_ID" --reason '...'
 ```
 
+Publish handoff — PR deliverables. If the bead's deliverable is a pull request,
+do not close it done until one of these holds; never silently drop the merge
+baton:
+
+- the PR is merged — a mayor merges it, you never merge your own, or
+- you mailed the mayor a merge request AND referenced that mail in the close
+  reason.
+
+```bash
+gc mail send mayor -s 'MERGE REQUEST: PR #<n>' -m '<branch> green; ready to merge'
+gc bd close "$CLAIMED_BEAD_ID" --reason 'PR #<n>; merge-request mailed to mayor.'
+```
+
 ## Continue
 
 After close, inspect `CLAIMED_CONTINUATION_GROUP` before another claim:
