@@ -2101,60 +2101,60 @@ func handleSlackEvents(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 
 		// Process event_callback. Always 200 quickly to avoid Slack retries.
 		w.WriteHeader(http.StatusOK)
-		// Route KNOWN events past the queue-full load-shed first
-		// (codex r7): a redelivery of a committed event needs no slot
-		// to drop, and a redelivery of an IN-FLIGHT event must park —
-		// slotless — even when the queue is saturated, because if the
-		// owner then fails this acked copy is the event's only
-		// recovery. Only genuinely new events contend at the
-		// nonblocking load-shed below. The peek is advisory (a claim
-		// can appear or conclude before the goroutine's begin); the
-		// begin loop re-checks and handles every interleaving.
-		needSlot := true
-		if unknown, wait := cfg.eventDedup.peek(env.EventID); !unknown {
-			if wait == nil {
-				log.Printf("slack event dedup: dropping redelivery event_id=%s retry_num=%q team_id=%q",
-					env.EventID, r.Header.Get("X-Slack-Retry-Num"), clipTeamIDForLog(teamID))
-				return
-			}
-			needSlot = false
-		}
-		var release func()
-		if needSlot {
-			var capacity int
-			var ok bool
-			release, capacity, ok = cfg.acquireDispatchSlot()
-			if !ok {
-				log.Printf("slack adapter: dispatch queue full (cap=%d), dropping slack event type=%q",
-					capacity, env.Type)
-				return
-			}
-		}
-		// Drop Events API redeliveries. Slack retries any delivery it
+		// Dedup Events API redeliveries. Slack retries any delivery it
 		// considers unacknowledged (network hiccup, slow first ack, its
 		// own read timeout) with the SAME event_id, and every retry that
 		// slips through forwards a duplicate notification into the bound
 		// session (hw-94w5k finding #4: byte-identical inbound log pairs).
-		// The 200 above already acknowledged this delivery, so returning
-		// here is safe. Keyed on event_id only — it is unique per event
-		// and stable across retries. Envelopes without an event_id (not
-		// event_callback shaped) are never deduped.
+		// The 200 above already acknowledged this delivery, so a drop
+		// below is safe. Keyed on event_id only — it is unique per
+		// event and stable across retries. Envelopes without an
+		// event_id (not event_callback shaped) are never deduped.
 		//
+		// The claim is taken SYNCHRONOUSLY, before load shedding
+		// (codex r9): two simultaneous deliveries of one event both
+		// racing an async claim could otherwise each read "unknown",
+		// with the loser dropped at the queue-full check — and if the
+		// winner's forward then failed, that dropped, already-acked
+		// copy was the event's only recovery. With the claim taken
+		// here, exactly one delivery owns the event; every other copy
+		// either drops (committed) or parks slotless (in flight).
+		// Cheap in-memory op — the handler still acks promptly.
+		retryNum := r.Header.Get("X-Slack-Retry-Num")
+		proceed, wait := cfg.eventDedup.begin(env.EventID)
+		if !proceed && wait == nil {
+			log.Printf("slack event dedup: dropping redelivery event_id=%s retry_num=%q team_id=%q",
+				env.EventID, retryNum, clipTeamIDForLog(teamID))
+			return
+		}
+		var release func()
+		if proceed {
+			// This delivery owns the event: contend at the nonblocking
+			// load-shed. On queue-full the claim is forgotten so a
+			// parked or future copy can take over — the event is only
+			// lost if no other copy exists, which is the accepted
+			// saturation-shedding behavior for unowned events too.
+			var capacity int
+			var ok bool
+			release, capacity, ok = cfg.acquireDispatchSlot()
+			if !ok {
+				cfg.eventDedup.forget(env.EventID)
+				log.Printf("slack adapter: dispatch queue full (cap=%d), dropping slack event type=%q event_id=%q",
+					capacity, env.Type, env.EventID)
+				return
+			}
+		}
 		// A redelivery that races the FIRST delivery's still-running
-		// forward must not be discarded on the spot: if that forward
-		// then fails, the discarded retry was the message's last chance
-		// (Slack got a 200 for it and stops the ladder). begin reports
-		// the in-flight case with a wait channel; the loop re-begins
-		// for the final verdict once the first delivery commits
-		// (→ drop) or forgets (→ this delivery takes over). The whole
-		// claim-then-process sequence runs in a goroutine so the
-		// handler returns — and net/http actually FINISHES the 200
-		// response — before any waiting happens; blocking the handler
-		// would delay the ack past Slack's timeout and provoke the
-		// very retries this code exists to absorb (codex r3 P2). The
-		// wait is bounded so a hung forward cannot pile up goroutines;
-		// a bound-expiry drop is loud-logged and Slack's next retry
-		// rung gets the same chance again. codex r2 P1.
+		// forward must not be discarded: if that forward then fails,
+		// the discarded retry was the message's last chance (Slack got
+		// a 200 for it and stops the ladder). It parks — slotless, in
+		// a goroutine, so the handler returns and net/http FINISHES
+		// the 200 before any waiting happens (codex r3 P2) — until the
+		// in-flight claim concludes: commit → drop, forget → take over
+		// (blocking-acquiring a fresh slot; codex r5). Parked
+		// goroutines cannot leak because every claim concludes
+		// (bounded gc forwards + conclude-on-every-return in
+		// processSlackEvent).
 		//
 		// Slot ownership transfers to processSlackEvent, which either
 		// releases on its own return path or hands the slot to its
@@ -2162,35 +2162,9 @@ func handleSlackEvents(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 		// cfg.dispatchSem when an inbound triggers an alias dispatch (which
 		// would otherwise hold two slots concurrently — see gc-cby.26
 		// Phase 4 review fix). The drop paths below release explicitly.
-		retryNum := r.Header.Get("X-Slack-Retry-Num")
 		go func() {
 			ownsSlot := release != nil
-			for {
-				proceed, wait := cfg.eventDedup.begin(env.EventID)
-				if proceed {
-					break
-				}
-				if wait == nil {
-					if ownsSlot {
-						release()
-					}
-					log.Printf("slack event dedup: dropping redelivery event_id=%s retry_num=%q team_id=%q",
-						env.EventID, retryNum, clipTeamIDForLog(teamID))
-					return
-				}
-				// Park until the in-flight claim concludes. NEVER give
-				// up (codex r4): this delivery already got its 200, so
-				// Slack will not resend it — dropping it while the
-				// owner is undecided would lose the event if the owner
-				// then fails. The slot is released while parked so
-				// waiting redeliveries cannot starve the dispatch
-				// semaphore; parked goroutines cannot leak because
-				// every claim concludes (bounded gc forwards +
-				// conclude-on-every-return in processSlackEvent).
-				if ownsSlot {
-					release()
-					ownsSlot = false
-				}
+			for !proceed {
 				for parked := true; parked; {
 					select {
 					case <-wait:
@@ -2199,6 +2173,12 @@ func handleSlackEvents(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 						log.Printf("slack event dedup: redelivery of event_id=%s still parked behind an in-flight delivery (retry_num=%q)",
 							env.EventID, retryNum)
 					}
+				}
+				proceed, wait = cfg.eventDedup.begin(env.EventID)
+				if !proceed && wait == nil {
+					log.Printf("slack event dedup: dropping redelivery event_id=%s retry_num=%q team_id=%q",
+						env.EventID, retryNum, clipTeamIDForLog(teamID))
+					return
 				}
 			}
 			if !ownsSlot {

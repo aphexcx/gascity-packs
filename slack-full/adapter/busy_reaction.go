@@ -164,6 +164,39 @@ type busyReactionRegistry struct {
 // comfortably past that while keeping the map small.
 const busyTombstoneTTL = 5 * time.Minute
 
+// busyTombstoneMaxEntries hard-caps the tombstone map (codex r9):
+// every consumed thread writes one, so sustained traffic would grow
+// it unboundedly between mark-site sweeps, and traffic stopping would
+// strand expired entries. tombstoneLocked sweeps expired entries on
+// every insert and evicts the oldest at the cap — an evicted
+// tombstone just stops blocking one restoration, the pre-tombstone
+// behavior.
+const busyTombstoneMaxEntries = 4096
+
+// tombstoneLocked records a consumed key, sweeping expired tombstones
+// and enforcing the cap. Called with r.mu held.
+func (r *busyReactionRegistry) tombstoneLocked(key busyReactionKey, now time.Time) {
+	for k, at := range r.tombstones {
+		if now.Sub(at) > busyTombstoneTTL {
+			delete(r.tombstones, k)
+		}
+	}
+	r.tombstones[key] = now
+	if len(r.tombstones) > busyTombstoneMaxEntries {
+		var oldestK busyReactionKey
+		var oldestAt time.Time
+		first := true
+		for k, at := range r.tombstones {
+			if first || at.Before(oldestAt) {
+				oldestK, oldestAt, first = k, at, false
+			}
+		}
+		if !first {
+			delete(r.tombstones, oldestK)
+		}
+	}
+}
+
 func newBusyReactionRegistry() *busyReactionRegistry {
 	return &busyReactionRegistry{
 		entries:    make(map[busyReactionKey]busyReactionMark),
@@ -422,7 +455,7 @@ func (r *busyReactionRegistry) takeConversation(channel string) []busyTaken {
 			continue
 		}
 		delete(r.entries, k)
-		r.tombstones[k] = now
+		r.tombstoneLocked(k, now)
 		if now.Sub(m.addedAt) > busyReactionTTL {
 			continue
 		}
@@ -502,7 +535,7 @@ func (r *busyReactionRegistry) take(channel, threadKey string) []busyTaken {
 	}
 	delete(r.entries, key)
 	now := r.clock()
-	r.tombstones[key] = now
+	r.tombstoneLocked(key, now)
 	if now.Sub(m.addedAt) > busyReactionTTL {
 		return nil
 	}

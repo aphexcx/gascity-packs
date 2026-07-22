@@ -123,35 +123,6 @@ func (c *eventDedupCache) begin(id string) (proceed bool, wait <-chan struct{}) 
 	return true, nil
 }
 
-// peek reports id's state WITHOUT claiming it: (true, nil) means the
-// id is unknown (the caller should acquire resources and then begin),
-// (false, nil) means committed (drop as duplicate), (false, ch) means
-// in flight (park on ch without holding resources, then begin). Used
-// by the events handler to route redeliveries of known events past
-// the queue-full load-shed — a redelivery of an in-flight event must
-// park even when no dispatch slot is free, because it may be the
-// event's only remaining copy (codex r7). Nil cache / empty id peek
-// as unknown.
-func (c *eventDedupCache) peek(id string) (unknown bool, wait <-chan struct{}) {
-	if c == nil || id == "" {
-		return true, nil
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	e, ok := c.entries[id]
-	if !ok {
-		return true, nil
-	}
-	if e.committedAt.IsZero() {
-		return false, e.done
-	}
-	if c.clock().Sub(e.committedAt) > c.ttl {
-		// Expired committed entry: treat as unknown (begin will sweep).
-		return true, nil
-	}
-	return false, nil
-}
-
 // commit marks id as successfully processed: redeliveries within the
 // TTL now drop, and any waiter re-begins into the committed verdict.
 // No-op for unknown ids (evicted under cap pressure, or empty).
