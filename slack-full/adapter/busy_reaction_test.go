@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -227,7 +229,8 @@ func TestBusyReaction_PublishToSameThreadRemovesBusy(t *testing.T) {
 			withSlackAPIStub(t, slackStub)
 
 			marks := newBusyReactionRegistry()
-			marks.mark("C1", tc.threadKey, tc.markedTS)
+			// Close addDone: the add already completed in this scenario.
+			close(marks.mark("C1", tc.threadKey, tc.markedTS))
 			cfg := config{slackBotToken: "xoxb-fake", busyReaction: "hourglass", busyMarks: marks}
 
 			req := httptest.NewRequest(http.MethodPost, "/publish", strings.NewReader(publishBody("C1", tc.threadKey)))
@@ -400,6 +403,129 @@ func TestBusyReaction_CustomEmojiHonored(t *testing.T) {
 	}
 }
 
+// (f) A reply that lands while the reactions.add is still in flight
+// must not have its reactions.remove overtake the add — Slack would
+// apply the delayed add last and the busy emoji would stick forever.
+// The remove side waits on the mark's addDone channel (hw-94w5k
+// codex r1).
+func TestBusyReaction_FastReplyWaitsForAddBeforeRemove(t *testing.T) {
+	rr := &reactionRecorder{ch: make(chan recordedReaction, 16)}
+	slackStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/reactions.add"):
+			// Simulate a slow Slack: the add is still in flight when
+			// the reply's publish arrives.
+			time.Sleep(400 * time.Millisecond)
+			var body slackReactionsAddReq
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			rr.record(recordedReaction{op: "add", channel: body.Channel, name: body.Name, timestamp: body.Timestamp})
+			_, _ = fmt.Fprint(w, `{"ok":true}`)
+		case strings.HasSuffix(r.URL.Path, "/reactions.remove"):
+			var body slackReactionsAddReq
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			rr.record(recordedReaction{op: "remove", channel: body.Channel, name: body.Name, timestamp: body.Timestamp})
+			_, _ = fmt.Fprint(w, `{"ok":true}`)
+		case strings.HasSuffix(r.URL.Path, "/chat.postMessage"):
+			_, _ = fmt.Fprint(w, `{"ok":true,"ts":"999.000001"}`)
+		default:
+			_, _ = fmt.Fprint(w, `{"ok":true}`)
+		}
+	}))
+	t.Cleanup(slackStub.Close)
+	withSlackAPIStub(t, slackStub)
+	capture := &inboundCapture{}
+	gcStub := httptest.NewServer(capture.handler())
+	t.Cleanup(gcStub.Close)
+
+	cfg := busyTestConfig(gcStub.URL)
+	env := targetedInboundEnvelope(t, "C1", "100.000010", "")
+	processSlackEvent(cfg, newTestHandleAliasRegistry(t), nil, nil, nil, nil, env, func() {})
+
+	// Reply immediately — well before the 400ms add completes.
+	req := httptest.NewRequest(http.MethodPost, "/publish", strings.NewReader(publishBody("C1", "100.000010")))
+	rec := httptest.NewRecorder()
+	handlePublish(cfg, nil, nil, newPublishDedupCache(publishDedupTTL))(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("publish status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+
+	first := rr.await(t, 2*time.Second)
+	second := rr.await(t, 2*time.Second)
+	if first.op != "add" || second.op != "remove" {
+		t.Errorf("reaction order = (%s, %s), want (add, remove) — remove must not overtake the in-flight add",
+			first.op, second.op)
+	}
+}
+
+// A threaded /publish-file reply — possibly the agent's entire answer
+// — clears the pending busy mark exactly like a text publish
+// (hw-94w5k codex r1).
+func TestBusyReaction_PublishFileToSameThreadRemovesBusy(t *testing.T) {
+	rr := &reactionRecorder{ch: make(chan recordedReaction, 16)}
+	uploadStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(uploadStub.Close)
+	slackStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/files.getUploadURLExternal"):
+			_, _ = fmt.Fprintf(w, `{"ok":true,"upload_url":%q,"file_id":"F1"}`, uploadStub.URL+"/upload")
+		case strings.HasSuffix(r.URL.Path, "/files.completeUploadExternal"):
+			_, _ = fmt.Fprint(w, `{"ok":true,"files":[{"id":"F1"}]}`)
+		case strings.HasSuffix(r.URL.Path, "/reactions.remove"):
+			var body slackReactionsAddReq
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			rr.record(recordedReaction{op: "remove", channel: body.Channel, name: body.Name, timestamp: body.Timestamp})
+			_, _ = fmt.Fprint(w, `{"ok":true}`)
+		default:
+			_, _ = fmt.Fprint(w, `{"ok":true}`)
+		}
+	}))
+	t.Cleanup(slackStub.Close)
+	withSlackAPIStub(t, slackStub)
+
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	filePath := filepath.Join(root, "answer.png")
+	if err := os.WriteFile(filePath, []byte("PNGDATA"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	marks := newBusyReactionRegistry()
+	close(marks.mark("C1", "100.000010", "100.000010"))
+	cfg := config{
+		slackBotToken:  "xoxb-fake",
+		busyReaction:   "hourglass",
+		busyMarks:      marks,
+		fileUploadRoot: root,
+	}
+
+	body := fmt.Sprintf(`{"conversation":{"conversation_id":"C1"},"file_path":%q,"reply_to_message_id":"100.000010"}`, filePath)
+	req := httptest.NewRequest(http.MethodPost, "/publish-file", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	handlePublishFile(cfg, nil)(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("publish-file status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var receipt publishFileReceipt
+	if err := json.Unmarshal(rec.Body.Bytes(), &receipt); err != nil || !receipt.Delivered {
+		t.Fatalf("publish-file receipt delivered = %v (err=%v, body=%s)", receipt.Delivered, err, rec.Body.String())
+	}
+
+	got := rr.await(t, 2*time.Second)
+	if got.op != "remove" || got.name != "hourglass" || got.channel != "C1" || got.timestamp != "100.000010" {
+		t.Errorf("reaction = (%s, %s on %s/%s), want (remove, hourglass on C1/100.000010)",
+			got.op, got.name, got.channel, got.timestamp)
+	}
+	if _, ok := marks.pending("C1", "100.000010"); ok {
+		t.Error("registry entry survived the file publish; want consumed")
+	}
+}
+
 // (g) A mark past busyReactionTTL is dead: the publish consumes the
 // stale entry but fires no reactions.remove.
 func TestBusyReaction_ExpiredMarkDoesNotRemove(t *testing.T) {
@@ -450,10 +576,10 @@ func TestBusyReactionRegistry_TakeAndSweep(t *testing.T) {
 	}
 
 	r.mark("C1", "1.0", "1.0")
-	if ts, ok := r.take("C1", "1.0"); !ok || ts != "1.0" {
+	if ts, _, ok := r.take("C1", "1.0"); !ok || ts != "1.0" {
 		t.Fatalf("take = (%q, %v), want (1.0, true)", ts, ok)
 	}
-	if _, ok := r.take("C1", "1.0"); ok {
+	if _, _, ok := r.take("C1", "1.0"); ok {
 		t.Fatal("second take succeeded; want consumed on first take")
 	}
 
@@ -507,8 +633,10 @@ func TestBusyReactionRegistry_CapEvictsOldest(t *testing.T) {
 // without busyMarks).
 func TestBusyReactionRegistry_NilSafe(t *testing.T) {
 	var r *busyReactionRegistry
-	r.mark("C1", "1.0", "1.0")
-	if _, ok := r.take("C1", "1.0"); ok {
+	if done := r.mark("C1", "1.0", "1.0"); done == nil {
+		t.Error("mark on nil registry returned a nil addDone channel; want closable")
+	}
+	if _, _, ok := r.take("C1", "1.0"); ok {
 		t.Error("take on nil registry reported a mark")
 	}
 	if _, ok := r.pending("C1", "1.0"); ok {

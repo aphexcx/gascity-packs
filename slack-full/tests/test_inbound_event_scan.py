@@ -159,6 +159,30 @@ def test_name_bound_session_matched_via_env_name(
     assert event["payload"]["conversation_id"] == "C0ENVNAME"
 
 
+def test_explicit_other_session_ignores_ambient_env_name(
+    gc_mock: "GcMock",
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `--session <other>` must not inherit the CURRENT process's
+    # GC_SESSION_NAME: a newer inbound targeting the ambient name would
+    # otherwise win the scan and misroute the reply/reaction.
+    common = _import_common()
+    monkeypatch.setenv("GC_SESSION_NAME", "mayor")  # current session's name
+    gc_mock.register_inbound_event(
+        target_session="mayor", conversation_id="C0AMBIENT", age_seconds=5,
+    )
+    gc_mock.register_inbound_event(
+        target_session="other-session", conversation_id="C0THEIRS", age_seconds=60,
+    )
+
+    event = common.find_latest_inbound_for_session("other-session")
+
+    assert event is not None
+    assert event["payload"]["conversation_id"] == "C0THEIRS", (
+        "ambient GC_SESSION_NAME leaked into an explicit --session lookup"
+    )
+
+
 def test_identity_candidates_degrade_without_sessions_endpoint(
     gc_mock: "GcMock",
     monkeypatch: pytest.MonkeyPatch,

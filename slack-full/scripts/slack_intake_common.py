@@ -367,10 +367,17 @@ def session_identity_candidates(session_id: str) -> set[str]:
     Best-effort: the /sessions resolve failing (gc down, restricted
     token) degrades to the env-derived candidates rather than raising —
     the caller's lookup then behaves exactly as before this fix.
+
+    GC_SESSION_NAME names the CURRENT process's session, so it only
+    joins the set when session_id is that session (id or name match) —
+    an explicit ``--session <other>`` must never inherit the ambient
+    name, or a newer inbound for the current session would win the
+    scan and misroute the reply/reaction to the wrong conversation.
     """
     candidates = {session_id}
     env_name = os.environ.get("GC_SESSION_NAME", "").strip()
-    if env_name:
+    env_id = os.environ.get("GC_SESSION_ID", "").strip()
+    if env_name and session_id in (env_id, env_name):
         candidates.add(env_name)
     try:
         res = gc_get("/sessions")

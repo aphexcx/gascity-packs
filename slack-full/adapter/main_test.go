@@ -2315,8 +2315,9 @@ func TestReadConfinedFileRejectsSymlink(t *testing.T) {
 	if err == nil {
 		t.Fatal("readConfinedFile(symlink): want error, got nil — TOCTOU window unclosed")
 	}
-	if !errors.Is(err, syscall.ELOOP) && !strings.Contains(err.Error(), "escapes") {
-		t.Errorf("readConfinedFile(symlink) error = %v, want ELOOP or root-escape rejection", err)
+	if !errors.Is(err, syscall.ELOOP) && !strings.Contains(err.Error(), "escapes") &&
+		!strings.Contains(err.Error(), "is a symlink") {
+		t.Errorf("readConfinedFile(symlink) error = %v, want ELOOP / root-escape / leaf-symlink rejection", err)
 	}
 }
 

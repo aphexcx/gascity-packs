@@ -164,6 +164,32 @@ func TestHandleSlackEventsQueueFullDropDoesNotRecordEventID(t *testing.T) {
 	awaitInboundHits(t, hits, 1)
 }
 
+// A delivery whose forward to gc FAILS must release its event_id: in
+// the lost-ack scenario the Slack retry is the only path for the
+// message to reach gc, and a committed id would turn the transient
+// failure into permanent message loss.
+func TestHandleSlackEventsFailedForwardReleasesEventID(t *testing.T) {
+	var hits int32
+	gcStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		// First request fails (gc hiccup); subsequent requests accept.
+		if atomic.AddInt32(&hits, 1) == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	t.Cleanup(gcStub.Close)
+	cfg := dedupTestConfig(t, gcStub.URL)
+
+	envBody := eventEnvelopeBody(t, "Ev0001", "1.0", "hi")
+	postSignedEvent(t, cfg, envBody) // forward fails with 500
+	awaitInboundHits(t, &hits, 1)
+
+	postSignedEvent(t, cfg, envBody) // Slack retry: must NOT be deduped
+	awaitInboundHits(t, &hits, 2)
+}
+
 // A nil cache (mis-wired test config) never dedupes and never panics.
 func TestHandleSlackEventsNilDedupCacheForwardsEverything(t *testing.T) {
 	gcStub, hits := countingGCStub(t)

@@ -49,6 +49,14 @@ const busyReactionTTL = 30 * time.Minute
 // evicted — that mark's reaction just stops being removable.
 const busyReactionMaxEntries = 4096
 
+// busyReactionAddWait bounds how long the remove side waits for the
+// corresponding reactions.add call to finish before issuing
+// reactions.remove anyway. The add normally completes in well under a
+// second; the bound only matters when the add hangs (no client
+// timeout on the Slack HTTP call), where an unbounded wait would leak
+// the remove goroutine.
+const busyReactionAddWait = 10 * time.Second
+
 // busyReactionKey identifies one conversation/thread with a pending
 // busy mark.
 type busyReactionKey struct {
@@ -57,10 +65,17 @@ type busyReactionKey struct {
 }
 
 // busyReactionMark is one pending busy reaction: the ts of the Slack
-// message the reaction was added to, and when it was added (for TTL).
+// message the reaction was added to, when it was added (for TTL), and
+// the channel the add goroutine closes once its reactions.add call has
+// returned. The remove side waits on addDone (bounded by
+// busyReactionAddWait) before firing reactions.remove, so a reply that
+// lands while the add is still in flight cannot have its remove
+// overtaken by the delayed add — which would leave a permanent busy
+// emoji on the message.
 type busyReactionMark struct {
 	messageTS string
 	addedAt   time.Time
+	addDone   chan struct{}
 }
 
 // busyThreadKey derives the registry thread key for an inbound
@@ -106,40 +121,49 @@ func (r *busyReactionRegistry) clock() time.Time {
 // cap. A re-mark of the same key (human re-tags the agent in the same
 // thread before the first reply lands) overwrites — the reaction sits
 // on the newest targeted message and the reply clears that one.
-func (r *busyReactionRegistry) mark(channel, threadKey, messageTS string) {
+//
+// The returned channel is the mark's addDone: the caller's add
+// goroutine MUST close it once its reactions.add call has returned so
+// the remove side can order remove-after-add. Always non-nil — a
+// nil/invalid-args no-op still returns a fresh channel so the caller
+// can close it unconditionally.
+func (r *busyReactionRegistry) mark(channel, threadKey, messageTS string) chan struct{} {
+	addDone := make(chan struct{})
 	if r == nil || channel == "" || threadKey == "" || messageTS == "" {
-		return
+		return addDone
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := r.clock()
 	r.sweepLocked(now)
 	r.entries[busyReactionKey{channel: channel, threadKey: threadKey}] =
-		busyReactionMark{messageTS: messageTS, addedAt: now}
+		busyReactionMark{messageTS: messageTS, addedAt: now, addDone: addDone}
 	if len(r.entries) > busyReactionMaxEntries {
 		r.evictOldestLocked()
 	}
+	return addDone
 }
 
-// take removes and returns the pending mark for (channel, threadKey).
-// An expired entry is deleted but NOT returned — the caller must not
-// fire a reactions.remove for a mark past its TTL.
-func (r *busyReactionRegistry) take(channel, threadKey string) (messageTS string, ok bool) {
+// take removes and returns the pending mark for (channel, threadKey),
+// along with its addDone channel (see mark). An expired entry is
+// deleted but NOT returned — the caller must not fire a
+// reactions.remove for a mark past its TTL.
+func (r *busyReactionRegistry) take(channel, threadKey string) (messageTS string, addDone chan struct{}, ok bool) {
 	if r == nil {
-		return "", false
+		return "", nil, false
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	key := busyReactionKey{channel: channel, threadKey: threadKey}
 	m, present := r.entries[key]
 	if !present {
-		return "", false
+		return "", nil, false
 	}
 	delete(r.entries, key)
 	if r.clock().Sub(m.addedAt) > busyReactionTTL {
-		return "", false
+		return "", nil, false
 	}
-	return m.messageTS, true
+	return m.messageTS, m.addDone, true
 }
 
 // pending reports the recorded message ts for (channel, threadKey)

@@ -79,6 +79,20 @@ func (c *eventDedupCache) seen(id string) bool {
 	return present
 }
 
+// forget drops id from the seen-set. processSlackEvent calls this when
+// processing fails after dispatch (postInbound error): the delivery
+// was recorded at the handler boundary, but nothing reached gc, and a
+// Slack retry carrying the same event_id is then the only recovery —
+// it must not find the id already seen. No-op for unknown ids.
+func (c *eventDedupCache) forget(id string) {
+	if c == nil || id == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.entries, id)
+}
+
 // size reports the number of remembered ids. Test helper.
 func (c *eventDedupCache) size() int {
 	if c == nil {

@@ -1439,38 +1439,12 @@ func handlePublish(cfg config, reg *identityRegistry, userAliases *userAliasMap,
 			receipt.MessageID = slackResp.TS
 		}
 		// Busy-reaction lifecycle, remove side (hq-xizo): a delivered
-		// publish into a conversation/thread carrying a pending busy mark
-		// means the agent's reply has landed — clear the busy emoji from
-		// the inbound message it was added to. ReplyToMessageID is the
-		// publish's thread ts and matches the registry thread key in both
-		// inbound shapes: a thread-reply inbound was marked under its
-		// thread_ts, and a channel-root inbound was marked under its own
-		// ts, which is exactly what a threaded reply to it carries here.
-		// A publish with no ReplyToMessageID posts at channel root and
-		// identifies no thread, so there is nothing to look up; publishes
-		// with no registry hit are untouched. Best-effort and async —
-		// removal failures are logged and never affect the receipt. The
-		// dedup-replay path above returns earlier without re-checking:
-		// the original delivery already consumed the mark.
-		if receipt.Delivered && cfg.busyReaction != "" && req.ReplyToMessageID != "" {
-			if markedTS, ok := cfg.busyMarks.take(req.Conversation.ConversationID, req.ReplyToMessageID); ok {
-				go func(channel, ts, emoji string) {
-					resp, err := removeReactionFromSlack(cfg.slackBotToken, slackReactionsAddReq{
-						Channel:   channel,
-						Name:      emoji,
-						Timestamp: ts,
-					})
-					if err != nil {
-						log.Printf("busy reaction remove failed: chan=%s ts=%s emoji=%s: %v", channel, ts, emoji, err)
-						return
-					}
-					// "no_reaction" is benign: the emoji already came off
-					// (human removed it, or the add never landed).
-					if !resp.OK && resp.Error != "no_reaction" {
-						log.Printf("busy reaction remove: chan=%s ts=%s emoji=%s: slack error=%s", channel, ts, emoji, resp.Error)
-					}
-				}(req.Conversation.ConversationID, markedTS, cfg.busyReaction)
-			}
+		// publish into a conversation/thread carrying a pending busy
+		// mark means the agent's reply has landed — clear the busy
+		// emoji. The dedup-replay path above returns earlier without
+		// re-checking: the original delivery already consumed the mark.
+		if receipt.Delivered {
+			clearBusyReaction(cfg, req.Conversation.ConversationID, req.ReplyToMessageID)
 		}
 		// Remember delivered receipts so a subsequent retry with the same
 		// idempotency key replays this receipt instead of re-posting. Put
@@ -1635,6 +1609,10 @@ func handlePublishFile(cfg config, reg *identityRegistry) http.HandlerFunc {
 
 		receipt.Delivered = true
 		receipt.FileID = urlResp.FileID
+		// Busy-reaction lifecycle, remove side: a threaded file upload
+		// may be the agent's entire reply — it must clear the pending
+		// busy mark exactly like a text publish (hw-94w5k codex r1).
+		clearBusyReaction(cfg, req.Conversation.ConversationID, req.ReplyToMessageID)
 		writeJSON(w, receipt)
 	}
 }
@@ -1952,6 +1930,56 @@ func handleReact(cfg config) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(receipt)
 	}
+}
+
+// clearBusyReaction consumes the pending busy mark for
+// (conversationID, threadKey) and removes the busy emoji from the
+// marked message. threadKey is the reply's reply_to_message_id, which
+// matches the registry key in both inbound shapes: a thread-reply
+// inbound was marked under its thread_ts, and a channel-root inbound
+// was marked under its own ts — exactly what a threaded reply to it
+// carries. An empty threadKey (channel-root publish) identifies no
+// thread, so there is nothing to look up; no registry hit means no
+// Slack call. Shared by handlePublish and handlePublishFile — either
+// reply shape (text or file) is the agent's answer and must clear the
+// affordance (hw-94w5k codex r1).
+//
+// The removal waits for the mark's reactions.add to finish first
+// (bounded by busyReactionAddWait): a fast reply otherwise races the
+// in-flight add, Slack applies the delayed add after the remove, and
+// the busy emoji sticks forever. Best-effort and async — failures are
+// logged and never affect the caller's receipt.
+func clearBusyReaction(cfg config, conversationID, threadKey string) {
+	if cfg.busyReaction == "" || conversationID == "" || threadKey == "" {
+		return
+	}
+	markedTS, addDone, ok := cfg.busyMarks.take(conversationID, threadKey)
+	if !ok {
+		return
+	}
+	go func(channel, ts, emoji string) {
+		if addDone != nil {
+			select {
+			case <-addDone:
+			case <-time.After(busyReactionAddWait):
+				log.Printf("busy reaction remove: chan=%s ts=%s: add still in flight after %v, removing anyway", channel, ts, busyReactionAddWait)
+			}
+		}
+		resp, err := removeReactionFromSlack(cfg.slackBotToken, slackReactionsAddReq{
+			Channel:   channel,
+			Name:      emoji,
+			Timestamp: ts,
+		})
+		if err != nil {
+			log.Printf("busy reaction remove failed: chan=%s ts=%s emoji=%s: %v", channel, ts, emoji, err)
+			return
+		}
+		// "no_reaction" is benign: the emoji already came off
+		// (human removed it, or the add never landed).
+		if !resp.OK && resp.Error != "no_reaction" {
+			log.Printf("busy reaction remove: chan=%s ts=%s emoji=%s: slack error=%s", channel, ts, emoji, resp.Error)
+		}
+	}(conversationID, markedTS, cfg.busyReaction)
 }
 
 // postReactionToSlack calls reactions.add for req.
@@ -2382,6 +2410,10 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 	}
 	if err := postInbound(cfg, inbound); err != nil {
 		log.Printf("inbound POST failed: %v", err)
+		// Nothing reached gc: release the event id recorded at the
+		// handler boundary so a Slack redelivery of this event is a
+		// second chance instead of a dedup drop (message loss).
+		cfg.eventDedup.forget(env.EventID)
 		return
 	}
 	log.Printf("inbound: chan=%s user=%s ts=%s thread=%s target=%q files=%d text=%dch",
@@ -2411,8 +2443,12 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 	// the dispatch path. BUSY_REACTION= (set-but-empty) disables this
 	// block entirely — no reaction, no mark.
 	if target != "" && cfg.slackBotToken != "" && cfg.busyReaction != "" {
-		cfg.busyMarks.mark(msg.Channel, busyThreadKey(msg.ThreadTS, msg.TS), msg.TS)
+		addDone := cfg.busyMarks.mark(msg.Channel, busyThreadKey(msg.ThreadTS, msg.TS), msg.TS)
 		go func(channel, ts, emoji string) {
+			// Closing addDone releases any remove waiting to run
+			// after this add (clearBusyReaction orders remove-after-
+			// add so a fast reply cannot leave a stale busy emoji).
+			defer close(addDone)
 			_, err := postReactionToSlack(cfg.slackBotToken, slackReactionsAddReq{
 				Channel:   channel,
 				Name:      emoji,

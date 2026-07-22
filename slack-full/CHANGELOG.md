@@ -21,7 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gains an optional `remove:true` issuing `reactions.remove`
   (`no_reaction` treated as benign delivery, mirroring
   `already_reacted`), surfaced on the CLI as `gc slack react
-  --remove`. Note the lifecycle fires only when an agent target is
+  --remove`. Beyond the original hq-xizo commit, the removal is
+  ordered after the corresponding `reactions.add` completes (a fast
+  reply otherwise races the in-flight add and the busy emoji sticks
+  forever) and a threaded `/publish-file` reply clears the mark
+  exactly like a text publish. Note the lifecycle fires only when an
+  agent target is
   parsed from the message (`@handle:` prefix, User Group mention, or
   sticky thread handle) — plain messages that reach a session solely
   through a channel binding carry no parsed target and get no busy
@@ -34,8 +39,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unacknowledged and each retry re-forwarded the same message into the
   bound session as a duplicate notification (observed as
   byte-identical inbound log pairs). Deliveries dropped at the
-  queue-full boundary are not recorded, so a Slack retry can still
-  recover them. (hw-94w5k finding #4)
+  queue-full boundary are not recorded, and a delivery whose forward
+  to gc fails releases its id — in both cases a Slack retry can still
+  recover the message. (hw-94w5k finding #4)
+- `openBeneath` (the confined open backing `/publish-file`) closes two
+  gaps `os.Root` leaves open: the root path is pre-opened with
+  `O_NOFOLLOW|O_DIRECTORY` and identity-matched against the `os.Root`
+  handle (a root swapped for a symlink otherwise re-confines the open
+  beneath the link target), and the leaf is Lstat'd + inode-pinned
+  (`os.Root` resolves in-root symlinks itself and does not honor
+  `O_NOFOLLOW` for them, so a raced-in leaf link could upload a
+  different in-root file than the one validated).
 - Human file posts delivered with subtype `file_share` are no longer
   discarded by the system-noise subtype gate, and file-only posts (no
   caption) are no longer discarded by the empty-text gate — both now
@@ -48,7 +62,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `GC_SESSION_ID`. Name-bound sessions produce inbound events carrying
   the NAME, so the id-only match made the default `--current` mode
   bail with "no recent inbound transcript entry" right after an
-  inbound landed. (hw-94w5k finding #2)
+  inbound landed. The ambient `GC_SESSION_NAME` only joins the match
+  set when the requested session IS the current one — an explicit
+  `--session <other>` never inherits it. (hw-94w5k finding #2)
 
 ### Changed
 
