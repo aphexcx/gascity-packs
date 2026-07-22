@@ -78,15 +78,15 @@ func dispatchRoomLaunch(
 	roomLaunchReg *roomLaunchMappingRegistry,
 	msg slackMessageEvent,
 	teamID, handle, remainder string,
-) {
+) (concluded bool) {
 	if roomLaunchReg == nil {
 		emitRoomLaunchNotEnabledEphemeral(cfg, msg, handle)
-		return
+		return true
 	}
 	pool, ok := roomLaunchReg.LookupPoolTemplate(teamID, msg.Channel)
 	if !ok {
 		emitRoomLaunchNotEnabledEphemeral(cfg, msg, handle)
-		return
+		return true
 	}
 
 	// Thread-root resolution: a top-level `@@new-handle ...` post has
@@ -113,7 +113,9 @@ func dispatchRoomLaunch(
 		if err := postSlackEphemeral(cfg.slackBotToken, msg.Channel, msg.User, msg.ThreadTS, body); err != nil {
 			log.Printf("launcher dispatch: ephemeral after spawn failure: %v", err)
 		}
-		return
+		// Transient: the session never spawned — a Slack redelivery
+		// should retry the launcher forward (codex r6).
+		return false
 	}
 
 	// Bootstrap alias on first spawn so the next `@<handle> ...` post
@@ -148,7 +150,9 @@ func dispatchRoomLaunch(
 		if err := postSlackEphemeral(cfg.slackBotToken, msg.Channel, msg.User, msg.ThreadTS, body); err != nil {
 			log.Printf("launcher dispatch: ephemeral after message failure: %v", err)
 		}
-		return
+		// Transient: the session exists but never got the message — a
+		// redelivery re-acquires the same thread session and re-posts.
+		return false
 	}
 
 	// Acknowledge to the user. Different wording for spawn vs. reuse so
@@ -174,6 +178,7 @@ func dispatchRoomLaunch(
 	}
 	log.Printf("launcher dispatch: handle=%q session=%s created=%v team=%s channel=%s thread=%s pool=%q",
 		handle, sessionID, created, teamID, msg.Channel, threadTS, pool)
+	return true
 }
 
 // emitRoomLaunchNotEnabledEphemeral surfaces the actionable fix-it for

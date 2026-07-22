@@ -1958,8 +1958,8 @@ func clearBusyReaction(cfg config, conversationID, threadKey string) {
 	var taken []busyTaken
 	if threadKey == "" {
 		taken = cfg.busyMarks.takeConversation(conversationID)
-	} else if markedTS, addDone, ok := cfg.busyMarks.take(conversationID, threadKey); ok {
-		taken = []busyTaken{{messageTS: markedTS, addDone: addDone}}
+	} else {
+		taken = cfg.busyMarks.take(conversationID, threadKey)
 	}
 	for _, tk := range taken {
 		go removeBusyReaction(cfg, conversationID, tk)
@@ -2369,7 +2369,15 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 	// existing alias dispatch behavior is unchanged.
 	if cfg.handlePrefix != "" && threadReg != nil {
 		if h, remainder, ok := parseDoubleHandlePrefix(msg.Text, cfg.handlePrefix); ok {
-			handleDoubleHandleDispatch(cfg, aliasReg, threadReg, roomLaunchReg, msg, env.TeamID, h, remainder)
+			// A transient launcher failure (spawn / first-message
+			// forward) forgets the dedup claim so a Slack redelivery
+			// retries it — same contract as the postInbound and alias
+			// failure paths (codex r6). Terminal outcomes (delivered,
+			// user-error ephemerals) commit via the defer.
+			if !handleDoubleHandleDispatch(cfg, aliasReg, threadReg, roomLaunchReg, msg, env.TeamID, h, remainder) {
+				commitDedup = false
+				cfg.eventDedup.forget(env.EventID)
+			}
 			return
 		}
 	}
@@ -2621,6 +2629,19 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 				if dispatchToAliasedSession(cfg, aliasedSessionID, inbound, target) {
 					cfg.eventDedup.commit(env.EventID)
 					return
+				}
+				// The busy reaction was already launched for this
+				// message, but no reply is coming — the addressed
+				// session never got it and the channel-bound session
+				// stays silent — so without cleanup the hourglass
+				// sits forever next to the ⚠️ (codex r6). Consume the
+				// mark and remove the emoji BEFORE forget wakes any
+				// parked retry (which re-marks and re-adds).
+				if cfg.busyReaction != "" {
+					for _, tk := range cfg.busyMarks.takeMessage(
+						inbound.Conversation.ConversationID, inbound.ReplyToMessageID, inbound.ProviderMessageID) {
+						go removeBusyReaction(cfg, inbound.Conversation.ConversationID, tk)
+					}
 				}
 				cfg.eventDedup.forget(env.EventID)
 				reactAliasDispatchFailure(cfg.slackBotToken,

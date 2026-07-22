@@ -737,6 +737,78 @@ func TestBusyReaction_FailedRetargetRestoresDisplacedMark(t *testing.T) {
 	}
 }
 
+// Overlapping re-targets with a failure in the middle must not orphan
+// the oldest reaction (codex r6): M2 displaced M1, M3 displaced M2,
+// M2's forward fails while M3 owns the key — M1 must merge into M3's
+// stale ancestry so the thread's eventual clear removes it.
+func TestBusyReactionRegistry_FailedMiddleRetargetPreservesAncestors(t *testing.T) {
+	r := newBusyReactionRegistry()
+	const m1, m2, m3 = "1.0", "2.0", "3.0"
+
+	d1, disp := r.markBoth("C1", "", m1)
+	close(d1)
+	if len(disp) != 0 {
+		t.Fatalf("M1 displaced %v, want none", disp)
+	}
+	d2, disp2 := r.markBoth("C1", m1, m2) // M2 re-targets M1's thread
+	d3, disp3 := r.markBoth("C1", m1, m3) // M3 re-targets again
+	close(d3)
+	if len(disp2) == 0 || disp2[0].mark.messageTS != m1 {
+		t.Fatalf("M2 displaced %v, want M1", disp2)
+	}
+	if len(disp3) == 0 || disp3[0].mark.messageTS != m2 {
+		t.Fatalf("M3 displaced %v, want M2", disp3)
+	}
+
+	// M2's forward fails while M3 owns the key: restore must not
+	// clobber M3, and M1 must survive as M3's stale ancestor.
+	r.cancelBoth("C1", m1, m2, d2, disp2)
+	if ts, ok := r.pending("C1", m1); !ok || ts != m3 {
+		t.Fatalf("key owner after failed M2 = (%q, %v), want M3", ts, ok)
+	}
+
+	taken := r.take("C1", m1)
+	got := map[string]bool{}
+	for _, tk := range taken {
+		got[tk.messageTS] = true
+	}
+	if !got[m3] || !got[m1] {
+		t.Errorf("take returned %v, want M3's mark plus preserved ancestor M1", got)
+	}
+	if got[m2] {
+		t.Errorf("take returned failed M2 (%v); its reaction never landed and it was displaced into M3's superseded set", got)
+	}
+}
+
+// takeMessage consumes exactly the named message's reaction and
+// re-parks any stale ancestors riding on the entry (codex r6 alias-
+// failure cleanup).
+func TestBusyReactionRegistry_TakeMessageReparksAncestors(t *testing.T) {
+	r := newBusyReactionRegistry()
+	const m1, m2, m3 = "1.0", "2.0", "3.0"
+	d1, _ := r.markBoth("C1", "", m1)
+	close(d1)
+	d2, disp2 := r.markBoth("C1", m1, m2)
+	d3, disp3 := r.markBoth("C1", m1, m3)
+	close(d3)
+	r.cancelBoth("C1", m1, m2, d2, disp2) // M1 → M3's stale
+	_ = disp3
+
+	taken := r.takeMessage("C1", m1, m3)
+	if len(taken) != 1 || taken[0].messageTS != m3 {
+		t.Fatalf("takeMessage = %v, want exactly M3", taken)
+	}
+	// M1 must have been re-parked under the key, still clearable.
+	remaining := r.take("C1", m1)
+	got := map[string]bool{}
+	for _, tk := range remaining {
+		got[tk.messageTS] = true
+	}
+	if !got[m1] {
+		t.Errorf("re-parked set = %v, want ancestor M1 preserved", got)
+	}
+}
+
 // A re-mark of the SAME message (retaken redelivery) merges add
 // completions: the stored done closes only when every add attempt has
 // concluded (codex r4).
@@ -745,10 +817,11 @@ func TestBusyReactionRegistry_SameMessageRemarkMergesAddDone(t *testing.T) {
 	d1, _ := r.markBoth("C1", "", "1.0")
 	d2, _ := r.markBoth("C1", "", "1.0")
 
-	_, done, ok := r.take("C1", "1.0")
-	if !ok || done == nil {
-		t.Fatalf("take = (done=%v, ok=%v), want a merged done channel", done, ok)
+	taken := r.take("C1", "1.0")
+	if len(taken) != 1 || taken[0].addDone == nil {
+		t.Fatalf("take = %v, want one entry with a merged done channel", taken)
 	}
+	done := taken[0].addDone
 	assertOpen := func(label string) {
 		t.Helper()
 		select {
@@ -818,10 +891,10 @@ func TestBusyReactionRegistry_TakeAndSweep(t *testing.T) {
 	}
 
 	r.mark("C1", "1.0", "1.0")
-	if ts, _, ok := r.take("C1", "1.0"); !ok || ts != "1.0" {
-		t.Fatalf("take = (%q, %v), want (1.0, true)", ts, ok)
+	if taken := r.take("C1", "1.0"); len(taken) != 1 || taken[0].messageTS != "1.0" {
+		t.Fatalf("take = %v, want one entry for 1.0", taken)
 	}
-	if _, _, ok := r.take("C1", "1.0"); ok {
+	if taken := r.take("C1", "1.0"); len(taken) != 0 {
 		t.Fatal("second take succeeded; want consumed on first take")
 	}
 
@@ -878,7 +951,7 @@ func TestBusyReactionRegistry_NilSafe(t *testing.T) {
 	if done := r.mark("C1", "1.0", "1.0"); done == nil {
 		t.Error("mark on nil registry returned a nil addDone channel; want closable")
 	}
-	if _, _, ok := r.take("C1", "1.0"); ok {
+	if taken := r.take("C1", "1.0"); len(taken) != 0 {
 		t.Error("take on nil registry reported a mark")
 	}
 	if _, ok := r.pending("C1", "1.0"); ok {

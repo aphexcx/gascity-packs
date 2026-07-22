@@ -38,7 +38,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dedup claim and restores any marks the failed inbound displaced),
   displaced-mark reactions are removed only after the displacing
   forward succeeds, and a re-mark of the same message merges
-  add-completion channels so a remove waits for every in-flight add. Note the lifecycle fires only when an agent target
+  add-completion channels so a remove waits for every in-flight add
+  (the wait bound exceeds the Slack client timeout, so ordering
+  provably holds). Registry entries carry displaced-ancestor
+  reactions across overlapping failed re-targets so every added emoji
+  stays clearable, and a failed cross-channel alias delivery removes
+  its own busy emoji next to the ⚠️ instead of stranding it. Note the lifecycle fires only when an agent target
   is
   parsed from the message (`@handle:` prefix, User Group mention, or
   sticky thread handle) — plain messages that reach a session solely
@@ -65,7 +70,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   owns the verdict (success commits, failure forgets). Deliveries
   dropped at the queue-full boundary are never recorded, and a failed
   forward releases its id, so a Slack retry can always recover the
-  message. (hw-94w5k finding #4)
+  message. Transient `@@handle` launcher failures (spawn or
+  first-message forward) forget the claim like every other forward
+  failure; terminal launcher outcomes (delivered, user-error
+  ephemerals) commit. (hw-94w5k finding #4)
 - `openBeneath` (the confined open backing `/publish-file`) restores
   the old per-component no-follow guarantee on top of `os.Root`
   (which follows a symlink at the root argument and resolves in-root

@@ -51,11 +51,13 @@ const busyReactionMaxEntries = 4096
 
 // busyReactionAddWait bounds how long the remove side waits for the
 // corresponding reactions.add call to finish before issuing
-// reactions.remove anyway. The add normally completes in well under a
-// second; the bound only matters when the add hangs (no client
-// timeout on the Slack HTTP call), where an unbounded wait would leak
-// the remove goroutine.
-const busyReactionAddWait = 10 * time.Second
+// reactions.remove anyway. It MUST exceed slackAPIClient's timeout
+// (30s): the add is bounded by that client, so waiting past it means
+// addDone has provably closed and remove-after-add ordering holds; a
+// shorter bound would reopen the very race this wait exists to
+// prevent (codex r6). The timeout branch is therefore effectively
+// unreachable and exists only as a leak backstop.
+const busyReactionAddWait = 45 * time.Second
 
 // busyReactionKey identifies one conversation/thread with a pending
 // busy mark.
@@ -72,10 +74,17 @@ type busyReactionKey struct {
 // lands while the add is still in flight cannot have its remove
 // overtaken by the delayed add — which would leave a permanent busy
 // emoji on the message.
+//
+// stale carries orphaned predecessor reactions that still ride under
+// this key (codex r6): when a re-target's forward fails while an even
+// newer mark owns the key, the failed attempt's restore list merges
+// here instead of being lost, so every reaction added under the key
+// is eventually removed when the key's current mark concludes.
 type busyReactionMark struct {
 	messageTS string
 	addedAt   time.Time
 	addDone   chan struct{}
+	stale     []busyTaken
 }
 
 // busyThreadKey derives the registry thread key for an inbound
@@ -179,27 +188,30 @@ func (r *busyReactionRegistry) markBoth(channel, threadTS, messageTS string) (ad
 		}
 	}
 	rootKey := busyThreadKey(threadTS, messageTS)
-	old, ok := r.markWithDone(channel, rootKey, messageTS, addDone)
-	collect(rootKey, old, ok)
+	for _, old := range r.markWithDone(channel, rootKey, messageTS, addDone) {
+		collect(rootKey, old, true)
+	}
 	if threadTS != "" && threadTS != messageTS {
-		old, ok = r.markWithDone(channel, messageTS, messageTS, addDone)
-		collect(messageTS, old, ok)
+		for _, old := range r.markWithDone(channel, messageTS, messageTS, addDone) {
+			collect(messageTS, old, true)
+		}
 	}
 	return addDone, superseded
 }
 
 // markWithDone is the mark implementation with a caller-supplied
 // addDone, letting markBoth share one channel across its two entries.
-// Returns the displaced live mark, if the write overwrote one whose
-// reaction sits on a DIFFERENT message. A re-mark of the SAME message
-// (a retaken Slack redelivery re-marking after a failed dispatch,
-// codex r4) merges completion channels instead of overwriting: the
-// earlier reactions.add may still be in flight and could land after a
-// remove that only waited for the newer add, so the stored channel
-// closes only when EVERY add attempt for the message has concluded.
-func (r *busyReactionRegistry) markWithDone(channel, threadKey, messageTS string, addDone chan struct{}) (old busyTaken, displaced bool) {
+// Returns every displaced pending reaction — the previous mark (when
+// its reaction sits on a DIFFERENT message) plus any stale ancestors
+// riding on it (codex r6). A re-mark of the SAME message (a retaken
+// Slack redelivery re-marking after a failed dispatch, codex r4)
+// merges completion channels instead of overwriting — the earlier
+// reactions.add may still be in flight and could land after a remove
+// that only waited for the newer add — and keeps the previous entry's
+// stale ancestors.
+func (r *busyReactionRegistry) markWithDone(channel, threadKey, messageTS string, addDone chan struct{}) (displaced []busyTaken) {
 	if r == nil || channel == "" || threadKey == "" || messageTS == "" {
-		return busyTaken{}, false
+		return nil
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -207,26 +219,30 @@ func (r *busyReactionRegistry) markWithDone(channel, threadKey, messageTS string
 	r.sweepLocked(now)
 	key := busyReactionKey{channel: channel, threadKey: threadKey}
 	storeDone := addDone
+	var keepStale []busyTaken
 	if prev, present := r.entries[key]; present {
 		switch {
 		case prev.messageTS != messageTS:
-			old, displaced = busyTaken{messageTS: prev.messageTS, addDone: prev.addDone}, true
-		case prev.addDone != nil && prev.addDone != addDone:
-			prevDone := prev.addDone
-			merged := make(chan struct{})
-			go func() {
-				<-prevDone
-				<-addDone
-				close(merged)
-			}()
-			storeDone = merged
+			displaced = append([]busyTaken{{messageTS: prev.messageTS, addDone: prev.addDone}}, prev.stale...)
+		default:
+			keepStale = prev.stale
+			if prev.addDone != nil && prev.addDone != addDone {
+				prevDone := prev.addDone
+				merged := make(chan struct{})
+				go func() {
+					<-prevDone
+					<-addDone
+					close(merged)
+				}()
+				storeDone = merged
+			}
 		}
 	}
-	r.entries[key] = busyReactionMark{messageTS: messageTS, addedAt: now, addDone: storeDone}
+	r.entries[key] = busyReactionMark{messageTS: messageTS, addedAt: now, addDone: storeDone, stale: keepStale}
 	if len(r.entries) > busyReactionMaxEntries {
 		r.evictOldestLocked()
 	}
-	return old, displaced
+	return displaced
 }
 
 // cancelBoth removes the entries markBoth created for (channel,
@@ -249,20 +265,39 @@ func (r *busyReactionRegistry) cancelBoth(channel, threadTS, messageTS string, a
 		if threadTS != "" && threadTS != messageTS {
 			keys = append(keys, messageTS)
 		}
+		// Restore pool: the marks this failed inbound displaced, plus
+		// any stale ancestors that were riding on the cancelled
+		// entries themselves (merged there by an even earlier failed
+		// re-target, codex r6). Grouped per key.
+		perKey := map[string][]busyTaken{}
+		for _, d := range restore {
+			perKey[d.threadKey] = append(perKey[d.threadKey], d.mark)
+		}
 		for _, k := range keys {
 			key := busyReactionKey{channel: channel, threadKey: k}
 			if m, ok := r.entries[key]; ok && m.messageTS == messageTS {
 				delete(r.entries, key)
+				perKey[k] = append(perKey[k], m.stale...)
 			}
 		}
-		for _, d := range restore {
-			key := busyReactionKey{channel: channel, threadKey: d.threadKey}
-			if _, taken := r.entries[key]; !taken {
-				r.entries[key] = busyReactionMark{
-					messageTS: d.mark.messageTS,
-					addedAt:   now,
-					addDone:   d.mark.addDone,
-				}
+		for k, marks := range perKey {
+			if len(marks) == 0 {
+				continue
+			}
+			key := busyReactionKey{channel: channel, threadKey: k}
+			if cur, taken := r.entries[key]; taken {
+				// A racing retry (or a newer re-target) owns the key:
+				// never clobber it — merge the pool into its stale
+				// ancestry so its conclusion still clears them.
+				cur.stale = append(cur.stale, marks...)
+				r.entries[key] = cur
+				continue
+			}
+			r.entries[key] = busyReactionMark{
+				messageTS: marks[0].messageTS,
+				addedAt:   now,
+				addDone:   marks[0].addDone,
+				stale:     marks[1:],
 			}
 		}
 		r.mu.Unlock()
@@ -296,34 +331,85 @@ func (r *busyReactionRegistry) takeConversation(channel string) []busyTaken {
 		if now.Sub(m.addedAt) > busyReactionTTL {
 			continue
 		}
-		if !seen[m.messageTS] {
-			seen[m.messageTS] = true
-			taken = append(taken, busyTaken{messageTS: m.messageTS, addDone: m.addDone})
+		for _, t := range append([]busyTaken{{messageTS: m.messageTS, addDone: m.addDone}}, m.stale...) {
+			if !seen[t.messageTS] {
+				seen[t.messageTS] = true
+				taken = append(taken, t)
+			}
 		}
 	}
 	return taken
 }
 
-// take removes and returns the pending mark for (channel, threadKey),
-// along with its addDone channel (see mark). An expired entry is
-// deleted but NOT returned — the caller must not fire a
-// reactions.remove for a mark past its TTL.
-func (r *busyReactionRegistry) take(channel, threadKey string) (messageTS string, addDone chan struct{}, ok bool) {
+// takeMessage removes the entries markBoth created for (channel,
+// threadTS, messageTS) while they still point at messageTS, returning
+// that message's pending reaction for removal. Backs the
+// alias-delivery-failure path (codex r6): the reactions.add already
+// launched but no reply is coming (the addressed session never got
+// the message and the bound session stays silent), so the emoji must
+// come off now. Stale ancestors riding on a consumed entry are NOT
+// removed — their messages' fate is independent — they are re-parked
+// under the key so a later conclusion still clears them.
+func (r *busyReactionRegistry) takeMessage(channel, threadTS, messageTS string) []busyTaken {
+	if r == nil || channel == "" || messageTS == "" {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := r.clock()
+	keys := []string{busyThreadKey(threadTS, messageTS)}
+	if threadTS != "" && threadTS != messageTS {
+		keys = append(keys, messageTS)
+	}
+	var taken []busyTaken
+	seen := map[string]bool{}
+	for _, k := range keys {
+		key := busyReactionKey{channel: channel, threadKey: k}
+		m, ok := r.entries[key]
+		if !ok || m.messageTS != messageTS {
+			continue
+		}
+		delete(r.entries, key)
+		expired := now.Sub(m.addedAt) > busyReactionTTL
+		if !expired && !seen[m.messageTS] {
+			seen[m.messageTS] = true
+			taken = append(taken, busyTaken{messageTS: m.messageTS, addDone: m.addDone})
+		}
+		if len(m.stale) > 0 && !expired {
+			// Re-park the ancestors: first becomes the key's mark,
+			// the rest stay stale on it.
+			r.entries[key] = busyReactionMark{
+				messageTS: m.stale[0].messageTS,
+				addedAt:   now,
+				addDone:   m.stale[0].addDone,
+				stale:     m.stale[1:],
+			}
+		}
+	}
+	return taken
+}
+
+// take removes and returns every pending reaction for (channel,
+// threadKey) — the current mark plus any stale ancestors riding on it
+// (codex r6). An expired entry is deleted but NOT returned — the
+// caller must not fire a reactions.remove for a mark past its TTL
+// (its stale ancestors expire with it).
+func (r *busyReactionRegistry) take(channel, threadKey string) []busyTaken {
 	if r == nil {
-		return "", nil, false
+		return nil
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	key := busyReactionKey{channel: channel, threadKey: threadKey}
 	m, present := r.entries[key]
 	if !present {
-		return "", nil, false
+		return nil
 	}
 	delete(r.entries, key)
 	if r.clock().Sub(m.addedAt) > busyReactionTTL {
-		return "", nil, false
+		return nil
 	}
-	return m.messageTS, m.addDone, true
+	return append([]busyTaken{{messageTS: m.messageTS, addDone: m.addDone}}, m.stale...)
 }
 
 // pending reports the recorded message ts for (channel, threadKey)
