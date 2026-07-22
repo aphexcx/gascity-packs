@@ -178,7 +178,12 @@ func (r *busyReactionRegistry) markBoth(channel, threadTS, messageTS string) (ad
 // markWithDone is the mark implementation with a caller-supplied
 // addDone, letting markBoth share one channel across its two entries.
 // Returns the displaced live mark, if the write overwrote one whose
-// reaction sits on a DIFFERENT message.
+// reaction sits on a DIFFERENT message. A re-mark of the SAME message
+// (a retaken Slack redelivery re-marking after a failed dispatch,
+// codex r4) merges completion channels instead of overwriting: the
+// earlier reactions.add may still be in flight and could land after a
+// remove that only waited for the newer add, so the stored channel
+// closes only when EVERY add attempt for the message has concluded.
 func (r *busyReactionRegistry) markWithDone(channel, threadKey, messageTS string, addDone chan struct{}) (old busyTaken, displaced bool) {
 	if r == nil || channel == "" || threadKey == "" || messageTS == "" {
 		return busyTaken{}, false
@@ -188,14 +193,54 @@ func (r *busyReactionRegistry) markWithDone(channel, threadKey, messageTS string
 	now := r.clock()
 	r.sweepLocked(now)
 	key := busyReactionKey{channel: channel, threadKey: threadKey}
-	if prev, present := r.entries[key]; present && prev.messageTS != messageTS {
-		old, displaced = busyTaken{messageTS: prev.messageTS, addDone: prev.addDone}, true
+	storeDone := addDone
+	if prev, present := r.entries[key]; present {
+		switch {
+		case prev.messageTS != messageTS:
+			old, displaced = busyTaken{messageTS: prev.messageTS, addDone: prev.addDone}, true
+		case prev.addDone != nil && prev.addDone != addDone:
+			prevDone := prev.addDone
+			merged := make(chan struct{})
+			go func() {
+				<-prevDone
+				<-addDone
+				close(merged)
+			}()
+			storeDone = merged
+		}
 	}
-	r.entries[key] = busyReactionMark{messageTS: messageTS, addedAt: now, addDone: addDone}
+	r.entries[key] = busyReactionMark{messageTS: messageTS, addedAt: now, addDone: storeDone}
 	if len(r.entries) > busyReactionMaxEntries {
 		r.evictOldestLocked()
 	}
 	return old, displaced
+}
+
+// cancelBoth removes the entries markBoth created for (channel,
+// threadTS, messageTS) — the inbound never reached gc, so no reply
+// will ever come to clear them — and closes addDone so any waiter
+// that already consumed a mark proceeds to its benign no-op remove
+// (the reactions.add for a cancelled mark never fires). Entries are
+// deleted only while they still point at messageTS; a newer mark that
+// took the key stays.
+func (r *busyReactionRegistry) cancelBoth(channel, threadTS, messageTS string, addDone chan struct{}) {
+	if r != nil && channel != "" && messageTS != "" {
+		r.mu.Lock()
+		keys := []string{busyThreadKey(threadTS, messageTS)}
+		if threadTS != "" && threadTS != messageTS {
+			keys = append(keys, messageTS)
+		}
+		for _, k := range keys {
+			key := busyReactionKey{channel: channel, threadKey: k}
+			if m, ok := r.entries[key]; ok && m.messageTS == messageTS {
+				delete(r.entries, key)
+			}
+		}
+		r.mu.Unlock()
+	}
+	if addDone != nil {
+		close(addDone)
+	}
 }
 
 // takeConversation removes and returns every pending mark in channel,

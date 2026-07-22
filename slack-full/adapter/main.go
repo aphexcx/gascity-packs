@@ -1257,7 +1257,7 @@ func registerAdapter(cfg config) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-GC-Request", "gc-slack-adapter")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := gcForwardClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -2144,26 +2144,57 @@ func handleSlackEvents(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 		// Phase 4 review fix). The drop paths below release explicitly.
 		retryNum := r.Header.Get("X-Slack-Retry-Num")
 		go func() {
+			ownsSlot := true
 			for {
 				proceed, wait := cfg.eventDedup.begin(env.EventID)
 				if proceed {
 					break
 				}
 				if wait == nil {
-					release()
+					if ownsSlot {
+						release()
+					}
 					log.Printf("slack event dedup: dropping redelivery event_id=%s retry_num=%q team_id=%q",
 						env.EventID, retryNum, clipTeamIDForLog(teamID))
 					return
 				}
-				select {
-				case <-wait:
-					// First delivery concluded — re-begin for the verdict.
-				case <-time.After(eventDedupInflightWait):
+				// Park until the in-flight claim concludes. NEVER give
+				// up (codex r4): this delivery already got its 200, so
+				// Slack will not resend it — dropping it while the
+				// owner is undecided would lose the event if the owner
+				// then fails. The slot is released while parked so
+				// waiting redeliveries cannot starve the dispatch
+				// semaphore; parked goroutines cannot leak because
+				// every claim concludes (bounded gc forwards +
+				// conclude-on-every-return in processSlackEvent).
+				if ownsSlot {
 					release()
-					log.Printf("slack event dedup: first delivery of event_id=%s still in flight after %v; dropping redelivery retry_num=%q",
-						env.EventID, eventDedupInflightWait, retryNum)
+					ownsSlot = false
+				}
+				for parked := true; parked; {
+					select {
+					case <-wait:
+						parked = false
+					case <-time.After(eventDedupParkLogInterval):
+						log.Printf("slack event dedup: redelivery of event_id=%s still parked behind an in-flight delivery (retry_num=%q)",
+							env.EventID, retryNum)
+					}
+				}
+			}
+			if !ownsSlot {
+				// Taking over after a parked wait: the original slot
+				// went back to the pool, so contend for a fresh one.
+				newRelease, capacity, ok := cfg.acquireDispatchSlot()
+				if !ok {
+					// Same drop semantics as the handler's queue-full
+					// path — and release the claim we just made so
+					// state doesn't record an event nothing processed.
+					cfg.eventDedup.forget(env.EventID)
+					log.Printf("slack adapter: dispatch queue full (cap=%d), dropping parked redelivery event_id=%s",
+						capacity, env.EventID)
 					return
 				}
+				release = newRelease
 			}
 			processSlackEvent(cfg, aliasReg, threadReg, roomLaunchReg, subteamMap, threadHandleSticky, env, release)
 		}()
@@ -2468,44 +2499,37 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 		DedupKey:         "slack-" + msg.TS,
 		ReceivedAt:       time.Now().UTC(),
 	}
-	if err := postInbound(cfg, inbound); err != nil {
-		log.Printf("inbound POST failed: %v", err)
-		// Nothing reached gc: forget the dedup claim so a Slack
-		// redelivery of this event — waiting on the claim right now
-		// or arriving later — is a second chance instead of a dedup
-		// drop (message loss).
-		commitDedup = false
-		cfg.eventDedup.forget(env.EventID)
-		return
-	}
-	log.Printf("inbound: chan=%s user=%s ts=%s thread=%s target=%q files=%d text=%dch",
-		msg.Channel, msg.User, msg.TS, msg.ThreadTS, target, len(attachments), len(text))
-
-	// Busy-reaction lifecycle, add side (hq-xizo; replaces the earlier
-	// unconditional "eyes" reaction). The reaction signals to the human
-	// that an agent was explicitly addressed (via `@handle:` prefix or
-	// a Slack User Group mention resolved via subteamAliasMap) and is
-	// working on the message; handlePublish removes it when the agent's
-	// reply lands in the same conversation/thread — the channel-native
-	// replacement for Slack Assistant-mode assistant.threads.setStatus,
-	// which this adapter deliberately does not use. Only fires when a
-	// target was parsed — generic channel chatter that merely lands on
-	// the bound session via postInbound does NOT trigger it, because
-	// most channel messages aren't intentionally directed at an agent
-	// — and only after postInbound succeeded (a busy mark on a dropped
-	// inbound would never clear: nothing is coming). Fires once per
-	// inbound (the alias-dispatch fanout below targets the same Slack
-	// TS, so a duplicate react would be a Slack no-op). The mark is
-	// recorded synchronously before the async reactions.add so a fast
-	// reply cannot race the registry; a mark whose reply never arrives
-	// expires after busyReactionTTL. If alias dispatch later fails,
-	// reactAliasDispatchFailure posts ⚠️ on the same TS — that is
-	// semantically distinct (busy affordance vs. delivery failure) and
-	// not a duplicate. Best-effort: errors are logged and don't block
-	// the dispatch path. BUSY_REACTION= (set-but-empty) disables this
-	// block entirely — no reaction, no mark.
-	if target != "" && cfg.slackBotToken != "" && cfg.busyReaction != "" {
-		addDone, superseded := cfg.busyMarks.markBoth(msg.Channel, msg.ThreadTS, msg.TS)
+	// Busy-reaction lifecycle, mark registration (hq-xizo; replaces the
+	// earlier unconditional "eyes" reaction). The reaction signals to
+	// the human that an agent was explicitly addressed (via `@handle:`
+	// prefix or a Slack User Group mention resolved via subteamAliasMap)
+	// and is working on the message; handlePublish removes it when the
+	// agent's reply lands in the same conversation/thread — the
+	// channel-native replacement for Slack Assistant-mode
+	// assistant.threads.setStatus, which this adapter deliberately does
+	// not use. Only fires when a target was parsed — generic channel
+	// chatter that merely lands on the bound session via postInbound
+	// does NOT trigger it, because most channel messages aren't
+	// intentionally directed at an agent.
+	//
+	// The MARK is recorded BEFORE the forward (codex r4): gc can hand
+	// the inbound to the agent — and the agent can /publish a reply —
+	// before postInbound's response even returns here, and a reply
+	// that finds no mark would leave the subsequently-added emoji
+	// stuck forever. The reactions.add itself still fires only after
+	// the forward succeeds (an emoji on a message no agent received
+	// would be a lie); a failed forward cancels the mark. A mark whose
+	// reply never arrives expires after busyReactionTTL. If alias
+	// dispatch later fails, reactAliasDispatchFailure posts ⚠️ on the
+	// same TS — semantically distinct (busy affordance vs. delivery
+	// failure). Best-effort: errors are logged and don't block the
+	// dispatch path. BUSY_REACTION= (set-but-empty) disables all of
+	// this — no reaction, no mark.
+	busyEligible := target != "" && cfg.slackBotToken != "" && cfg.busyReaction != ""
+	var busyAddDone chan struct{}
+	if busyEligible {
+		var superseded []busyTaken
+		busyAddDone, superseded = cfg.busyMarks.markBoth(msg.Channel, msg.ThreadTS, msg.TS)
 		// A re-target of the same thread displaced earlier mark(s)
 		// whose messages still wear the busy emoji — nothing would
 		// ever remove those, so clean them up now (codex r3). The
@@ -2513,7 +2537,31 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 		for _, s := range superseded {
 			go removeBusyReaction(cfg, msg.Channel, s)
 		}
-		go func(channel, ts, emoji string) {
+	}
+
+	if err := postInbound(cfg, inbound); err != nil {
+		log.Printf("inbound POST failed: %v", err)
+		// Nothing reached gc: forget the dedup claim so a Slack
+		// redelivery of this event — waiting on the claim right now
+		// or arriving later — is a second chance instead of a dedup
+		// drop (message loss). The busy mark is cancelled for the
+		// same reason: no agent received the message, so no reply
+		// will ever come to clear it (the redelivery re-marks).
+		commitDedup = false
+		cfg.eventDedup.forget(env.EventID)
+		if busyEligible {
+			cfg.busyMarks.cancelBoth(msg.Channel, msg.ThreadTS, msg.TS, busyAddDone)
+		}
+		return
+	}
+	log.Printf("inbound: chan=%s user=%s ts=%s thread=%s target=%q files=%d text=%dch",
+		msg.Channel, msg.User, msg.TS, msg.ThreadTS, target, len(attachments), len(text))
+
+	// Busy-reaction lifecycle, add side: fires once per inbound (the
+	// alias-dispatch fanout below targets the same Slack TS, so a
+	// duplicate react would be a Slack no-op).
+	if busyEligible {
+		go func(channel, ts, emoji string, addDone chan struct{}) {
 			// Closing addDone releases any remove waiting to run
 			// after this add (clearBusyReaction orders remove-after-
 			// add so a fast reply cannot leave a stale busy emoji).
@@ -2526,7 +2574,7 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 			if err != nil {
 				log.Printf("react busy %s failed: chan=%s ts=%s: %v", emoji, channel, ts, err)
 			}
-		}(msg.Channel, msg.TS, cfg.busyReaction)
+		}(msg.Channel, msg.TS, cfg.busyReaction, busyAddDone)
 	}
 
 	// Cross-channel address-by-handle: if the parsed target matches a
@@ -3862,7 +3910,7 @@ func dispatchToAliasedSession(cfg config, sessionID string, msg externalInboundM
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-GC-Request", "gc-slack-adapter-alias")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := gcForwardClient.Do(req)
 	if err != nil {
 		log.Printf("alias dispatch: POST %s: %v", target, err)
 		return false
@@ -3975,6 +4023,15 @@ func handleIdentityDelete(reg *identityRegistry) http.HandlerFunc {
 	}
 }
 
+// gcForwardClient bounds every adapter→gc control-plane call
+// (postInbound, adapter registration, alias dispatch). These ran on
+// http.DefaultClient with no timeout, which let a hung gc keep a
+// dedup claim undecided indefinitely — parking acked Slack
+// redeliveries forever (codex r4). 20 seconds is generous for a
+// same-host API; a timeout surfaces as a normal forward failure,
+// which forgets the claim so a redelivery can take over.
+var gcForwardClient = &http.Client{Timeout: 20 * time.Second}
+
 func postInbound(cfg config, msg externalInboundMessage) error {
 	body, _ := json.Marshal(map[string]any{
 		"message": msg,
@@ -3987,7 +4044,7 @@ func postInbound(cfg config, msg externalInboundMessage) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-GC-Request", "gc-slack-adapter")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := gcForwardClient.Do(req)
 	if err != nil {
 		return err
 	}

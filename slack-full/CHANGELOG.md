@@ -32,8 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   documented default `gc slack reply-current` shape, no thread ts)
   clears every pending mark in the conversation, and re-targeting a
   thread before the first reply lands removes the displaced message's
-  reaction instead of stranding it. Note the lifecycle fires only
-  when an agent target is
+  reaction instead of stranding it. The mark registers before the
+  forward to gc (a reply can arrive before postInbound even returns;
+  a failed forward cancels the mark), and a re-mark of the same
+  message merges add-completion channels so a remove waits for every
+  in-flight add. Note the lifecycle fires only when an agent target
+  is
   parsed from the message (`@handle:` prefix, User Group mention, or
   sticky thread handle) — plain messages that reach a session solely
   through a channel binding carry no parsed target and get no busy
@@ -47,14 +51,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bound session as a duplicate notification (observed as
   byte-identical inbound log pairs). Entries are two-state
   (in-flight → committed): a redelivery racing the first delivery's
-  still-running forward waits for its verdict instead of being
-  discarded — if the forward fails, the retry takes over. The wait
-  runs in a goroutine after the handler has returned, so Slack's ack
-  is never delayed behind it. For targeted inbounds the alias
-  dispatch owns the verdict (success commits, failure forgets).
-  Deliveries dropped at the queue-full boundary are never recorded,
-  and a failed forward releases its id, so a Slack retry can always
-  recover the message. (hw-94w5k finding #4)
+  still-running forward parks (slot released, no dispatch-semaphore
+  starvation) until the owner's verdict — commit drops it, forget
+  hands it the event — and never gives up: it already returned a 200,
+  so Slack will not resend it. The wait runs in a goroutine after the
+  handler has returned, so Slack's ack is never delayed behind it,
+  and adapter→gc forwards now run on a 20-second-timeout client so
+  claims always conclude. For targeted inbounds the alias dispatch
+  owns the verdict (success commits, failure forgets). Deliveries
+  dropped at the queue-full boundary are never recorded, and a failed
+  forward releases its id, so a Slack retry can always recover the
+  message. (hw-94w5k finding #4)
 - `openBeneath` (the confined open backing `/publish-file`) restores
   the old per-component no-follow guarantee on top of `os.Root`
   (which follows a symlink at the root argument and resolves in-root

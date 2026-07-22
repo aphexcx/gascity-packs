@@ -618,6 +618,124 @@ func TestBusyReaction_PublishFileToSameThreadRemovesBusy(t *testing.T) {
 	}
 }
 
+// (h) The mark registers BEFORE the forward to gc (codex r4): a reply
+// published while postInbound is still in flight must find the mark,
+// and the eventual add must still be removed (ordered after the add).
+func TestBusyReaction_ReplyDuringForwardFindsMark(t *testing.T) {
+	rr := &reactionRecorder{ch: make(chan recordedReaction, 16)}
+	slackStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/reactions.add"):
+			var body slackReactionsAddReq
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			rr.record(recordedReaction{op: "add", channel: body.Channel, name: body.Name, timestamp: body.Timestamp})
+			_, _ = fmt.Fprint(w, `{"ok":true}`)
+		case strings.HasSuffix(r.URL.Path, "/reactions.remove"):
+			var body slackReactionsAddReq
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			rr.record(recordedReaction{op: "remove", channel: body.Channel, name: body.Name, timestamp: body.Timestamp})
+			_, _ = fmt.Fprint(w, `{"ok":true}`)
+		case strings.HasSuffix(r.URL.Path, "/chat.postMessage"):
+			_, _ = fmt.Fprint(w, `{"ok":true,"ts":"999.000001"}`)
+		default:
+			_, _ = fmt.Fprint(w, `{"ok":true}`)
+		}
+	}))
+	t.Cleanup(slackStub.Close)
+	withSlackAPIStub(t, slackStub)
+
+	// gc stub: the inbound forward stalls long enough for the agent's
+	// reply to arrive first.
+	forwardStarted := make(chan struct{}, 1)
+	gcStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case forwardStarted <- struct{}{}:
+		default:
+		}
+		time.Sleep(300 * time.Millisecond)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	t.Cleanup(gcStub.Close)
+
+	cfg := busyTestConfig(gcStub.URL)
+	env := targetedInboundEnvelope(t, "C1", "100.000010", "")
+	procDone := make(chan struct{})
+	go func() {
+		defer close(procDone)
+		processSlackEvent(cfg, newTestHandleAliasRegistry(t), nil, nil, nil, nil, env, func() {})
+	}()
+	<-forwardStarted
+
+	// Reply while the forward is still in flight: the mark must exist.
+	req := httptest.NewRequest(http.MethodPost, "/publish", strings.NewReader(publishBody("C1", "100.000010")))
+	rec := httptest.NewRecorder()
+	handlePublish(cfg, nil, nil, newPublishDedupCache(publishDedupTTL))(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("publish status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+
+	first := rr.await(t, 3*time.Second)
+	second := rr.await(t, 3*time.Second)
+	if first.op != "add" || second.op != "remove" || second.timestamp != "100.000010" {
+		t.Errorf("reaction sequence = (%s, %s on %s), want (add, remove on 100.000010)",
+			first.op, second.op, second.timestamp)
+	}
+	<-procDone
+}
+
+// A failed forward cancels the pre-registered mark: no reply is
+// coming, and the redelivery re-marks on take-over.
+func TestBusyReaction_FailedForwardCancelsMark(t *testing.T) {
+	slackStub, reactions := newReactionRecordingSlackStub(t)
+	withSlackAPIStub(t, slackStub)
+	gcStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(gcStub.Close)
+
+	cfg := busyTestConfig(gcStub.URL)
+	env := targetedInboundEnvelope(t, "C1", "100.000010", "")
+	processSlackEvent(cfg, newTestHandleAliasRegistry(t), nil, nil, nil, nil, env, func() {})
+
+	if n := cfg.busyMarks.size(); n != 0 {
+		t.Errorf("registry has %d entries after failed forward, want 0 (mark cancelled)", n)
+	}
+	// No reactions.add either — the forward never succeeded.
+	reactions.assertNoCall(t, 300*time.Millisecond)
+}
+
+// A re-mark of the SAME message (retaken redelivery) merges add
+// completions: the stored done closes only when every add attempt has
+// concluded (codex r4).
+func TestBusyReactionRegistry_SameMessageRemarkMergesAddDone(t *testing.T) {
+	r := newBusyReactionRegistry()
+	d1, _ := r.markBoth("C1", "", "1.0")
+	d2, _ := r.markBoth("C1", "", "1.0")
+
+	_, done, ok := r.take("C1", "1.0")
+	if !ok || done == nil {
+		t.Fatalf("take = (done=%v, ok=%v), want a merged done channel", done, ok)
+	}
+	assertOpen := func(label string) {
+		t.Helper()
+		select {
+		case <-done:
+			t.Fatalf("merged done closed %s", label)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	assertOpen("before either add concluded")
+	close(d1)
+	assertOpen("with the second add still in flight")
+	close(d2)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("merged done not closed after both adds concluded")
+	}
+}
+
 // (g) A mark past busyReactionTTL is dead: the publish consumes the
 // stale entry but fires no reactions.remove.
 func TestBusyReaction_ExpiredMarkDoesNotRemove(t *testing.T) {

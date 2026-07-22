@@ -35,13 +35,17 @@ import (
 // delay while keeping the map small.
 const eventDedupTTL = 10 * time.Minute
 
-// eventDedupInflightWait bounds how long a redelivery waits for the
-// in-flight first delivery to conclude before giving up and dropping.
-// The forward normally concludes in seconds; the bound only matters
-// when it hangs, where an unbounded wait would pile up handler
-// goroutines. A drop here is loud-logged, and Slack's next rung on
-// the retry ladder gets the same chance again.
-const eventDedupInflightWait = 30 * time.Second
+// eventDedupParkLogInterval paces the "still parked" log line for a
+// redelivery waiting on an in-flight claim. The wait itself is
+// UNBOUNDED by design (codex r4): the redelivery already returned a
+// 200, so Slack will never resend it — dropping it while the owner's
+// outcome is undecided would permanently lose the event if that owner
+// then fails. Every claim concludes deterministically (the gc forward
+// calls are bounded by gcForwardClient and processSlackEvent concludes
+// on every return path), so parked goroutines cannot leak; the parked
+// waiter holds no dispatch slot (released before parking, re-acquired
+// on takeover).
+const eventDedupParkLogInterval = 30 * time.Second
 
 // eventDedupMaxEntries hard-caps the seen-set so a pathological event
 // flood cannot grow it without bound. At the cap, the oldest committed
