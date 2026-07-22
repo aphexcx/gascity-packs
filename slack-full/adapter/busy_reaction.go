@@ -49,6 +49,41 @@ const busyReactionTTL = 30 * time.Minute
 // evicted — that mark's reaction just stops being removable.
 const busyReactionMaxEntries = 4096
 
+// busyStaleMaxPerEntry caps how many orphaned ancestor reactions one
+// registry entry retains (codex r7): a stream of overlapping failed
+// re-targets on a hot thread would otherwise grow the ancestry — and
+// copy it on every displacement — without bound. On overflow the
+// OLDEST ancestors drop; their reactions simply stop being removable,
+// which is the pre-ancestry behavior.
+const busyStaleMaxPerEntry = 16
+
+// mergeStale merges add into existing, deduplicating by message ts
+// (first occurrence wins) and capping at busyStaleMaxPerEntry by
+// dropping from the front (oldest).
+func mergeStale(existing, add []busyTaken) []busyTaken {
+	if len(add) == 0 && len(existing) <= busyStaleMaxPerEntry {
+		return existing
+	}
+	seen := map[string]bool{}
+	merged := make([]busyTaken, 0, len(existing)+len(add))
+	for _, t := range existing {
+		if !seen[t.messageTS] {
+			seen[t.messageTS] = true
+			merged = append(merged, t)
+		}
+	}
+	for _, t := range add {
+		if !seen[t.messageTS] {
+			seen[t.messageTS] = true
+			merged = append(merged, t)
+		}
+	}
+	if len(merged) > busyStaleMaxPerEntry {
+		merged = merged[len(merged)-busyStaleMaxPerEntry:]
+	}
+	return merged
+}
+
 // busyReactionAddWait bounds how long the remove side waits for the
 // corresponding reactions.add call to finish before issuing
 // reactions.remove anyway. It MUST exceed slackAPIClient's timeout
@@ -280,31 +315,55 @@ func (r *busyReactionRegistry) cancelBoth(channel, threadTS, messageTS string, a
 				perKey[k] = append(perKey[k], m.stale...)
 			}
 		}
-		for k, marks := range perKey {
-			if len(marks) == 0 {
-				continue
-			}
-			key := busyReactionKey{channel: channel, threadKey: k}
-			if cur, taken := r.entries[key]; taken {
-				// A racing retry (or a newer re-target) owns the key:
-				// never clobber it — merge the pool into its stale
-				// ancestry so its conclusion still clears them.
-				cur.stale = append(cur.stale, marks...)
-				r.entries[key] = cur
-				continue
-			}
-			r.entries[key] = busyReactionMark{
-				messageTS: marks[0].messageTS,
-				addedAt:   now,
-				addDone:   marks[0].addDone,
-				stale:     marks[1:],
-			}
-		}
+		r.restoreLocked(channel, now, perKey)
 		r.mu.Unlock()
 	}
 	if addDone != nil {
 		close(addDone)
 	}
+}
+
+// restoreLocked re-parks per-key mark pools: an unowned key gets the
+// pool's first mark as its entry (rest as stale ancestry); a key a
+// racing retry or newer re-target owns is never clobbered — the pool
+// merges into its stale ancestry so its conclusion still clears them.
+// Ancestry is deduplicated and bounded (busyStaleMaxPerEntry). Called
+// with r.mu held.
+func (r *busyReactionRegistry) restoreLocked(channel string, now time.Time, perKey map[string][]busyTaken) {
+	for k, marks := range perKey {
+		if len(marks) == 0 {
+			continue
+		}
+		key := busyReactionKey{channel: channel, threadKey: k}
+		if cur, taken := r.entries[key]; taken {
+			cur.stale = mergeStale(cur.stale, marks)
+			r.entries[key] = cur
+			continue
+		}
+		r.entries[key] = busyReactionMark{
+			messageTS: marks[0].messageTS,
+			addedAt:   now,
+			addDone:   marks[0].addDone,
+			stale:     mergeStale(nil, marks[1:]),
+		}
+	}
+}
+
+// restoreDisplaced re-parks marks a failed delivery had displaced
+// (codex r7): the displacing message's affordance is being rolled
+// back, but the displaced agents may still be working and their
+// reactions were deliberately not removed.
+func (r *busyReactionRegistry) restoreDisplaced(channel string, restore []busyDisplaced) {
+	if r == nil || channel == "" || len(restore) == 0 {
+		return
+	}
+	perKey := map[string][]busyTaken{}
+	for _, d := range restore {
+		perKey[d.threadKey] = append(perKey[d.threadKey], d.mark)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.restoreLocked(channel, r.clock(), perKey)
 }
 
 // takeConversation removes and returns every pending mark in channel,
@@ -382,7 +441,7 @@ func (r *busyReactionRegistry) takeMessage(channel, threadTS, messageTS string) 
 				messageTS: m.stale[0].messageTS,
 				addedAt:   now,
 				addDone:   m.stale[0].addDone,
-				stale:     m.stale[1:],
+				stale:     mergeStale(nil, m.stale[1:]),
 			}
 		}
 	}

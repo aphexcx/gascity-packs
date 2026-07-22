@@ -118,19 +118,6 @@ func dispatchRoomLaunch(
 		return false
 	}
 
-	// Bootstrap alias on first spawn so the next `@<handle> ...` post
-	// in the thread (or any other channel) routes via the existing
-	// single-`@` alias dispatch path. Idempotent on Set if the handle
-	// is already registered to this same session.
-	if created && aliasReg != nil {
-		if err := aliasReg.Set(handle, sessionID); err != nil {
-			log.Printf("launcher dispatch: aliasReg.Set handle=%q session=%s: %v",
-				handle, sessionID, err)
-			// Continue — the spawn succeeded; alias bootstrap is best-effort.
-			// The user can re-register manually via /handle-alias if needed.
-		}
-	}
-
 	// Post the remainder as the session's first/next message via the
 	// shared session-message helper. The receiving session sees the
 	// raw remainder so the user's first message reads naturally; we
@@ -152,7 +139,25 @@ func dispatchRoomLaunch(
 		}
 		// Transient: the session exists but never got the message — a
 		// redelivery re-acquires the same thread session and re-posts.
+		// The alias is deliberately NOT registered yet (below, after
+		// this succeeds): a registered alias would send the redelivery
+		// down handleDoubleHandleDispatch's pre-claimed branch, which
+		// commits without ever re-posting the remainder (codex r7).
 		return false
+	}
+
+	// Bootstrap alias only after the first message actually landed, so
+	// the next `@<handle> ...` post routes via the single-`@` alias
+	// dispatch path. Idempotent on Set if the handle is already
+	// registered to this same session. Ordered after postSessionMessage
+	// (codex r7) — see the failure comment above.
+	if created && aliasReg != nil {
+		if err := aliasReg.Set(handle, sessionID); err != nil {
+			log.Printf("launcher dispatch: aliasReg.Set handle=%q session=%s: %v",
+				handle, sessionID, err)
+			// Continue — the spawn succeeded; alias bootstrap is best-effort.
+			// The user can re-register manually via /handle-alias if needed.
+		}
 	}
 
 	// Acknowledge to the user. Different wording for spawn vs. reuse so

@@ -2101,11 +2101,34 @@ func handleSlackEvents(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 
 		// Process event_callback. Always 200 quickly to avoid Slack retries.
 		w.WriteHeader(http.StatusOK)
-		release, capacity, ok := cfg.acquireDispatchSlot()
-		if !ok {
-			log.Printf("slack adapter: dispatch queue full (cap=%d), dropping slack event type=%q",
-				capacity, env.Type)
-			return
+		// Route KNOWN events past the queue-full load-shed first
+		// (codex r7): a redelivery of a committed event needs no slot
+		// to drop, and a redelivery of an IN-FLIGHT event must park —
+		// slotless — even when the queue is saturated, because if the
+		// owner then fails this acked copy is the event's only
+		// recovery. Only genuinely new events contend at the
+		// nonblocking load-shed below. The peek is advisory (a claim
+		// can appear or conclude before the goroutine's begin); the
+		// begin loop re-checks and handles every interleaving.
+		needSlot := true
+		if unknown, wait := cfg.eventDedup.peek(env.EventID); !unknown {
+			if wait == nil {
+				log.Printf("slack event dedup: dropping redelivery event_id=%s retry_num=%q team_id=%q",
+					env.EventID, r.Header.Get("X-Slack-Retry-Num"), clipTeamIDForLog(teamID))
+				return
+			}
+			needSlot = false
+		}
+		var release func()
+		if needSlot {
+			var capacity int
+			var ok bool
+			release, capacity, ok = cfg.acquireDispatchSlot()
+			if !ok {
+				log.Printf("slack adapter: dispatch queue full (cap=%d), dropping slack event type=%q",
+					capacity, env.Type)
+				return
+			}
 		}
 		// Drop Events API redeliveries. Slack retries any delivery it
 		// considers unacknowledged (network hiccup, slow first ack, its
@@ -2115,10 +2138,7 @@ func handleSlackEvents(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 		// The 200 above already acknowledged this delivery, so returning
 		// here is safe. Keyed on event_id only — it is unique per event
 		// and stable across retries. Envelopes without an event_id (not
-		// event_callback shaped) are never deduped. Checked AFTER slot
-		// acquisition so a queue-full drop above never records the id:
-		// Slack's retry is the only recovery for a dropped event and
-		// must not find itself marked already-seen.
+		// event_callback shaped) are never deduped.
 		//
 		// A redelivery that races the FIRST delivery's still-running
 		// forward must not be discarded on the spot: if that forward
@@ -2144,7 +2164,7 @@ func handleSlackEvents(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 		// Phase 4 review fix). The drop paths below release explicitly.
 		retryNum := r.Header.Get("X-Slack-Retry-Num")
 		go func() {
-			ownsSlot := true
+			ownsSlot := release != nil
 			for {
 				proceed, wait := cfg.eventDedup.begin(env.EventID)
 				if proceed {
@@ -2562,16 +2582,15 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 	// Busy-reaction lifecycle, add side: fires once per inbound (the
 	// alias-dispatch fanout below targets the same Slack TS, so a
 	// duplicate react would be a Slack no-op). Marks displaced by this
-	// re-target are cleaned up only NOW — after the forward succeeded
-	// (codex r3 + r5): their messages still wear the busy emoji and
-	// nothing else would ever remove it, but removing before the
-	// forward's outcome was known could strip an affordance whose
-	// agent is still working. The affordance moves to the newest
-	// targeted message.
+	// re-target are cleaned up only after the FINAL delivery for this
+	// event succeeded — postInbound for plain channel routing, the
+	// alias POST when an alias dispatch fires (codex r3 + r5 + r7):
+	// their messages still wear the busy emoji and nothing else would
+	// ever remove it, but removing before the event's outcome is
+	// known could strip an affordance whose agent is still working.
+	// The affordance moves to the newest targeted message. See the
+	// displaced-cleanup dispatch after the alias block.
 	if busyEligible {
-		for _, d := range busyDisplacedMarks {
-			go removeBusyReaction(cfg, msg.Channel, d.mark)
-		}
 		go func(channel, ts, emoji string, addDone chan struct{}) {
 			// Closing addDone releases any remove waiting to run
 			// after this add (clearBusyReaction orders remove-after-
@@ -2594,6 +2613,7 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 	// binding. The originating channel's bound session still sees the
 	// inbound (above) and is expected to stay silent (per its prompt)
 	// because target != its handle.
+	displacedOwned := false
 	if target != "" && aliasReg != nil {
 		if aliasedSessionID, ok := aliasReg.Get(target); ok {
 			// Thread-stickiness bind: record (channel, msg.TS) -> target
@@ -2621,12 +2641,18 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 			// is the acceptable cost of not losing the addressed
 			// session's copy.
 			commitDedup = false
+			displacedOwned = true
 			released = true
 			dispatchInflightWG.Add(1)
-			go func() {
+			go func(displaced []busyDisplaced) {
 				defer dispatchInflightWG.Done()
 				defer release()
 				if dispatchToAliasedSession(cfg, aliasedSessionID, inbound, target) {
+					// Final delivery landed: NOW retire the marks
+					// this re-target displaced (codex r7).
+					for _, d := range displaced {
+						go removeBusyReaction(cfg, inbound.Conversation.ConversationID, d.mark)
+					}
 					cfg.eventDedup.commit(env.EventID)
 					return
 				}
@@ -2634,19 +2660,35 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 				// message, but no reply is coming — the addressed
 				// session never got it and the channel-bound session
 				// stays silent — so without cleanup the hourglass
-				// sits forever next to the ⚠️ (codex r6). Consume the
-				// mark and remove the emoji BEFORE forget wakes any
-				// parked retry (which re-marks and re-adds).
+				// sits forever next to the ⚠️ (codex r6). The removal
+				// runs SYNCHRONOUSLY and completes before forget wakes
+				// any parked retry: an async removal could otherwise
+				// land after the retry's re-add (already_reacted) and
+				// strip the recovered attempt's emoji (codex r7). The
+				// marks this attempt displaced are restored — their
+				// agents may still be working (codex r7).
 				if cfg.busyReaction != "" {
 					for _, tk := range cfg.busyMarks.takeMessage(
 						inbound.Conversation.ConversationID, inbound.ReplyToMessageID, inbound.ProviderMessageID) {
-						go removeBusyReaction(cfg, inbound.Conversation.ConversationID, tk)
+						removeBusyReaction(cfg, inbound.Conversation.ConversationID, tk)
 					}
+					cfg.busyMarks.restoreDisplaced(inbound.Conversation.ConversationID, displaced)
 				}
 				cfg.eventDedup.forget(env.EventID)
 				reactAliasDispatchFailure(cfg.slackBotToken,
 					inbound.Conversation.ConversationID, inbound.ProviderMessageID)
-			}()
+			}(busyDisplacedMarks)
+		}
+	}
+
+	// No alias dispatch owns this event: postInbound was the final
+	// delivery and it succeeded, so retire the displaced marks now
+	// (codex r7 — when an alias dispatch fires, ITS success branch
+	// does this instead, because the alias POST is the delivery that
+	// decides the event).
+	if busyEligible && !displacedOwned {
+		for _, d := range busyDisplacedMarks {
+			go removeBusyReaction(cfg, msg.Channel, d.mark)
 		}
 	}
 }
