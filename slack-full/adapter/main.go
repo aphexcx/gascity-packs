@@ -1757,7 +1757,7 @@ func slackGetUploadURL(token, filename string, length int) (*slackGetUploadURLRe
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+token)
 	httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	httpResp, err := http.DefaultClient.Do(httpReq)
+	httpResp, err := slackAPIClient.Do(httpReq)
 	if err != nil {
 		return nil, err
 	}
@@ -1818,7 +1818,7 @@ func slackPutFileBytes(uploadURL string, filename string, body []byte) error {
 		return redactTransportError("build upload request to", safeURL, err)
 	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := slackUploadClient.Do(req)
 	if err != nil {
 		return redactTransportError("upload POST to", safeURL, err)
 	}
@@ -1846,7 +1846,7 @@ func slackCompleteUpload(token string, req slackCompleteUploadReq) (*slackComple
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+token)
 	httpReq.Header.Set("Content-Type", "application/json; charset=utf-8")
-	httpResp, err := http.DefaultClient.Do(httpReq)
+	httpResp, err := slackAPIClient.Do(httpReq)
 	if err != nil {
 		return nil, err
 	}
@@ -2017,7 +2017,7 @@ func callSlackReactions(token, method string, req slackReactionsAddReq) (*slackR
 	httpReq.Header.Set("Authorization", "Bearer "+token)
 	httpReq.Header.Set("Content-Type", "application/json; charset=utf-8")
 
-	httpResp, err := http.DefaultClient.Do(httpReq)
+	httpResp, err := slackAPIClient.Do(httpReq)
 	if err != nil {
 		return nil, err
 	}
@@ -2042,7 +2042,7 @@ func postToSlack(token string, req slackPostMessageReq) (*slackPostMessageResp, 
 	httpReq.Header.Set("Authorization", "Bearer "+token)
 	httpReq.Header.Set("Content-Type", "application/json; charset=utf-8")
 
-	httpResp, err := http.DefaultClient.Do(httpReq)
+	httpResp, err := slackAPIClient.Do(httpReq)
 	if err != nil {
 		return nil, err
 	}
@@ -2183,18 +2183,17 @@ func handleSlackEvents(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 			}
 			if !ownsSlot {
 				// Taking over after a parked wait: the original slot
-				// went back to the pool, so contend for a fresh one.
-				newRelease, capacity, ok := cfg.acquireDispatchSlot()
-				if !ok {
-					// Same drop semantics as the handler's queue-full
-					// path — and release the claim we just made so
-					// state doesn't record an event nothing processed.
-					cfg.eventDedup.forget(env.EventID)
-					log.Printf("slack adapter: dispatch queue full (cap=%d), dropping parked redelivery event_id=%s",
-						capacity, env.EventID)
-					return
-				}
-				release = newRelease
+				// went back to the pool, so contend for a fresh one —
+				// BLOCKING, unlike the handler's entry check. This
+				// delivery already got its 200 and may be the event's
+				// only remaining copy, so a queue-full drop here would
+				// lose it permanently (codex r5). The blocked
+				// goroutine holds no slot and every slot holder
+				// releases in bounded time, so this always makes
+				// progress; new deliveries still shed load at the
+				// handler's nonblocking check.
+				cfg.dispatchSem <- struct{}{}
+				release = func() { <-cfg.dispatchSem }
 			}
 			processSlackEvent(cfg, aliasReg, threadReg, roomLaunchReg, subteamMap, threadHandleSticky, env, release)
 		}()
@@ -2527,31 +2526,26 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 	// this — no reaction, no mark.
 	busyEligible := target != "" && cfg.slackBotToken != "" && cfg.busyReaction != ""
 	var busyAddDone chan struct{}
+	var busyDisplacedMarks []busyDisplaced
 	if busyEligible {
-		var superseded []busyTaken
-		busyAddDone, superseded = cfg.busyMarks.markBoth(msg.Channel, msg.ThreadTS, msg.TS)
-		// A re-target of the same thread displaced earlier mark(s)
-		// whose messages still wear the busy emoji — nothing would
-		// ever remove those, so clean them up now (codex r3). The
-		// affordance moves to the newest targeted message.
-		for _, s := range superseded {
-			go removeBusyReaction(cfg, msg.Channel, s)
-		}
+		busyAddDone, busyDisplacedMarks = cfg.busyMarks.markBoth(msg.Channel, msg.ThreadTS, msg.TS)
 	}
 
 	if err := postInbound(cfg, inbound); err != nil {
 		log.Printf("inbound POST failed: %v", err)
-		// Nothing reached gc: forget the dedup claim so a Slack
-		// redelivery of this event — waiting on the claim right now
-		// or arriving later — is a second chance instead of a dedup
-		// drop (message loss). The busy mark is cancelled for the
-		// same reason: no agent received the message, so no reply
-		// will ever come to clear it (the redelivery re-marks).
+		// Nothing reached gc. Cancel the busy mark FIRST — no agent
+		// received the message, so no reply will ever come to clear
+		// it — restoring any marks it displaced (their agents may
+		// still be working, codex r5). Only THEN release the dedup
+		// claim: forget wakes a parked redelivery, and it must not
+		// re-mark this timestamp while the old attempt's cancellation
+		// is still pending (a late cancel would delete the retry's
+		// fresh mark and strand its hourglass).
+		if busyEligible {
+			cfg.busyMarks.cancelBoth(msg.Channel, msg.ThreadTS, msg.TS, busyAddDone, busyDisplacedMarks)
+		}
 		commitDedup = false
 		cfg.eventDedup.forget(env.EventID)
-		if busyEligible {
-			cfg.busyMarks.cancelBoth(msg.Channel, msg.ThreadTS, msg.TS, busyAddDone)
-		}
 		return
 	}
 	log.Printf("inbound: chan=%s user=%s ts=%s thread=%s target=%q files=%d text=%dch",
@@ -2559,8 +2553,17 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 
 	// Busy-reaction lifecycle, add side: fires once per inbound (the
 	// alias-dispatch fanout below targets the same Slack TS, so a
-	// duplicate react would be a Slack no-op).
+	// duplicate react would be a Slack no-op). Marks displaced by this
+	// re-target are cleaned up only NOW — after the forward succeeded
+	// (codex r3 + r5): their messages still wear the busy emoji and
+	// nothing else would ever remove it, but removing before the
+	// forward's outcome was known could strip an affordance whose
+	// agent is still working. The affordance moves to the newest
+	// targeted message.
 	if busyEligible {
+		for _, d := range busyDisplacedMarks {
+			go removeBusyReaction(cfg, msg.Channel, d.mark)
+		}
 		go func(channel, ts, emoji string, addDone chan struct{}) {
 			// Closing addDone releases any remove waiting to run
 			// after this add (clearBusyReaction orders remove-after-
@@ -4031,6 +4034,18 @@ func handleIdentityDelete(reg *identityRegistry) http.HandlerFunc {
 // same-host API; a timeout surfaces as a normal forward failure,
 // which forgets the claim so a redelivery can take over.
 var gcForwardClient = &http.Client{Timeout: 20 * time.Second}
+
+// slackAPIClient bounds Slack Web API JSON calls (chat.postMessage,
+// reactions, ephemerals, upload bookkeeping). Every synchronous call
+// reachable while a dedup claim is open must conclude, or parked
+// redeliveries wait forever (codex r5); the rest simply shouldn't
+// hang goroutines on a stalled upstream either.
+var slackAPIClient = &http.Client{Timeout: 30 * time.Second}
+
+// slackUploadClient bounds the pre-signed file-bytes POST, which
+// carries whole file payloads and deserves a longer leash than the
+// JSON calls.
+var slackUploadClient = &http.Client{Timeout: 120 * time.Second}
 
 func postInbound(cfg config, msg externalInboundMessage) error {
 	body, _ := json.Marshal(map[string]any{

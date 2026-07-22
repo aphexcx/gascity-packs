@@ -130,6 +130,14 @@ type busyTaken struct {
 	addDone   chan struct{}
 }
 
+// busyDisplaced is a mark displaced by a re-target, together with the
+// registry key it was displaced from — enough to restore it if the
+// displacing inbound's forward then fails (codex r5).
+type busyDisplaced struct {
+	threadKey string
+	mark      busyTaken
+}
+
 // The returned channel is the mark's addDone: the caller's add
 // goroutine MUST close it once its reactions.add call has returned so
 // the remove side can order remove-after-add. Always non-nil — a
@@ -156,21 +164,26 @@ func (r *busyReactionRegistry) mark(channel, threadKey, messageTS string) chan s
 // superseded returns the marks these writes displaced (a human
 // re-targeting the same thread before the first reply lands, codex
 // r3): those messages already carry a busy reaction that no registry
-// entry points at anymore, so the caller must remove them — TTL
-// expiry only deletes metadata, never the Slack-side emoji.
+// entry points at anymore. Once the displacing inbound's forward
+// SUCCEEDS the caller must remove those reactions (TTL expiry only
+// deletes metadata, never the Slack-side emoji); if the forward
+// fails, the caller restores them via cancelBoth instead (codex r5).
 // Deduplicated by message ts and never includes messageTS itself.
-func (r *busyReactionRegistry) markBoth(channel, threadTS, messageTS string) (addDone chan struct{}, superseded []busyTaken) {
+func (r *busyReactionRegistry) markBoth(channel, threadTS, messageTS string) (addDone chan struct{}, superseded []busyDisplaced) {
 	addDone = make(chan struct{})
 	seen := map[string]bool{messageTS: true}
-	collect := func(old busyTaken, ok bool) {
+	collect := func(key string, old busyTaken, ok bool) {
 		if ok && !seen[old.messageTS] {
 			seen[old.messageTS] = true
-			superseded = append(superseded, old)
+			superseded = append(superseded, busyDisplaced{threadKey: key, mark: old})
 		}
 	}
-	collect(r.markWithDone(channel, busyThreadKey(threadTS, messageTS), messageTS, addDone))
+	rootKey := busyThreadKey(threadTS, messageTS)
+	old, ok := r.markWithDone(channel, rootKey, messageTS, addDone)
+	collect(rootKey, old, ok)
 	if threadTS != "" && threadTS != messageTS {
-		collect(r.markWithDone(channel, messageTS, messageTS, addDone))
+		old, ok = r.markWithDone(channel, messageTS, messageTS, addDone)
+		collect(messageTS, old, ok)
 	}
 	return addDone, superseded
 }
@@ -218,14 +231,20 @@ func (r *busyReactionRegistry) markWithDone(channel, threadKey, messageTS string
 
 // cancelBoth removes the entries markBoth created for (channel,
 // threadTS, messageTS) — the inbound never reached gc, so no reply
-// will ever come to clear them — and closes addDone so any waiter
-// that already consumed a mark proceeds to its benign no-op remove
-// (the reactions.add for a cancelled mark never fires). Entries are
-// deleted only while they still point at messageTS; a newer mark that
-// took the key stays.
-func (r *busyReactionRegistry) cancelBoth(channel, threadTS, messageTS string, addDone chan struct{}) {
+// will ever come to clear them — restores any marks that inbound had
+// displaced (their agents may still be working and their reactions
+// were deliberately NOT removed yet, codex r5), and closes addDone so
+// any waiter that already consumed a mark proceeds to its benign
+// no-op remove (the reactions.add for a cancelled mark never fires).
+// Entries are deleted only while they still point at messageTS, and a
+// restore never clobbers a key a racing retry has already re-marked.
+// Callers must run this BEFORE releasing the event's dedup claim, so
+// a woken redelivery cannot re-mark the timestamp while the old
+// attempt's cancellation is still in flight.
+func (r *busyReactionRegistry) cancelBoth(channel, threadTS, messageTS string, addDone chan struct{}, restore []busyDisplaced) {
 	if r != nil && channel != "" && messageTS != "" {
 		r.mu.Lock()
+		now := r.clock()
 		keys := []string{busyThreadKey(threadTS, messageTS)}
 		if threadTS != "" && threadTS != messageTS {
 			keys = append(keys, messageTS)
@@ -234,6 +253,16 @@ func (r *busyReactionRegistry) cancelBoth(channel, threadTS, messageTS string, a
 			key := busyReactionKey{channel: channel, threadKey: k}
 			if m, ok := r.entries[key]; ok && m.messageTS == messageTS {
 				delete(r.entries, key)
+			}
+		}
+		for _, d := range restore {
+			key := busyReactionKey{channel: channel, threadKey: d.threadKey}
+			if _, taken := r.entries[key]; !taken {
+				r.entries[key] = busyReactionMark{
+					messageTS: d.mark.messageTS,
+					addedAt:   now,
+					addDone:   d.mark.addDone,
+				}
 			}
 		}
 		r.mu.Unlock()

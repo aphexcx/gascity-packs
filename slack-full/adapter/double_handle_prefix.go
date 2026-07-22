@@ -206,7 +206,10 @@ func postSlackEphemeral(token, channel, user, threadTS, text string) error {
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
-	resp, err := http.DefaultClient.Do(req)
+	// slackAPIClient, not http.DefaultClient: this runs synchronously
+	// on the event path while a dedup claim is open — an unbounded
+	// hang would park acked redeliveries forever (codex r5).
+	resp, err := slackAPIClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("postEphemeral transport: %w", err)
 	}

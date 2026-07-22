@@ -705,6 +705,38 @@ func TestBusyReaction_FailedForwardCancelsMark(t *testing.T) {
 	reactions.assertNoCall(t, 300*time.Millisecond)
 }
 
+// A re-target whose forward FAILS must not strip the previous
+// message's busy affordance: no remove fires, and the displaced mark
+// is restored so the earlier agent's eventual reply can still clear
+// it (codex r5).
+func TestBusyReaction_FailedRetargetRestoresDisplacedMark(t *testing.T) {
+	slackStub, reactions := newReactionRecordingSlackStub(t)
+	withSlackAPIStub(t, slackStub)
+	gcStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(gcStub.Close)
+
+	cfg := busyTestConfig(gcStub.URL)
+	// Pre-existing mark: root message M1, its add already completed.
+	doneM1, _ := cfg.busyMarks.markBoth("C1", "", "100.000010")
+	close(doneM1)
+
+	// Targeted thread reply M2 in M1's thread; its forward fails.
+	env := targetedInboundEnvelope(t, "C1", "100.000020", "100.000010")
+	processSlackEvent(cfg, newTestHandleAliasRegistry(t), nil, nil, nil, nil, env, func() {})
+
+	// No reactions at all: M2's add never fired (forward failed) and
+	// M1's emoji must NOT have been removed.
+	reactions.assertNoCall(t, 300*time.Millisecond)
+	if ts, ok := cfg.busyMarks.pending("C1", "100.000010"); !ok || ts != "100.000010" {
+		t.Errorf("displaced mark = (%q, %v), want restored (100.000010, true)", ts, ok)
+	}
+	if _, ok := cfg.busyMarks.pending("C1", "100.000020"); ok {
+		t.Error("failed re-target's own-ts mark survived; want cancelled")
+	}
+}
+
 // A re-mark of the SAME message (retaken redelivery) merges add
 // completions: the stored done closes only when every add attempt has
 // concluded (codex r4).

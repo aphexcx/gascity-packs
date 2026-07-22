@@ -34,9 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   thread before the first reply lands removes the displaced message's
   reaction instead of stranding it. The mark registers before the
   forward to gc (a reply can arrive before postInbound even returns;
-  a failed forward cancels the mark), and a re-mark of the same
-  message merges add-completion channels so a remove waits for every
-  in-flight add. Note the lifecycle fires only when an agent target
+  a failed forward cancels the mark before releasing the event's
+  dedup claim and restores any marks the failed inbound displaced),
+  displaced-mark reactions are removed only after the displacing
+  forward succeeds, and a re-mark of the same message merges
+  add-completion channels so a remove waits for every in-flight add. Note the lifecycle fires only when an agent target
   is
   parsed from the message (`@handle:` prefix, User Group mention, or
   sticky thread handle) — plain messages that reach a session solely
@@ -55,9 +57,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   starvation) until the owner's verdict — commit drops it, forget
   hands it the event — and never gives up: it already returned a 200,
   so Slack will not resend it. The wait runs in a goroutine after the
-  handler has returned, so Slack's ack is never delayed behind it,
-  and adapter→gc forwards now run on a 20-second-timeout client so
-  claims always conclude. For targeted inbounds the alias dispatch
+  handler has returned, so Slack's ack is never delayed behind it.
+  Adapter→gc forwards run on a 20-second-timeout client and Slack Web
+  API calls on 30s/120s-timeout clients so claims always conclude,
+  and a take-over blocks for dispatch capacity instead of dropping
+  the event's last copy on a full queue. For targeted inbounds the alias dispatch
   owns the verdict (success commits, failure forgets). Deliveries
   dropped at the queue-full boundary are never recorded, and a failed
   forward releases its id, so a Slack retry can always recover the
