@@ -809,6 +809,48 @@ func TestBusyReactionRegistry_TakeMessageReparksAncestors(t *testing.T) {
 	}
 }
 
+// A reply that consumed the thread while a displacing dispatch was in
+// flight tombstones the key: a failed dispatch must NOT restore the
+// displaced mark afterwards — the thread's clearing event already
+// happened — and the blocked mark is returned for reaction removal
+// (codex r8). A fresh mark on the key re-arms it.
+func TestBusyReactionRegistry_TombstoneBlocksRestoreAfterConsume(t *testing.T) {
+	r := newBusyReactionRegistry()
+	const m1, m2 = "1.0", "2.0"
+
+	d1, _ := r.markBoth("C1", "", m1)
+	close(d1)
+	d2, disp2 := r.markBoth("C1", m1, m2) // M2 displaces M1
+	if len(disp2) == 0 || disp2[0].mark.messageTS != m1 {
+		t.Fatalf("displaced = %v, want M1", disp2)
+	}
+	// A reply lands while M2's dispatch is in flight and consumes the
+	// thread (root key + own-ts key).
+	if taken := r.take("C1", m1); len(taken) == 0 {
+		t.Fatal("reply take found no mark")
+	}
+	// M2's dispatch fails: restore must be blocked by the tombstone and
+	// M1 handed back for removal.
+	blocked := r.cancelBoth("C1", m1, m2, d2, disp2)
+	got := map[string]bool{}
+	for _, tk := range blocked {
+		got[tk.messageTS] = true
+	}
+	if !got[m1] {
+		t.Errorf("blocked = %v, want M1 handed back for removal", got)
+	}
+	if _, ok := r.pending("C1", m1); ok {
+		t.Error("mark restored under a tombstoned key; want blocked")
+	}
+
+	// A fresh targeted inbound re-arms the key despite the tombstone.
+	d3, _ := r.markBoth("C1", "", m1)
+	close(d3)
+	if _, ok := r.pending("C1", m1); !ok {
+		t.Error("fresh mark did not re-arm the tombstoned key")
+	}
+}
+
 // A re-mark of the SAME message (retaken redelivery) merges add
 // completions: the stored done closes only when every add attempt has
 // concluded (codex r4).

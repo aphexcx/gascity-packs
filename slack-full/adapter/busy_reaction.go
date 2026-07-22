@@ -143,13 +143,32 @@ func busyThreadKey(threadTS, messageTS string) string {
 type busyReactionRegistry struct {
 	mu      sync.Mutex
 	entries map[busyReactionKey]busyReactionMark
+	// tombstones records keys a reply recently CONSUMED (take /
+	// takeConversation). Restoration paths consult them (codex r8): a
+	// displaced mark must not be re-parked under a key whose thread
+	// already got its reply while the displacing dispatch was in
+	// flight — the reply was that thread's one clearing event, so a
+	// restored mark would never be consumed and its reaction would
+	// stick forever. Blocked marks are returned to the caller for
+	// immediate removal instead. Entries expire after
+	// busyTombstoneTTL and are swept opportunistically.
+	tombstones map[busyReactionKey]time.Time
 	// now is the clock; nil means time.Now. Injectable so tests can
 	// drive TTL expiry without sleeping.
 	now func() time.Time
 }
 
+// busyTombstoneTTL bounds how long a consumed key blocks restoration.
+// The races it guards close within one bounded dispatch round trip
+// (≤ the 20s gc-forward timeout plus scheduling slack); 5 minutes is
+// comfortably past that while keeping the map small.
+const busyTombstoneTTL = 5 * time.Minute
+
 func newBusyReactionRegistry() *busyReactionRegistry {
-	return &busyReactionRegistry{entries: make(map[busyReactionKey]busyReactionMark)}
+	return &busyReactionRegistry{
+		entries:    make(map[busyReactionKey]busyReactionMark),
+		tombstones: make(map[busyReactionKey]time.Time),
+	}
 }
 
 func (r *busyReactionRegistry) clock() time.Time {
@@ -274,6 +293,10 @@ func (r *busyReactionRegistry) markWithDone(channel, threadKey, messageTS string
 		}
 	}
 	r.entries[key] = busyReactionMark{messageTS: messageTS, addedAt: now, addDone: storeDone, stale: keepStale}
+	// A fresh targeted inbound re-arms the thread: the next reply is a
+	// legitimate clearing event, so any consumed-key tombstone stops
+	// applying (tombstones only block RESTORING old marks, codex r8).
+	delete(r.tombstones, key)
 	if len(r.entries) > busyReactionMaxEntries {
 		r.evictOldestLocked()
 	}
@@ -292,7 +315,7 @@ func (r *busyReactionRegistry) markWithDone(channel, threadKey, messageTS string
 // Callers must run this BEFORE releasing the event's dedup claim, so
 // a woken redelivery cannot re-mark the timestamp while the old
 // attempt's cancellation is still in flight.
-func (r *busyReactionRegistry) cancelBoth(channel, threadTS, messageTS string, addDone chan struct{}, restore []busyDisplaced) {
+func (r *busyReactionRegistry) cancelBoth(channel, threadTS, messageTS string, addDone chan struct{}, restore []busyDisplaced) (blocked []busyTaken) {
 	if r != nil && channel != "" && messageTS != "" {
 		r.mu.Lock()
 		now := r.clock()
@@ -315,26 +338,35 @@ func (r *busyReactionRegistry) cancelBoth(channel, threadTS, messageTS string, a
 				perKey[k] = append(perKey[k], m.stale...)
 			}
 		}
-		r.restoreLocked(channel, now, perKey)
+		blocked = r.restoreLocked(channel, now, perKey)
 		r.mu.Unlock()
 	}
 	if addDone != nil {
 		close(addDone)
 	}
+	return blocked
 }
 
 // restoreLocked re-parks per-key mark pools: an unowned key gets the
 // pool's first mark as its entry (rest as stale ancestry); a key a
 // racing retry or newer re-target owns is never clobbered — the pool
 // merges into its stale ancestry so its conclusion still clears them.
-// Ancestry is deduplicated and bounded (busyStaleMaxPerEntry). Called
-// with r.mu held.
-func (r *busyReactionRegistry) restoreLocked(channel string, now time.Time, perKey map[string][]busyTaken) {
+// A key whose thread was CONSUMED by a reply after the displacement
+// (live tombstone, codex r8) blocks restoration entirely — that reply
+// was the thread's one clearing event, so a restored mark would never
+// be consumed; the blocked marks are returned for the caller to
+// remove their reactions instead. Ancestry is deduplicated and
+// bounded (busyStaleMaxPerEntry). Called with r.mu held.
+func (r *busyReactionRegistry) restoreLocked(channel string, now time.Time, perKey map[string][]busyTaken) (blocked []busyTaken) {
 	for k, marks := range perKey {
 		if len(marks) == 0 {
 			continue
 		}
 		key := busyReactionKey{channel: channel, threadKey: k}
+		if at, dead := r.tombstones[key]; dead && now.Sub(at) <= busyTombstoneTTL {
+			blocked = append(blocked, marks...)
+			continue
+		}
 		if cur, taken := r.entries[key]; taken {
 			cur.stale = mergeStale(cur.stale, marks)
 			r.entries[key] = cur
@@ -347,15 +379,18 @@ func (r *busyReactionRegistry) restoreLocked(channel string, now time.Time, perK
 			stale:     mergeStale(nil, marks[1:]),
 		}
 	}
+	return blocked
 }
 
 // restoreDisplaced re-parks marks a failed delivery had displaced
 // (codex r7): the displacing message's affordance is being rolled
 // back, but the displaced agents may still be working and their
-// reactions were deliberately not removed.
-func (r *busyReactionRegistry) restoreDisplaced(channel string, restore []busyDisplaced) {
+// reactions were deliberately not removed. Marks blocked by a
+// consumed-key tombstone are returned — the caller must remove their
+// reactions (codex r8).
+func (r *busyReactionRegistry) restoreDisplaced(channel string, restore []busyDisplaced) (blocked []busyTaken) {
 	if r == nil || channel == "" || len(restore) == 0 {
-		return
+		return nil
 	}
 	perKey := map[string][]busyTaken{}
 	for _, d := range restore {
@@ -363,7 +398,7 @@ func (r *busyReactionRegistry) restoreDisplaced(channel string, restore []busyDi
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.restoreLocked(channel, r.clock(), perKey)
+	return r.restoreLocked(channel, r.clock(), perKey)
 }
 
 // takeConversation removes and returns every pending mark in channel,
@@ -387,6 +422,7 @@ func (r *busyReactionRegistry) takeConversation(channel string) []busyTaken {
 			continue
 		}
 		delete(r.entries, k)
+		r.tombstones[k] = now
 		if now.Sub(m.addedAt) > busyReactionTTL {
 			continue
 		}
@@ -465,7 +501,9 @@ func (r *busyReactionRegistry) take(channel, threadKey string) []busyTaken {
 		return nil
 	}
 	delete(r.entries, key)
-	if r.clock().Sub(m.addedAt) > busyReactionTTL {
+	now := r.clock()
+	r.tombstones[key] = now
+	if now.Sub(m.addedAt) > busyReactionTTL {
 		return nil
 	}
 	return append([]busyTaken{{messageTS: m.messageTS, addDone: m.addDone}}, m.stale...)
@@ -497,11 +535,16 @@ func (r *busyReactionRegistry) size() int {
 	return len(r.entries)
 }
 
-// sweepLocked drops expired marks. Called with r.mu held.
+// sweepLocked drops expired marks and tombstones. Called with r.mu held.
 func (r *busyReactionRegistry) sweepLocked(now time.Time) {
 	for k, m := range r.entries {
 		if now.Sub(m.addedAt) > busyReactionTTL {
 			delete(r.entries, k)
+		}
+	}
+	for k, at := range r.tombstones {
+		if now.Sub(at) > busyTombstoneTTL {
+			delete(r.tombstones, k)
 		}
 	}
 }

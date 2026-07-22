@@ -148,15 +148,21 @@ func dispatchRoomLaunch(
 
 	// Bootstrap alias only after the first message actually landed, so
 	// the next `@<handle> ...` post routes via the single-`@` alias
-	// dispatch path. Idempotent on Set if the handle is already
-	// registered to this same session. Ordered after postSessionMessage
-	// (codex r7) — see the failure comment above.
-	if created && aliasReg != nil {
-		if err := aliasReg.Set(handle, sessionID); err != nil {
-			log.Printf("launcher dispatch: aliasReg.Set handle=%q session=%s: %v",
-				handle, sessionID, err)
-			// Continue — the spawn succeeded; alias bootstrap is best-effort.
-			// The user can re-register manually via /handle-alias if needed.
+	// dispatch path. Ordered after postSessionMessage (codex r7) — see
+	// the failure comment above. Gated on the handle being unclaimed
+	// rather than on `created` (codex r8): a retry after a failed
+	// first message re-acquires the existing thread session
+	// (created=false) and must still bind the handle it advertises in
+	// the acknowledgement below.
+	if aliasReg != nil {
+		if _, claimed := aliasReg.Get(handle); !claimed {
+			if err := aliasReg.Set(handle, sessionID); err != nil {
+				log.Printf("launcher dispatch: aliasReg.Set handle=%q session=%s: %v",
+					handle, sessionID, err)
+				// Continue — the message landed; alias bootstrap is
+				// best-effort. The user can re-register manually via
+				// /handle-alias if needed.
+			}
 		}
 	}
 

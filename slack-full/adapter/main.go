@@ -2570,7 +2570,12 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 		// is still pending (a late cancel would delete the retry's
 		// fresh mark and strand its hourglass).
 		if busyEligible {
-			cfg.busyMarks.cancelBoth(msg.Channel, msg.ThreadTS, msg.TS, busyAddDone, busyDisplacedMarks)
+			// Marks whose thread a reply already consumed cannot be
+			// restored (tombstoned) — remove their reactions instead
+			// (codex r8).
+			for _, tk := range cfg.busyMarks.cancelBoth(msg.Channel, msg.ThreadTS, msg.TS, busyAddDone, busyDisplacedMarks) {
+				go removeBusyReaction(cfg, msg.Channel, tk)
+			}
 		}
 		commitDedup = false
 		cfg.eventDedup.forget(env.EventID)
@@ -2672,7 +2677,13 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 						inbound.Conversation.ConversationID, inbound.ReplyToMessageID, inbound.ProviderMessageID) {
 						removeBusyReaction(cfg, inbound.Conversation.ConversationID, tk)
 					}
-					cfg.busyMarks.restoreDisplaced(inbound.Conversation.ConversationID, displaced)
+					// Displaced marks whose thread a reply consumed
+					// while this dispatch was in flight cannot be
+					// restored (tombstoned) — remove their reactions
+					// instead (codex r8).
+					for _, tk := range cfg.busyMarks.restoreDisplaced(inbound.Conversation.ConversationID, displaced) {
+						go removeBusyReaction(cfg, inbound.Conversation.ConversationID, tk)
+					}
 				}
 				cfg.eventDedup.forget(env.EventID)
 				reactAliasDispatchFailure(cfg.slackBotToken,
