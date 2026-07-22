@@ -8,6 +8,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Busy-reaction lifecycle (hq-xizo, ported from
+  `feat/hq-xizo-slack-full-hardening`): a targeted inbound gets a busy
+  reaction (`BUSY_REACTION`, default `hourglass`; set-but-empty
+  disables) added on dispatch and removed when the agent's reply
+  publishes back into the same conversation/thread, tracked in a
+  bounded in-memory registry keyed by (conversation, thread key) with
+  a 30-minute TTL. Replaces the prior unconditional `eyes` reaction on
+  targeted inbounds; the ⚠️ dispatch-failure reaction stays. `/react`
+  gains an optional `remove:true` issuing `reactions.remove`
+  (`no_reaction` treated as benign delivery, mirroring
+  `already_reacted`), surfaced on the CLI as `gc slack react
+  --remove`. Note the lifecycle fires only when an agent target is
+  parsed from the message (`@handle:` prefix, User Group mention, or
+  sticky thread handle) — plain messages that reach a session solely
+  through a channel binding carry no parsed target and get no busy
+  reaction, by design. (hw-94w5k finding #3)
+
+### Fixed
+
+- Slack Events API redeliveries are now deduplicated on `event_id`
+  with a 10-minute seen-set: Slack retries any delivery it considers
+  unacknowledged and each retry re-forwarded the same message into the
+  bound session as a duplicate notification (observed as
+  byte-identical inbound log pairs). Deliveries dropped at the
+  queue-full boundary are not recorded, so a Slack retry can still
+  recover them. (hw-94w5k finding #4)
+- Human file posts delivered with subtype `file_share` are no longer
+  discarded by the system-noise subtype gate, and file-only posts (no
+  caption) are no longer discarded by the empty-text gate — both now
+  reach the attachment download pipeline. Other subtypes
+  (`message_changed`, `bot_message`, …) and bot-authored file posts
+  stay filtered. (hw-94w5k finding #1)
+- `gc slack react` / `reply-current` latest-inbound lookup now matches
+  `target_session` against every identifier the session is known by
+  (id, `GC_SESSION_NAME`, gc-reported alias/session_name), not just
+  `GC_SESSION_ID`. Name-bound sessions produce inbound events carrying
+  the NAME, so the id-only match made the default `--current` mode
+  bail with "no recent inbound transcript entry" right after an
+  inbound landed. (hw-94w5k finding #2)
+
 ### Changed
 
 - Renamed the pack directory from `slack-pack/` to `slack-full/` and the
