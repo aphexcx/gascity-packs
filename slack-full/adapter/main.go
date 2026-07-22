@@ -2107,11 +2107,38 @@ func handleSlackEvents(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 		// acquisition so a queue-full drop above never records the id:
 		// Slack's retry is the only recovery for a dropped event and
 		// must not find itself marked already-seen.
-		if env.EventID != "" && cfg.eventDedup.seen(env.EventID) {
-			release()
-			log.Printf("slack event dedup: dropping redelivery event_id=%s retry_num=%q team_id=%q",
-				env.EventID, r.Header.Get("X-Slack-Retry-Num"), clipTeamIDForLog(teamID))
-			return
+		//
+		// A redelivery that races the FIRST delivery's still-running
+		// forward must not be discarded on the spot: if that forward
+		// then fails, the discarded retry was the message's last chance
+		// (Slack got a 200 for it and stops the ladder). begin reports
+		// the in-flight case with a wait channel; blocking this handler
+		// goroutine is fine — the 200 is already written — and the loop
+		// re-begins for the final verdict once the first delivery
+		// commits (→ drop) or forgets (→ this delivery takes over).
+		// The wait is bounded so a hung forward cannot pile up handler
+		// goroutines; a bound-expiry drop is loud-logged and Slack's
+		// next retry rung gets the same chance again. codex r2 P1.
+		for {
+			proceed, wait := cfg.eventDedup.begin(env.EventID)
+			if proceed {
+				break
+			}
+			if wait == nil {
+				release()
+				log.Printf("slack event dedup: dropping redelivery event_id=%s retry_num=%q team_id=%q",
+					env.EventID, r.Header.Get("X-Slack-Retry-Num"), clipTeamIDForLog(teamID))
+				return
+			}
+			select {
+			case <-wait:
+				// First delivery concluded — re-begin for the verdict.
+			case <-time.After(eventDedupInflightWait):
+				release()
+				log.Printf("slack event dedup: first delivery of event_id=%s still in flight after %v; dropping redelivery retry_num=%q",
+					env.EventID, eventDedupInflightWait, r.Header.Get("X-Slack-Retry-Num"))
+				return
+			}
 		}
 		// Slot ownership transfers to processSlackEvent, which either
 		// releases on its own return path or hands the slot to its
@@ -2238,6 +2265,19 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 	defer func() {
 		if !released {
 			release()
+		}
+	}()
+	// Conclude the dedup claim begun in handleSlackEvents: every path
+	// out of this function is a final handling of the event — noise
+	// drops included, a redelivery would take the identical path — so
+	// the default verdict is commit. The one exception is a failed
+	// forward to gc, which flips this off and forgets the id so a
+	// redelivery can take over (codex r2 P1). No-op when the envelope
+	// carries no event_id or the cache is nil.
+	commitDedup := true
+	defer func() {
+		if commitDedup {
+			cfg.eventDedup.commit(env.EventID)
 		}
 	}()
 	if env.Type != "event_callback" || len(env.Event) == 0 {
@@ -2410,9 +2450,11 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 	}
 	if err := postInbound(cfg, inbound); err != nil {
 		log.Printf("inbound POST failed: %v", err)
-		// Nothing reached gc: release the event id recorded at the
-		// handler boundary so a Slack redelivery of this event is a
-		// second chance instead of a dedup drop (message loss).
+		// Nothing reached gc: forget the dedup claim so a Slack
+		// redelivery of this event — waiting on the claim right now
+		// or arriving later — is a second chance instead of a dedup
+		// drop (message loss).
+		commitDedup = false
 		cfg.eventDedup.forget(env.EventID)
 		return
 	}
@@ -2443,7 +2485,7 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 	// the dispatch path. BUSY_REACTION= (set-but-empty) disables this
 	// block entirely — no reaction, no mark.
 	if target != "" && cfg.slackBotToken != "" && cfg.busyReaction != "" {
-		addDone := cfg.busyMarks.mark(msg.Channel, busyThreadKey(msg.ThreadTS, msg.TS), msg.TS)
+		addDone := cfg.busyMarks.markBoth(msg.Channel, msg.ThreadTS, msg.TS)
 		go func(channel, ts, emoji string) {
 			// Closing addDone releases any remove waiting to run
 			// after this add (clearBusyReaction orders remove-after-

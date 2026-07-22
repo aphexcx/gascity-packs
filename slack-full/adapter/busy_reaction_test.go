@@ -187,7 +187,8 @@ func TestBusyReaction_TargetedInboundAddsBusyAndRecordsMark(t *testing.T) {
 }
 
 // A targeted inbound that is itself a thread reply records its mark
-// under the thread's root ts (thread_ts), still reacting on the
+// under BOTH the thread's root ts (thread_ts) and its own ts — reply
+// paths thread under either (codex r2) — still reacting on the
 // inbound message's own ts.
 func TestBusyReaction_ThreadReplyInboundKeyedByThreadTS(t *testing.T) {
 	slackStub, reactions := newReactionRecordingSlackStub(t)
@@ -205,7 +206,10 @@ func TestBusyReaction_ThreadReplyInboundKeyedByThreadTS(t *testing.T) {
 		t.Errorf("reaction = (%s on %s), want add on 100.000020", got.op, got.timestamp)
 	}
 	if ts, ok := cfg.busyMarks.pending("C1", "100.000001"); !ok || ts != "100.000020" {
-		t.Errorf("busy mark under thread key = (%q, %v), want (100.000020, true)", ts, ok)
+		t.Errorf("busy mark under thread-root key = (%q, %v), want (100.000020, true)", ts, ok)
+	}
+	if ts, ok := cfg.busyMarks.pending("C1", "100.000020"); !ok || ts != "100.000020" {
+		t.Errorf("busy mark under own-ts key = (%q, %v), want (100.000020, true)", ts, ok)
 	}
 }
 
@@ -216,12 +220,18 @@ func TestBusyReaction_ThreadReplyInboundKeyedByThreadTS(t *testing.T) {
 // its thread_ts, reaction on its own ts).
 func TestBusyReaction_PublishToSameThreadRemovesBusy(t *testing.T) {
 	cases := []struct {
-		name      string
-		threadKey string // registry key = publish reply_to_message_id
-		markedTS  string // ts the reaction sits on
+		name         string
+		seedThreadTS string // inbound's thread_ts ("" = channel-root inbound)
+		seedTS       string // inbound's own ts
+		replyTo      string // publish reply_to_message_id
+		markedTS     string // ts the reaction sits on
 	}{
-		{name: "root inbound, reply threads under its ts", threadKey: "100.000010", markedTS: "100.000010"},
-		{name: "thread-reply inbound, keyed by thread root", threadKey: "100.000001", markedTS: "100.000020"},
+		{name: "root inbound, reply threads under its ts",
+			seedThreadTS: "", seedTS: "100.000010", replyTo: "100.000010", markedTS: "100.000010"},
+		{name: "thread-reply inbound, reply threads under the root",
+			seedThreadTS: "100.000001", seedTS: "100.000020", replyTo: "100.000001", markedTS: "100.000020"},
+		{name: "thread-reply inbound, reply threads under the inbound's own ts (codex r2)",
+			seedThreadTS: "100.000001", seedTS: "100.000020", replyTo: "100.000020", markedTS: "100.000020"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -230,10 +240,10 @@ func TestBusyReaction_PublishToSameThreadRemovesBusy(t *testing.T) {
 
 			marks := newBusyReactionRegistry()
 			// Close addDone: the add already completed in this scenario.
-			close(marks.mark("C1", tc.threadKey, tc.markedTS))
+			close(marks.markBoth("C1", tc.seedThreadTS, tc.seedTS))
 			cfg := config{slackBotToken: "xoxb-fake", busyReaction: "hourglass", busyMarks: marks}
 
-			req := httptest.NewRequest(http.MethodPost, "/publish", strings.NewReader(publishBody("C1", tc.threadKey)))
+			req := httptest.NewRequest(http.MethodPost, "/publish", strings.NewReader(publishBody("C1", tc.replyTo)))
 			rec := httptest.NewRecorder()
 			handlePublish(cfg, nil, nil, newPublishDedupCache(publishDedupTTL))(rec, req)
 			if rec.Code != http.StatusOK {
@@ -254,7 +264,7 @@ func TestBusyReaction_PublishToSameThreadRemovesBusy(t *testing.T) {
 			if got.channel != "C1" || got.timestamp != tc.markedTS {
 				t.Errorf("remove target = (%s, %s), want (C1, %s)", got.channel, got.timestamp, tc.markedTS)
 			}
-			if _, ok := marks.pending("C1", tc.threadKey); ok {
+			if _, ok := marks.pending("C1", tc.replyTo); ok {
 				t.Error("registry entry survived the publish; want consumed")
 			}
 		})

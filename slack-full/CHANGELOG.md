@@ -25,8 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ordered after the corresponding `reactions.add` completes (a fast
   reply otherwise races the in-flight add and the busy emoji sticks
   forever) and a threaded `/publish-file` reply clears the mark
-  exactly like a text publish. Note the lifecycle fires only when an
-  agent target is
+  exactly like a text publish. A thread-reply inbound is marked under
+  both its thread root AND its own ts — reply-current and the
+  alias-dispatch instructions thread replies under the inbound's own
+  ts, which the root-only key missed. Note the lifecycle fires only
+  when an agent target is
   parsed from the message (`@handle:` prefix, User Group mention, or
   sticky thread handle) — plain messages that reach a session solely
   through a channel binding carry no parsed target and get no busy
@@ -38,10 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with a 10-minute seen-set: Slack retries any delivery it considers
   unacknowledged and each retry re-forwarded the same message into the
   bound session as a duplicate notification (observed as
-  byte-identical inbound log pairs). Deliveries dropped at the
-  queue-full boundary are not recorded, and a delivery whose forward
-  to gc fails releases its id — in both cases a Slack retry can still
-  recover the message. (hw-94w5k finding #4)
+  byte-identical inbound log pairs). Entries are two-state
+  (in-flight → committed): a redelivery racing the first delivery's
+  still-running forward waits for its verdict instead of being
+  discarded — if the forward fails, the retry takes over. Deliveries
+  dropped at the queue-full boundary are never recorded, and a failed
+  forward releases its id, so a Slack retry can always recover the
+  message. (hw-94w5k finding #4)
 - `openBeneath` (the confined open backing `/publish-file`) closes two
   gaps `os.Root` leaves open: the root path is pre-opened with
   `O_NOFOLLOW|O_DIRECTORY` and identity-matched against the `os.Root`

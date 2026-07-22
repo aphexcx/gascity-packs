@@ -202,9 +202,10 @@ func TestHandleSlackEventsNilDedupCacheForwardsEverything(t *testing.T) {
 	awaitInboundHits(t, hits, 2)
 }
 
-// Cache semantics: first seen is false, repeat within TTL is true,
-// repeat after TTL is false again; empty ids are never recorded.
-func TestEventDedupCacheSeenAndTTL(t *testing.T) {
+// Cache semantics: begin claims an unknown id; a second begin while
+// in flight reports a wait channel; after commit it drops; after the
+// TTL it proceeds again; empty ids never dedupe.
+func TestEventDedupCacheLifecycle(t *testing.T) {
 	var mu sync.Mutex
 	current := time.Now()
 	c := newEventDedupCache(eventDedupTTL)
@@ -214,28 +215,67 @@ func TestEventDedupCacheSeenAndTTL(t *testing.T) {
 		return current
 	}
 
-	if c.seen("Ev1") {
-		t.Error("first seen(Ev1) = true, want false")
+	proceed, wait := c.begin("Ev1")
+	if !proceed || wait != nil {
+		t.Fatalf("first begin = (%v, %v), want (true, nil)", proceed, wait)
 	}
-	if !c.seen("Ev1") {
-		t.Error("second seen(Ev1) = false, want true (within TTL)")
+	proceed, wait = c.begin("Ev1")
+	if proceed || wait == nil {
+		t.Fatalf("in-flight begin = (%v, %v), want (false, wait-chan)", proceed, wait)
+	}
+	select {
+	case <-wait:
+		t.Fatal("wait channel closed before the first delivery concluded")
+	default:
+	}
+	c.commit("Ev1")
+	select {
+	case <-wait:
+	default:
+		t.Fatal("wait channel not closed by commit")
+	}
+	proceed, wait = c.begin("Ev1")
+	if proceed || wait != nil {
+		t.Fatalf("committed begin = (%v, %v), want (false, nil) — duplicate drop", proceed, wait)
 	}
 	mu.Lock()
 	current = current.Add(eventDedupTTL + time.Minute)
 	mu.Unlock()
-	if c.seen("Ev1") {
-		t.Error("seen(Ev1) after TTL = true, want false (entry expired)")
+	if proceed, _ = c.begin("Ev1"); !proceed {
+		t.Error("begin after TTL = false, want true (entry expired)")
 	}
-	if c.seen("") {
-		t.Error("seen(\"\") = true, want false (empty ids never dedupe)")
-	}
-	if n := c.size(); n != 1 {
-		t.Errorf("size = %d, want 1 (only the re-recorded Ev1; empty id not stored)", n)
+	if proceed, _ = c.begin(""); !proceed {
+		t.Error("begin(\"\") = false, want true (empty ids never dedupe)")
 	}
 }
 
-// Cache semantics: the size cap evicts the oldest id, keeping the map
-// bounded under an event flood.
+// Cache semantics: forget erases the claim (closing any waiter) so a
+// redelivery proceeds as brand new.
+func TestEventDedupCacheForgetReleases(t *testing.T) {
+	c := newEventDedupCache(eventDedupTTL)
+	if proceed, _ := c.begin("Ev1"); !proceed {
+		t.Fatal("first begin = false, want true")
+	}
+	_, wait := c.begin("Ev1")
+	if wait == nil {
+		t.Fatal("in-flight begin returned nil wait channel")
+	}
+	c.forget("Ev1")
+	select {
+	case <-wait:
+	default:
+		t.Fatal("wait channel not closed by forget")
+	}
+	if proceed, _ := c.begin("Ev1"); !proceed {
+		t.Error("begin after forget = false, want true (retry takes over)")
+	}
+	if n := c.size(); n != 1 {
+		t.Errorf("size = %d, want 1 (the retry's fresh claim)", n)
+	}
+}
+
+// Cache semantics: the size cap evicts the oldest committed id,
+// keeping the map bounded under an event flood.
 func TestEventDedupCacheCapEvictsOldest(t *testing.T) {
 	var mu sync.Mutex
 	current := time.Now()
@@ -250,27 +290,78 @@ func TestEventDedupCacheCapEvictsOldest(t *testing.T) {
 		mu.Lock()
 		current = current.Add(time.Millisecond)
 		mu.Unlock()
-		c.seen(fmt.Sprintf("Ev%d", i))
+		id := fmt.Sprintf("Ev%d", i)
+		c.begin(id)
+		c.commit(id)
 	}
 	if n := c.size(); n != eventDedupMaxEntries {
 		t.Errorf("size = %d, want cap %d", n, eventDedupMaxEntries)
 	}
-	if c.seen("Ev0") {
-		t.Error("oldest id survived cap eviction; want evicted (seen = false)")
+	if proceed, _ := c.begin("Ev0"); !proceed {
+		t.Error("oldest id survived cap eviction; want evicted (begin proceeds)")
 	}
 	last := fmt.Sprintf("Ev%d", eventDedupMaxEntries)
-	if !c.seen(last) {
-		t.Error("newest id missing after cap eviction; want kept (seen = true)")
+	if proceed, _ := c.begin(last); proceed {
+		t.Error("newest id missing after cap eviction; want kept (begin drops)")
 	}
 }
 
 // A nil cache is inert on every method.
 func TestEventDedupCacheNilSafe(t *testing.T) {
 	var c *eventDedupCache
-	if c.seen("Ev1") {
-		t.Error("seen on nil cache = true, want false")
+	if proceed, wait := c.begin("Ev1"); !proceed || wait != nil {
+		t.Error("begin on nil cache must proceed with no wait")
 	}
+	c.commit("Ev1")
+	c.forget("Ev1")
 	if n := c.size(); n != 0 {
 		t.Errorf("size on nil cache = %d, want 0", n)
 	}
+}
+
+// A redelivery racing the FIRST delivery's still-running forward must
+// wait for its outcome (codex r2 P1): if the forward fails, the
+// waiting retry takes over and the message still reaches gc.
+func TestHandleSlackEventsInflightRetryTakesOverAfterFailure(t *testing.T) {
+	var hits int32
+	gcStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		if atomic.AddInt32(&hits, 1) == 1 {
+			// First forward: slow AND failing — the retry arrives
+			// while this is still in flight.
+			time.Sleep(300 * time.Millisecond)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	t.Cleanup(gcStub.Close)
+	cfg := dedupTestConfig(t, gcStub.URL)
+
+	envBody := eventEnvelopeBody(t, "Ev0001", "1.0", "hi")
+	postSignedEvent(t, cfg, envBody) // async: forward now in flight
+	// Redelivery while the first forward is still running. The handler
+	// blocks on the in-flight claim, sees the failure verdict, and
+	// takes over.
+	postSignedEvent(t, cfg, envBody)
+	awaitInboundHits(t, &hits, 2)
+}
+
+// ...and if the in-flight first delivery SUCCEEDS, the waiting retry
+// drops as a duplicate.
+func TestHandleSlackEventsInflightRetryDropsAfterSuccess(t *testing.T) {
+	var hits int32
+	gcStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		atomic.AddInt32(&hits, 1)
+		time.Sleep(300 * time.Millisecond)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	t.Cleanup(gcStub.Close)
+	cfg := dedupTestConfig(t, gcStub.URL)
+
+	envBody := eventEnvelopeBody(t, "Ev0001", "1.0", "hi")
+	postSignedEvent(t, cfg, envBody)
+	postSignedEvent(t, cfg, envBody) // waits on the in-flight claim, then drops
+	awaitInboundHits(t, &hits, 1)
 }

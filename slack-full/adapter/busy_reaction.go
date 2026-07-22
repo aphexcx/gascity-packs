@@ -129,8 +129,33 @@ func (r *busyReactionRegistry) clock() time.Time {
 // can close it unconditionally.
 func (r *busyReactionRegistry) mark(channel, threadKey, messageTS string) chan struct{} {
 	addDone := make(chan struct{})
+	r.markWithDone(channel, threadKey, messageTS, addDone)
+	return addDone
+}
+
+// markBoth records the pending mark under EVERY thread key a reply may
+// carry (codex r2). The canonical key is the thread root (thread_ts
+// for a thread-reply inbound, own ts for a channel-root one) — but
+// reply-current and the alias-dispatch instructions thread replies
+// under the inbound's OWN ts (Slack normalizes either form into the
+// same thread), so a thread-reply inbound is additionally marked under
+// its own ts. Both entries share one addDone; consuming one leaves the
+// sibling to expire by TTL, whose eventual redundant reactions.remove
+// is benign ("no_reaction" counts as delivered).
+func (r *busyReactionRegistry) markBoth(channel, threadTS, messageTS string) chan struct{} {
+	addDone := make(chan struct{})
+	r.markWithDone(channel, busyThreadKey(threadTS, messageTS), messageTS, addDone)
+	if threadTS != "" && threadTS != messageTS {
+		r.markWithDone(channel, messageTS, messageTS, addDone)
+	}
+	return addDone
+}
+
+// markWithDone is the mark implementation with a caller-supplied
+// addDone, letting markBoth share one channel across its two entries.
+func (r *busyReactionRegistry) markWithDone(channel, threadKey, messageTS string, addDone chan struct{}) {
 	if r == nil || channel == "" || threadKey == "" || messageTS == "" {
-		return addDone
+		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -141,7 +166,6 @@ func (r *busyReactionRegistry) mark(channel, threadKey, messageTS string) chan s
 	if len(r.entries) > busyReactionMaxEntries {
 		r.evictOldestLocked()
 	}
-	return addDone
 }
 
 // take removes and returns the pending mark for (channel, threadKey),

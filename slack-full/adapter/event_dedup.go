@@ -14,29 +14,58 @@ import (
 // before processing, but an ack lost in transit still produces a
 // retry, and without a seen-set that retry re-forwards the same
 // message into the bound session as a duplicate notification
-// (observed as byte-identical inbound log pairs). The cache remembers
-// recently dispatched event_ids just long enough to cover Slack's
-// retry ladder.
+// (observed as byte-identical inbound log pairs).
+//
+// Entries are two-state so a retry can never be dropped while the
+// outcome it would recover from is still undecided (codex r2 P1):
+//
+//   - in-flight: a delivery is processing. A concurrent redelivery
+//     waits on the entry's done channel instead of being discarded —
+//     if the first forward fails (forget), the waiter takes over; if
+//     it succeeds (commit), the waiter drops as a duplicate.
+//   - committed: the event reached gc. Redeliveries within the TTL
+//     drop immediately.
+//
+// Processing failure calls forget, which erases the entry entirely —
+// the retry (waiting or future) is then the recovery path.
 
-// eventDedupTTL bounds how long a dispatched event_id is remembered.
+// eventDedupTTL bounds how long a committed event_id is remembered.
 // Slack's last retry fires ~5 minutes after the original delivery;
 // 10 minutes covers the ladder with slack for clock skew and queue
 // delay while keeping the map small.
 const eventDedupTTL = 10 * time.Minute
 
+// eventDedupInflightWait bounds how long a redelivery waits for the
+// in-flight first delivery to conclude before giving up and dropping.
+// The forward normally concludes in seconds; the bound only matters
+// when it hangs, where an unbounded wait would pile up handler
+// goroutines. A drop here is loud-logged, and Slack's next rung on
+// the retry ladder gets the same chance again.
+const eventDedupInflightWait = 30 * time.Second
+
 // eventDedupMaxEntries hard-caps the seen-set so a pathological event
-// flood cannot grow it without bound. At the cap, the oldest entry is
-// evicted — that event's redeliveries just stop being deduplicable,
-// which is the pre-cache behavior. 4096 ids at ~10 minutes of traffic
-// is far beyond any realistic workspace's event rate.
+// flood cannot grow it without bound. At the cap, the oldest committed
+// entry is evicted — that event's redeliveries just stop being
+// deduplicable, which is the pre-cache behavior. 4096 ids at ~10
+// minutes of traffic is far beyond any realistic workspace's rate.
 const eventDedupMaxEntries = 4096
 
-// eventDedupCache is a TTL seen-set over Slack event ids. Safe for
-// concurrent callers. A nil *eventDedupCache never dedupes, so tests
-// (and a misordered main) degrade to "no dedup" rather than panicking.
+// eventDedupEntry is one tracked event_id. committedAt is zero while
+// the owning delivery is still processing; done is closed exactly once
+// when the entry leaves the in-flight state (commit or forget).
+type eventDedupEntry struct {
+	committedAt time.Time
+	done        chan struct{}
+	closed      bool
+}
+
+// eventDedupCache tracks Slack event ids across the in-flight →
+// committed lifecycle. Safe for concurrent callers. A nil
+// *eventDedupCache never dedupes, so tests (and a misordered main)
+// degrade to "no dedup" rather than panicking.
 type eventDedupCache struct {
 	mu      sync.Mutex
-	entries map[string]time.Time
+	entries map[string]*eventDedupEntry
 	ttl     time.Duration
 	// now is the clock; nil means time.Now. Injectable so tests can
 	// drive TTL expiry without sleeping.
@@ -44,7 +73,7 @@ type eventDedupCache struct {
 }
 
 func newEventDedupCache(ttl time.Duration) *eventDedupCache {
-	return &eventDedupCache{entries: make(map[string]time.Time), ttl: ttl}
+	return &eventDedupCache{entries: make(map[string]*eventDedupEntry), ttl: ttl}
 }
 
 func (c *eventDedupCache) clock() time.Time {
@@ -54,46 +83,83 @@ func (c *eventDedupCache) clock() time.Time {
 	return time.Now()
 }
 
-// seen reports whether id was recorded within the TTL, recording it as
-// a side effect either way. The check-and-record is atomic under the
-// mutex so two concurrent deliveries of the same event dedupe to one.
-// Expired entries are swept opportunistically on each call; if the map
-// is still over cap after the sweep, the oldest entry is evicted.
-func (c *eventDedupCache) seen(id string) bool {
+// begin claims id for processing. Exactly one of:
+//
+//   - proceed=true: the caller owns this event and MUST conclude it
+//     with commit (success) or forget (failure).
+//   - proceed=false, wait=nil: a delivery already committed within the
+//     TTL — drop this one as a duplicate.
+//   - proceed=false, wait!=nil: another delivery is in flight — wait
+//     on the channel (bounded) and call begin again for the verdict.
+//
+// A nil cache and an empty id always proceed (no dedup, nothing to
+// conclude — commit/forget on them are no-ops).
+func (c *eventDedupCache) begin(id string) (proceed bool, wait <-chan struct{}) {
 	if c == nil || id == "" {
-		return false
+		return true, nil
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := c.clock()
-	for k, at := range c.entries {
-		if now.Sub(at) > c.ttl {
+	for k, e := range c.entries {
+		if !e.committedAt.IsZero() && now.Sub(e.committedAt) > c.ttl {
 			delete(c.entries, k)
 		}
 	}
-	_, present := c.entries[id]
-	c.entries[id] = now
-	if !present && len(c.entries) > eventDedupMaxEntries {
+	if e, ok := c.entries[id]; ok {
+		if e.committedAt.IsZero() {
+			return false, e.done
+		}
+		return false, nil
+	}
+	c.entries[id] = &eventDedupEntry{done: make(chan struct{})}
+	if len(c.entries) > eventDedupMaxEntries {
 		c.evictOldestLocked()
 	}
-	return present
+	return true, nil
 }
 
-// forget drops id from the seen-set. processSlackEvent calls this when
-// processing fails after dispatch (postInbound error): the delivery
-// was recorded at the handler boundary, but nothing reached gc, and a
-// Slack retry carrying the same event_id is then the only recovery —
-// it must not find the id already seen. No-op for unknown ids.
+// commit marks id as successfully processed: redeliveries within the
+// TTL now drop, and any waiter re-begins into the committed verdict.
+// No-op for unknown ids (evicted under cap pressure, or empty).
+func (c *eventDedupCache) commit(id string) {
+	if c == nil || id == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[id]
+	if !ok {
+		return
+	}
+	e.committedAt = c.clock()
+	if !e.closed {
+		e.closed = true
+		close(e.done)
+	}
+}
+
+// forget erases id entirely: processing failed and nothing reached gc,
+// so a redelivery (waiting or future) must be treated as brand new —
+// it is the only recovery path for the message. No-op for unknown ids.
 func (c *eventDedupCache) forget(id string) {
 	if c == nil || id == "" {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	e, ok := c.entries[id]
+	if !ok {
+		return
+	}
 	delete(c.entries, id)
+	if !e.closed {
+		e.closed = true
+		close(e.done)
+	}
 }
 
-// size reports the number of remembered ids. Test helper.
+// size reports the number of tracked ids. Test helper.
 func (c *eventDedupCache) size() int {
 	if c == nil {
 		return 0
@@ -103,19 +169,34 @@ func (c *eventDedupCache) size() int {
 	return len(c.entries)
 }
 
-// evictOldestLocked drops the single oldest entry. Called with c.mu
-// held, only on the insert that pushed the map past the cap (expired
-// entries were already swept by seen).
+// evictOldestLocked drops the single oldest committed entry, falling
+// back to any entry only if every entry is in-flight (pathological).
+// Called with c.mu held, only on the insert that pushed the map past
+// the cap (expired entries were already swept by begin).
 func (c *eventDedupCache) evictOldestLocked() {
 	var oldestID string
 	var oldestAt time.Time
 	first := true
-	for k, at := range c.entries {
-		if first || at.Before(oldestAt) {
-			oldestID, oldestAt, first = k, at, false
+	for k, e := range c.entries {
+		if e.committedAt.IsZero() {
+			continue
+		}
+		if first || e.committedAt.Before(oldestAt) {
+			oldestID, oldestAt, first = k, e.committedAt, false
 		}
 	}
-	if !first {
-		delete(c.entries, oldestID)
+	if first {
+		// No committed entries at all: evict an arbitrary in-flight
+		// one rather than growing without bound. Its conclusion
+		// (commit/forget) becomes a harmless no-op.
+		for k, e := range c.entries {
+			delete(c.entries, k)
+			if !e.closed {
+				e.closed = true
+				close(e.done)
+			}
+			return
+		}
 	}
+	delete(c.entries, oldestID)
 }
