@@ -519,9 +519,16 @@ func (r *busyReactionRegistry) takeMessage(channel, threadTS, messageTS string) 
 
 // take removes and returns every pending reaction for (channel,
 // threadKey) — the current mark plus any stale ancestors riding on it
-// (codex r6). An expired entry is deleted but NOT returned — the
-// caller must not fire a reactions.remove for a mark past its TTL
-// (its stale ancestors expire with it).
+// (codex r6) — and also consumes every OTHER entry in the channel
+// pointing at the same message (codex r10): markBoth records a
+// thread-reply inbound under both its thread root and its own ts, and
+// a reply threading under one alias is the clearing event for both;
+// leaving the sibling behind would strand it (and any ancestors an
+// overlapping failed re-target parked on it) with no later clearing
+// event. All consumed keys are tombstoned. An expired entry is
+// deleted but NOT returned — the caller must not fire a
+// reactions.remove for a mark past its TTL (its stale ancestors
+// expire with it).
 func (r *busyReactionRegistry) take(channel, threadKey string) []busyTaken {
 	if r == nil {
 		return nil
@@ -536,10 +543,30 @@ func (r *busyReactionRegistry) take(channel, threadKey string) []busyTaken {
 	delete(r.entries, key)
 	now := r.clock()
 	r.tombstoneLocked(key, now)
-	if now.Sub(m.addedAt) > busyReactionTTL {
-		return nil
+	expired := now.Sub(m.addedAt) > busyReactionTTL
+	seen := map[string]bool{}
+	var taken []busyTaken
+	collect := func(cm busyReactionMark, cmExpired bool) {
+		if cmExpired {
+			return
+		}
+		for _, t := range append([]busyTaken{{messageTS: cm.messageTS, addDone: cm.addDone}}, cm.stale...) {
+			if !seen[t.messageTS] {
+				seen[t.messageTS] = true
+				taken = append(taken, t)
+			}
+		}
 	}
-	return append([]busyTaken{{messageTS: m.messageTS, addDone: m.addDone}}, m.stale...)
+	collect(m, expired)
+	for k, sib := range r.entries {
+		if k.channel != channel || sib.messageTS != m.messageTS {
+			continue
+		}
+		delete(r.entries, k)
+		r.tombstoneLocked(k, now)
+		collect(sib, now.Sub(sib.addedAt) > busyReactionTTL)
+	}
+	return taken
 }
 
 // pending reports the recorded message ts for (channel, threadKey)

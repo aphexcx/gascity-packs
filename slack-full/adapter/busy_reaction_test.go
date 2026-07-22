@@ -809,6 +809,30 @@ func TestBusyReactionRegistry_TakeMessageReparksAncestors(t *testing.T) {
 	}
 }
 
+// Consuming either alias of a dual-key mark consumes BOTH entries and
+// tombstones both keys (codex r10): a reply threading under the
+// inbound's own ts is the clearing event for the root-key sibling too.
+func TestBusyReactionRegistry_TakeConsumesBothDualKeys(t *testing.T) {
+	r := newBusyReactionRegistry()
+	d, _ := r.markBoth("C1", "1.0", "2.0") // root key 1.0 + own-ts key 2.0
+	close(d)
+
+	taken := r.take("C1", "2.0") // reply threads under the inbound's own ts
+	if len(taken) != 1 || taken[0].messageTS != "2.0" {
+		t.Fatalf("take = %v, want exactly the 2.0 mark once", taken)
+	}
+	if _, ok := r.pending("C1", "1.0"); ok {
+		t.Error("root-key sibling survived the own-ts take; want consumed")
+	}
+	// Both keys are tombstoned: a restore under the root key blocks.
+	dOld := make(chan struct{})
+	close(dOld)
+	blocked := r.restoreDisplaced("C1", []busyDisplaced{{threadKey: "1.0", mark: busyTaken{messageTS: "0.5", addDone: dOld}}})
+	if len(blocked) != 1 || blocked[0].messageTS != "0.5" {
+		t.Errorf("restore under consumed root key = blocked %v, want the 0.5 mark handed back", blocked)
+	}
+}
+
 // A reply that consumed the thread while a displacing dispatch was in
 // flight tombstones the key: a failed dispatch must NOT restore the
 // displaced mark afterwards — the thread's clearing event already

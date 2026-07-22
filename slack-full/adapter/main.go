@@ -2653,15 +2653,25 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 				// marks this attempt displaced are restored — their
 				// agents may still be working (codex r7).
 				if cfg.busyReaction != "" {
-					for _, tk := range cfg.busyMarks.takeMessage(
-						inbound.Conversation.ConversationID, inbound.ReplyToMessageID, inbound.ProviderMessageID) {
-						removeBusyReaction(cfg, inbound.Conversation.ConversationID, tk)
-					}
+					// ALL registry mutations happen before any Slack
+					// network I/O (codex r10): take this message's
+					// marks and restore the displaced ones first —
+					// both are instant in-memory ops — so a displaced
+					// agent's reply arriving during the (bounded, up
+					// to add-wait + Slack timeout) removal calls below
+					// finds its restored mark and clears normally
+					// instead of missing the registry entirely.
+					taken := cfg.busyMarks.takeMessage(
+						inbound.Conversation.ConversationID, inbound.ReplyToMessageID, inbound.ProviderMessageID)
 					// Displaced marks whose thread a reply consumed
 					// while this dispatch was in flight cannot be
 					// restored (tombstoned) — remove their reactions
 					// instead (codex r8).
-					for _, tk := range cfg.busyMarks.restoreDisplaced(inbound.Conversation.ConversationID, displaced) {
+					blocked := cfg.busyMarks.restoreDisplaced(inbound.Conversation.ConversationID, displaced)
+					for _, tk := range taken {
+						removeBusyReaction(cfg, inbound.Conversation.ConversationID, tk)
+					}
+					for _, tk := range blocked {
 						go removeBusyReaction(cfg, inbound.Conversation.ConversationID, tk)
 					}
 				}
