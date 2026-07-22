@@ -9,34 +9,33 @@ import (
 )
 
 // openBeneath opens rel (a Clean, root-relative path containing no
-// "..") beneath rootAbs via os.Root, the stdlib's openat(2)-backed
-// traversal-confined API: every component resolves relative to the
-// pinned root fd, so a directory swapped for a symlink mid-walk cannot
-// redirect the open outside rootAbs — the portable equivalent of
-// openat2(RESOLVE_BENEATH). The previous hand-rolled walk used raw
-// syscall.Openat, which does not exist on darwin and made the adapter
-// linux-only.
+// "..") beneath rootAbs with a per-component pinned walk built on
+// os.Root — the portable replacement for the raw syscall.Openat walk
+// (which does not exist on darwin and made the adapter linux-only).
 //
-// os.Root alone is weaker than the old walk in two spots, and both
-// gaps are closed here explicitly:
+// os.Root alone follows symlinks it considers safe: a symlink at the
+// ROOT argument itself, and in-root symlinks at ANY component
+// (O_NOFOLLOW passed to Root.OpenFile does not opt out — verified
+// empirically on go1.26). The caller's contract is stronger than
+// confinement: realPath was EvalSymlinks-resolved before this call,
+// so every component of a legitimate path is a real directory or
+// file, and ANY symlink anywhere on the path means an inode was
+// swapped in the race window — the open must fail rather than return
+// a different (even in-root) file than the one validated.
 //
-//   - The ROOT argument: os.OpenRoot follows a symlink at the root
-//     path itself, so a root swapped for a symlink to /etc between the
-//     caller's confinement check and this call would re-confine the
-//     open beneath /etc. The root is therefore first opened with
-//     plain open(2) + O_NOFOLLOW|O_DIRECTORY (portable — no openat
-//     needed for the first component) and the os.Root handle must
-//     match that fd's (dev, ino) identity.
+// The walk restores the old per-component guarantee portably:
 //
-//   - The LEAF: os.Root resolves in-root symlinks itself; passing
-//     O_NOFOLLOW to Root.OpenFile does not reject them (verified
-//     empirically on go1.26). realPath is EvalSymlinks-resolved before
-//     it gets here, so ANY symlink at the leaf means the inode was
-//     swapped in the race window. The leaf is Lstat'd first (symlink →
-//     hard failure) and the opened file must match the Lstat'd
-//     (dev, ino), so an open raced through a swapped-in link can never
-//     return a different file than the one the caller validated —
-//     including a different in-root file.
+//   - The root is first opened with plain open(2) +
+//     O_NOFOLLOW|O_DIRECTORY (rejecting a root swapped for a symlink)
+//     and the os.Root handle must match that fd's (dev, ino).
+//   - Each intermediate component is Lstat'd through the current
+//     pinned sub-root (symlink → hard failure), descended into with
+//     Root.OpenRoot, and the opened sub-root must match the Lstat'd
+//     (dev, ino) — so a component swapped between the two calls fails
+//     the identity check instead of being silently followed.
+//   - The leaf is Lstat'd (symlink → hard failure), opened with
+//     O_NOFOLLOW, and the opened file must match the Lstat'd
+//     (dev, ino).
 func openBeneath(rootAbs, rel string) (*os.File, error) {
 	if rel == "" || rel == "." || filepath.IsAbs(rel) {
 		return nil, fmt.Errorf("openBeneath: invalid relative path %q", rel)
@@ -61,16 +60,16 @@ func openBeneath(rootAbs, rel string) (*os.File, error) {
 		return nil, fmt.Errorf("openBeneath: fstat root %q: %w", rootAbs, err)
 	}
 
-	root, err := os.OpenRoot(rootAbs)
+	cur, err := os.OpenRoot(rootAbs)
 	if err != nil {
 		return nil, fmt.Errorf("openBeneath: open root %q: %w", rootAbs, err)
 	}
-	defer root.Close()
+	defer func() { _ = cur.Close() }()
 	// os.OpenRoot re-resolved rootAbs independently of the pinned fd
 	// above; require both opens to have landed on the same directory
 	// inode so a swap between the two calls cannot substitute a
 	// different root.
-	rootFI, err := root.Stat(".")
+	rootFI, err := cur.Stat(".")
 	if err != nil {
 		return nil, fmt.Errorf("openBeneath: stat root %q: %w", rootAbs, err)
 	}
@@ -78,21 +77,52 @@ func openBeneath(rootAbs, rel string) (*os.File, error) {
 		return nil, fmt.Errorf("openBeneath: root %q changed identity between opens", rootAbs)
 	}
 
-	// Leaf swap detection (see doc comment): a symlink at the leaf is
-	// a hard failure, and the opened file must be the exact inode the
-	// Lstat verified — covering both swap orders around the two calls.
-	leafFI, err := root.Lstat(rel)
+	// Descend one pinned sub-root at a time (see doc comment).
+	for _, c := range comps[:len(comps)-1] {
+		li, err := cur.Lstat(c)
+		if err != nil {
+			return nil, fmt.Errorf("openBeneath: lstat component %q of %q: %w", c, rel, err)
+		}
+		if li.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("openBeneath: component %q of %q is a symlink", c, rel)
+		}
+		compSt, ok := li.Sys().(*syscall.Stat_t)
+		if !ok {
+			return nil, fmt.Errorf("openBeneath: lstat component %q of %q: no unix stat", c, rel)
+		}
+		next, err := cur.OpenRoot(c)
+		if err != nil {
+			return nil, fmt.Errorf("openBeneath: open component %q of %q: %w", c, rel, err)
+		}
+		nextFI, err := next.Stat(".")
+		if err != nil {
+			_ = next.Close()
+			return nil, fmt.Errorf("openBeneath: stat component %q of %q: %w", c, rel, err)
+		}
+		if !sameInode(nextFI, compSt) {
+			_ = next.Close()
+			return nil, fmt.Errorf("openBeneath: component %q of %q changed identity during open", c, rel)
+		}
+		_ = cur.Close()
+		cur = next
+	}
+
+	// Leaf swap detection: a symlink at the leaf is a hard failure,
+	// and the opened file must be the exact inode the Lstat verified —
+	// covering both swap orders around the two calls.
+	leaf := comps[len(comps)-1]
+	li, err := cur.Lstat(leaf)
 	if err != nil {
 		return nil, fmt.Errorf("openBeneath: lstat %q beneath %q: %w", rel, rootAbs, err)
 	}
-	if leafFI.Mode()&os.ModeSymlink != 0 {
+	if li.Mode()&os.ModeSymlink != 0 {
 		return nil, fmt.Errorf("openBeneath: %q beneath %q is a symlink", rel, rootAbs)
 	}
-	leafSt, ok := leafFI.Sys().(*syscall.Stat_t)
+	leafSt, ok := li.Sys().(*syscall.Stat_t)
 	if !ok {
 		return nil, fmt.Errorf("openBeneath: lstat %q beneath %q: no unix stat", rel, rootAbs)
 	}
-	f, err := root.OpenFile(rel, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	f, err := cur.OpenFile(leaf, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, fmt.Errorf("openBeneath: open %q beneath %q: %w", rel, rootAbs, err)
 	}

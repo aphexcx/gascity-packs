@@ -240,7 +240,8 @@ func TestBusyReaction_PublishToSameThreadRemovesBusy(t *testing.T) {
 
 			marks := newBusyReactionRegistry()
 			// Close addDone: the add already completed in this scenario.
-			close(marks.markBoth("C1", tc.seedThreadTS, tc.seedTS))
+			done, _ := marks.markBoth("C1", tc.seedThreadTS, tc.seedTS)
+			close(done)
 			cfg := config{slackBotToken: "xoxb-fake", busyReaction: "hourglass", busyMarks: marks}
 
 			req := httptest.NewRequest(http.MethodPost, "/publish", strings.NewReader(publishBody("C1", tc.replyTo)))
@@ -272,18 +273,18 @@ func TestBusyReaction_PublishToSameThreadRemovesBusy(t *testing.T) {
 }
 
 // (c) A /publish that matches no pending mark — unrelated
-// conversation, or unrelated thread in the same conversation, or no
-// thread ts at all — fires no reactions.remove and leaves existing
-// marks untouched.
+// conversation (threaded or root), or unrelated thread in the same
+// conversation — fires no reactions.remove and leaves existing marks
+// untouched.
 func TestBusyReaction_UnrelatedPublishDoesNotRemove(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
 		conversation string
 		replyTo      string
 	}{
-		{name: "different conversation", conversation: "C_OTHER", replyTo: "100.000010"},
+		{name: "different conversation, threaded", conversation: "C_OTHER", replyTo: "100.000010"},
+		{name: "different conversation, channel root", conversation: "C_OTHER", replyTo: ""},
 		{name: "different thread", conversation: "C1", replyTo: "555.000001"},
-		{name: "no thread ts", conversation: "C1", replyTo: ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			slackStub, reactions := newReactionRecordingSlackStub(t)
@@ -305,6 +306,87 @@ func TestBusyReaction_UnrelatedPublishDoesNotRemove(t *testing.T) {
 				t.Error("unrelated publish consumed the pending mark; want untouched")
 			}
 		})
+	}
+}
+
+// A channel-root publish into the SAME conversation — the documented
+// default `gc slack reply-current` shape, which carries no
+// reply_to_message_id — clears every pending mark in that
+// conversation (codex r3): a busy emoji nothing will ever remove is
+// worse than clearing a sibling thread's affordance early.
+func TestBusyReaction_RootPublishClearsConversationMarks(t *testing.T) {
+	slackStub, reactions := newReactionRecordingSlackStub(t)
+	withSlackAPIStub(t, slackStub)
+
+	marks := newBusyReactionRegistry()
+	doneA, _ := marks.markBoth("C1", "", "100.000010")
+	close(doneA)
+	doneB, _ := marks.markBoth("C1", "200.000001", "200.000020")
+	close(doneB)
+	cfg := config{slackBotToken: "xoxb-fake", busyReaction: "hourglass", busyMarks: marks}
+
+	req := httptest.NewRequest(http.MethodPost, "/publish", strings.NewReader(publishBody("C1", "")))
+	rec := httptest.NewRecorder()
+	handlePublish(cfg, nil, nil, newPublishDedupCache(publishDedupTTL))(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("publish status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+
+	// Two distinct marked messages → two removes (dual-key entries for
+	// the thread-reply inbound dedupe to one).
+	got := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		rec := reactions.await(t, 2*time.Second)
+		if rec.op != "remove" {
+			t.Errorf("reaction op = %q, want remove", rec.op)
+		}
+		got[rec.timestamp] = true
+	}
+	if !got["100.000010"] || !got["200.000020"] {
+		t.Errorf("removed set = %v, want both 100.000010 and 200.000020", got)
+	}
+	reactions.assertNoCall(t, 300*time.Millisecond)
+	if n := marks.size(); n != 0 {
+		t.Errorf("registry has %d entries after root-publish clear, want 0", n)
+	}
+}
+
+// Re-targeting the same thread before the first reply lands moves the
+// busy affordance: the displaced mark's reaction is removed (codex
+// r3) — TTL expiry only deletes metadata, never the Slack-side emoji.
+func TestBusyReaction_RetargetRemovesSupersededReaction(t *testing.T) {
+	slackStub, reactions := newReactionRecordingSlackStub(t)
+	withSlackAPIStub(t, slackStub)
+	capture := &inboundCapture{}
+	gcStub := httptest.NewServer(capture.handler())
+	t.Cleanup(gcStub.Close)
+
+	cfg := busyTestConfig(gcStub.URL)
+	// First targeted inbound: channel-root message M1.
+	env1 := targetedInboundEnvelope(t, "C1", "100.000010", "")
+	processSlackEvent(cfg, newTestHandleAliasRegistry(t), nil, nil, nil, nil, env1, func() {})
+	first := reactions.await(t, 2*time.Second)
+	if first.op != "add" || first.timestamp != "100.000010" {
+		t.Fatalf("first reaction = (%s on %s), want add on 100.000010", first.op, first.timestamp)
+	}
+
+	// Second targeted inbound M2 replying in M1's thread: displaces
+	// M1's mark (root key now points at M2).
+	env2 := targetedInboundEnvelope(t, "C1", "100.000020", "100.000010")
+	processSlackEvent(cfg, newTestHandleAliasRegistry(t), nil, nil, nil, nil, env2, func() {})
+
+	// Expect an add on M2 and a remove on the superseded M1, in any
+	// order (both async).
+	ops := map[string]string{}
+	for i := 0; i < 2; i++ {
+		rec := reactions.await(t, 2*time.Second)
+		ops[rec.op] = rec.timestamp
+	}
+	if ops["add"] != "100.000020" {
+		t.Errorf("add landed on %q, want 100.000020", ops["add"])
+	}
+	if ops["remove"] != "100.000010" {
+		t.Errorf("remove landed on %q, want superseded 100.000010", ops["remove"])
 	}
 }
 

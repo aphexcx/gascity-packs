@@ -28,7 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exactly like a text publish. A thread-reply inbound is marked under
   both its thread root AND its own ts — reply-current and the
   alias-dispatch instructions thread replies under the inbound's own
-  ts, which the root-only key missed. Note the lifecycle fires only
+  ts, which the root-only key missed. A channel-root reply (the
+  documented default `gc slack reply-current` shape, no thread ts)
+  clears every pending mark in the conversation, and re-targeting a
+  thread before the first reply lands removes the displaced message's
+  reaction instead of stranding it. Note the lifecycle fires only
   when an agent target is
   parsed from the message (`@handle:` prefix, User Group mention, or
   sticky thread handle) — plain messages that reach a session solely
@@ -44,18 +48,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   byte-identical inbound log pairs). Entries are two-state
   (in-flight → committed): a redelivery racing the first delivery's
   still-running forward waits for its verdict instead of being
-  discarded — if the forward fails, the retry takes over. Deliveries
-  dropped at the queue-full boundary are never recorded, and a failed
-  forward releases its id, so a Slack retry can always recover the
-  message. (hw-94w5k finding #4)
-- `openBeneath` (the confined open backing `/publish-file`) closes two
-  gaps `os.Root` leaves open: the root path is pre-opened with
-  `O_NOFOLLOW|O_DIRECTORY` and identity-matched against the `os.Root`
-  handle (a root swapped for a symlink otherwise re-confines the open
-  beneath the link target), and the leaf is Lstat'd + inode-pinned
-  (`os.Root` resolves in-root symlinks itself and does not honor
-  `O_NOFOLLOW` for them, so a raced-in leaf link could upload a
-  different in-root file than the one validated).
+  discarded — if the forward fails, the retry takes over. The wait
+  runs in a goroutine after the handler has returned, so Slack's ack
+  is never delayed behind it. For targeted inbounds the alias
+  dispatch owns the verdict (success commits, failure forgets).
+  Deliveries dropped at the queue-full boundary are never recorded,
+  and a failed forward releases its id, so a Slack retry can always
+  recover the message. (hw-94w5k finding #4)
+- `openBeneath` (the confined open backing `/publish-file`) restores
+  the old per-component no-follow guarantee on top of `os.Root`
+  (which follows a symlink at the root argument and resolves in-root
+  symlinks at every component, ignoring `O_NOFOLLOW` for them): the
+  root is pre-opened with `O_NOFOLLOW|O_DIRECTORY` and
+  identity-matched against the `os.Root` handle, every intermediate
+  component is Lstat'd (symlink → hard failure) and descended into
+  via a pinned sub-root whose identity must match, and the leaf is
+  Lstat'd + inode-pinned — so a raced-in link anywhere on the path
+  fails instead of substituting a different (even in-root) file.
 - Human file posts delivered with subtype `file_share` are no longer
   discarded by the system-noise subtype gate, and file-only posts (no
   caption) are no longer discarded by the empty-text gate — both now

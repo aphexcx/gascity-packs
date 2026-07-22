@@ -1932,54 +1932,66 @@ func handleReact(cfg config) http.HandlerFunc {
 	}
 }
 
-// clearBusyReaction consumes the pending busy mark for
-// (conversationID, threadKey) and removes the busy emoji from the
-// marked message. threadKey is the reply's reply_to_message_id, which
-// matches the registry key in both inbound shapes: a thread-reply
-// inbound was marked under its thread_ts, and a channel-root inbound
-// was marked under its own ts — exactly what a threaded reply to it
-// carries. An empty threadKey (channel-root publish) identifies no
-// thread, so there is nothing to look up; no registry hit means no
-// Slack call. Shared by handlePublish and handlePublishFile — either
-// reply shape (text or file) is the agent's answer and must clear the
-// affordance (hw-94w5k codex r1).
+// clearBusyReaction consumes pending busy mark(s) for a delivered
+// reply into conversationID and removes the busy emoji from the
+// marked message(s). threadKey is the reply's reply_to_message_id,
+// which matches the registry key in both inbound shapes: a
+// thread-reply inbound was marked under its thread_ts AND its own ts,
+// and a channel-root inbound under its own ts. An EMPTY threadKey is
+// the documented default `gc slack reply-current` shape — a
+// channel-root reply — and clears every pending mark in the
+// conversation (codex r3): the agent answered in-channel, and a busy
+// emoji nothing will ever remove is worse than clearing a sibling
+// thread's affordance early. Shared by handlePublish and
+// handlePublishFile — either reply shape (text or file) is the
+// agent's answer (hw-94w5k codex r1).
 //
-// The removal waits for the mark's reactions.add to finish first
+// Each removal waits for its mark's reactions.add to finish first
 // (bounded by busyReactionAddWait): a fast reply otherwise races the
 // in-flight add, Slack applies the delayed add after the remove, and
 // the busy emoji sticks forever. Best-effort and async — failures are
 // logged and never affect the caller's receipt.
 func clearBusyReaction(cfg config, conversationID, threadKey string) {
-	if cfg.busyReaction == "" || conversationID == "" || threadKey == "" {
+	if cfg.busyReaction == "" || conversationID == "" {
 		return
 	}
-	markedTS, addDone, ok := cfg.busyMarks.take(conversationID, threadKey)
-	if !ok {
+	var taken []busyTaken
+	if threadKey == "" {
+		taken = cfg.busyMarks.takeConversation(conversationID)
+	} else if markedTS, addDone, ok := cfg.busyMarks.take(conversationID, threadKey); ok {
+		taken = []busyTaken{{messageTS: markedTS, addDone: addDone}}
+	}
+	for _, tk := range taken {
+		go removeBusyReaction(cfg, conversationID, tk)
+	}
+}
+
+// removeBusyReaction removes the busy emoji from one marked message,
+// after its reactions.add has finished (bounded wait — see
+// clearBusyReaction). Also used to clean up marks superseded by a
+// re-target of the same thread (codex r3). Best-effort: errors are
+// logged only, and "no_reaction" is benign — the emoji already came
+// off (human removed it, or the add never landed).
+func removeBusyReaction(cfg config, channel string, tk busyTaken) {
+	if tk.addDone != nil {
+		select {
+		case <-tk.addDone:
+		case <-time.After(busyReactionAddWait):
+			log.Printf("busy reaction remove: chan=%s ts=%s: add still in flight after %v, removing anyway", channel, tk.messageTS, busyReactionAddWait)
+		}
+	}
+	resp, err := removeReactionFromSlack(cfg.slackBotToken, slackReactionsAddReq{
+		Channel:   channel,
+		Name:      cfg.busyReaction,
+		Timestamp: tk.messageTS,
+	})
+	if err != nil {
+		log.Printf("busy reaction remove failed: chan=%s ts=%s emoji=%s: %v", channel, tk.messageTS, cfg.busyReaction, err)
 		return
 	}
-	go func(channel, ts, emoji string) {
-		if addDone != nil {
-			select {
-			case <-addDone:
-			case <-time.After(busyReactionAddWait):
-				log.Printf("busy reaction remove: chan=%s ts=%s: add still in flight after %v, removing anyway", channel, ts, busyReactionAddWait)
-			}
-		}
-		resp, err := removeReactionFromSlack(cfg.slackBotToken, slackReactionsAddReq{
-			Channel:   channel,
-			Name:      emoji,
-			Timestamp: ts,
-		})
-		if err != nil {
-			log.Printf("busy reaction remove failed: chan=%s ts=%s emoji=%s: %v", channel, ts, emoji, err)
-			return
-		}
-		// "no_reaction" is benign: the emoji already came off
-		// (human removed it, or the add never landed).
-		if !resp.OK && resp.Error != "no_reaction" {
-			log.Printf("busy reaction remove: chan=%s ts=%s emoji=%s: slack error=%s", channel, ts, emoji, resp.Error)
-		}
-	}(conversationID, markedTS, cfg.busyReaction)
+	if !resp.OK && resp.Error != "no_reaction" {
+		log.Printf("busy reaction remove: chan=%s ts=%s emoji=%s: slack error=%s", channel, tk.messageTS, cfg.busyReaction, resp.Error)
+	}
 }
 
 // postReactionToSlack calls reactions.add for req.
@@ -2112,41 +2124,49 @@ func handleSlackEvents(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 		// forward must not be discarded on the spot: if that forward
 		// then fails, the discarded retry was the message's last chance
 		// (Slack got a 200 for it and stops the ladder). begin reports
-		// the in-flight case with a wait channel; blocking this handler
-		// goroutine is fine — the 200 is already written — and the loop
-		// re-begins for the final verdict once the first delivery
-		// commits (→ drop) or forgets (→ this delivery takes over).
-		// The wait is bounded so a hung forward cannot pile up handler
-		// goroutines; a bound-expiry drop is loud-logged and Slack's
-		// next retry rung gets the same chance again. codex r2 P1.
-		for {
-			proceed, wait := cfg.eventDedup.begin(env.EventID)
-			if proceed {
-				break
-			}
-			if wait == nil {
-				release()
-				log.Printf("slack event dedup: dropping redelivery event_id=%s retry_num=%q team_id=%q",
-					env.EventID, r.Header.Get("X-Slack-Retry-Num"), clipTeamIDForLog(teamID))
-				return
-			}
-			select {
-			case <-wait:
-				// First delivery concluded — re-begin for the verdict.
-			case <-time.After(eventDedupInflightWait):
-				release()
-				log.Printf("slack event dedup: first delivery of event_id=%s still in flight after %v; dropping redelivery retry_num=%q",
-					env.EventID, eventDedupInflightWait, r.Header.Get("X-Slack-Retry-Num"))
-				return
-			}
-		}
+		// the in-flight case with a wait channel; the loop re-begins
+		// for the final verdict once the first delivery commits
+		// (→ drop) or forgets (→ this delivery takes over). The whole
+		// claim-then-process sequence runs in a goroutine so the
+		// handler returns — and net/http actually FINISHES the 200
+		// response — before any waiting happens; blocking the handler
+		// would delay the ack past Slack's timeout and provoke the
+		// very retries this code exists to absorb (codex r3 P2). The
+		// wait is bounded so a hung forward cannot pile up goroutines;
+		// a bound-expiry drop is loud-logged and Slack's next retry
+		// rung gets the same chance again. codex r2 P1.
+		//
 		// Slot ownership transfers to processSlackEvent, which either
 		// releases on its own return path or hands the slot to its
 		// alias-dispatch goroutine. This avoids double-counting against
 		// cfg.dispatchSem when an inbound triggers an alias dispatch (which
 		// would otherwise hold two slots concurrently — see gc-cby.26
-		// Phase 4 review fix).
-		go processSlackEvent(cfg, aliasReg, threadReg, roomLaunchReg, subteamMap, threadHandleSticky, env, release)
+		// Phase 4 review fix). The drop paths below release explicitly.
+		retryNum := r.Header.Get("X-Slack-Retry-Num")
+		go func() {
+			for {
+				proceed, wait := cfg.eventDedup.begin(env.EventID)
+				if proceed {
+					break
+				}
+				if wait == nil {
+					release()
+					log.Printf("slack event dedup: dropping redelivery event_id=%s retry_num=%q team_id=%q",
+						env.EventID, retryNum, clipTeamIDForLog(teamID))
+					return
+				}
+				select {
+				case <-wait:
+					// First delivery concluded — re-begin for the verdict.
+				case <-time.After(eventDedupInflightWait):
+					release()
+					log.Printf("slack event dedup: first delivery of event_id=%s still in flight after %v; dropping redelivery retry_num=%q",
+						env.EventID, eventDedupInflightWait, retryNum)
+					return
+				}
+			}
+			processSlackEvent(cfg, aliasReg, threadReg, roomLaunchReg, subteamMap, threadHandleSticky, env, release)
+		}()
 	}
 }
 
@@ -2485,7 +2505,14 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 	// the dispatch path. BUSY_REACTION= (set-but-empty) disables this
 	// block entirely — no reaction, no mark.
 	if target != "" && cfg.slackBotToken != "" && cfg.busyReaction != "" {
-		addDone := cfg.busyMarks.markBoth(msg.Channel, msg.ThreadTS, msg.TS)
+		addDone, superseded := cfg.busyMarks.markBoth(msg.Channel, msg.ThreadTS, msg.TS)
+		// A re-target of the same thread displaced earlier mark(s)
+		// whose messages still wear the busy emoji — nothing would
+		// ever remove those, so clean them up now (codex r3). The
+		// affordance moves to the newest targeted message.
+		for _, s := range superseded {
+			go removeBusyReaction(cfg, msg.Channel, s)
+		}
 		go func(channel, ts, emoji string) {
 			// Closing addDone releases any remove waiting to run
 			// after this add (clearBusyReaction orders remove-after-
@@ -2523,15 +2550,30 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 			// Transfer the slot we already hold to the alias goroutine.
 			// No new acquireDispatchSlot — that would double-count
 			// against dispatchSem (gc-cby.26 Phase 4 review fix).
+			//
+			// The dedup verdict transfers with it (codex r3 P1): for a
+			// targeted inbound the alias dispatch IS the delivery to
+			// the addressed session, so committing at processSlackEvent
+			// return would drop a waiting Slack redelivery even when
+			// this dispatch then fails. Success commits; failure
+			// forgets so the redelivery can take over. The retaken
+			// delivery re-runs postInbound too — a duplicate for the
+			// channel-bound session (which self-dedupes by message ts)
+			// is the acceptable cost of not losing the addressed
+			// session's copy.
+			commitDedup = false
 			released = true
 			dispatchInflightWG.Add(1)
 			go func() {
 				defer dispatchInflightWG.Done()
 				defer release()
-				if !dispatchToAliasedSession(cfg, aliasedSessionID, inbound, target) {
-					reactAliasDispatchFailure(cfg.slackBotToken,
-						inbound.Conversation.ConversationID, inbound.ProviderMessageID)
+				if dispatchToAliasedSession(cfg, aliasedSessionID, inbound, target) {
+					cfg.eventDedup.commit(env.EventID)
+					return
 				}
+				cfg.eventDedup.forget(env.EventID)
+				reactAliasDispatchFailure(cfg.slackBotToken,
+					inbound.Conversation.ConversationID, inbound.ProviderMessageID)
 			}()
 		}
 	}

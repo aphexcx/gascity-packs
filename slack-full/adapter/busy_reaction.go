@@ -122,11 +122,21 @@ func (r *busyReactionRegistry) clock() time.Time {
 // thread before the first reply lands) overwrites — the reaction sits
 // on the newest targeted message and the reply clears that one.
 //
+// busyTaken is one consumed mark: the ts the reaction sits on and the
+// channel its add goroutine closes on completion (remove-after-add
+// ordering).
+type busyTaken struct {
+	messageTS string
+	addDone   chan struct{}
+}
+
 // The returned channel is the mark's addDone: the caller's add
 // goroutine MUST close it once its reactions.add call has returned so
 // the remove side can order remove-after-add. Always non-nil — a
 // nil/invalid-args no-op still returns a fresh channel so the caller
-// can close it unconditionally.
+// can close it unconditionally. Any mark this overwrites is silently
+// discarded — production code uses markBoth, which surfaces
+// superseded marks so their reactions can be cleaned up.
 func (r *busyReactionRegistry) mark(channel, threadKey, messageTS string) chan struct{} {
 	addDone := make(chan struct{})
 	r.markWithDone(channel, threadKey, messageTS, addDone)
@@ -142,30 +152,82 @@ func (r *busyReactionRegistry) mark(channel, threadKey, messageTS string) chan s
 // its own ts. Both entries share one addDone; consuming one leaves the
 // sibling to expire by TTL, whose eventual redundant reactions.remove
 // is benign ("no_reaction" counts as delivered).
-func (r *busyReactionRegistry) markBoth(channel, threadTS, messageTS string) chan struct{} {
-	addDone := make(chan struct{})
-	r.markWithDone(channel, busyThreadKey(threadTS, messageTS), messageTS, addDone)
-	if threadTS != "" && threadTS != messageTS {
-		r.markWithDone(channel, messageTS, messageTS, addDone)
+//
+// superseded returns the marks these writes displaced (a human
+// re-targeting the same thread before the first reply lands, codex
+// r3): those messages already carry a busy reaction that no registry
+// entry points at anymore, so the caller must remove them — TTL
+// expiry only deletes metadata, never the Slack-side emoji.
+// Deduplicated by message ts and never includes messageTS itself.
+func (r *busyReactionRegistry) markBoth(channel, threadTS, messageTS string) (addDone chan struct{}, superseded []busyTaken) {
+	addDone = make(chan struct{})
+	seen := map[string]bool{messageTS: true}
+	collect := func(old busyTaken, ok bool) {
+		if ok && !seen[old.messageTS] {
+			seen[old.messageTS] = true
+			superseded = append(superseded, old)
+		}
 	}
-	return addDone
+	collect(r.markWithDone(channel, busyThreadKey(threadTS, messageTS), messageTS, addDone))
+	if threadTS != "" && threadTS != messageTS {
+		collect(r.markWithDone(channel, messageTS, messageTS, addDone))
+	}
+	return addDone, superseded
 }
 
 // markWithDone is the mark implementation with a caller-supplied
 // addDone, letting markBoth share one channel across its two entries.
-func (r *busyReactionRegistry) markWithDone(channel, threadKey, messageTS string, addDone chan struct{}) {
+// Returns the displaced live mark, if the write overwrote one whose
+// reaction sits on a DIFFERENT message.
+func (r *busyReactionRegistry) markWithDone(channel, threadKey, messageTS string, addDone chan struct{}) (old busyTaken, displaced bool) {
 	if r == nil || channel == "" || threadKey == "" || messageTS == "" {
-		return
+		return busyTaken{}, false
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := r.clock()
 	r.sweepLocked(now)
-	r.entries[busyReactionKey{channel: channel, threadKey: threadKey}] =
-		busyReactionMark{messageTS: messageTS, addedAt: now, addDone: addDone}
+	key := busyReactionKey{channel: channel, threadKey: threadKey}
+	if prev, present := r.entries[key]; present && prev.messageTS != messageTS {
+		old, displaced = busyTaken{messageTS: prev.messageTS, addDone: prev.addDone}, true
+	}
+	r.entries[key] = busyReactionMark{messageTS: messageTS, addedAt: now, addDone: addDone}
 	if len(r.entries) > busyReactionMaxEntries {
 		r.evictOldestLocked()
 	}
+	return old, displaced
+}
+
+// takeConversation removes and returns every pending mark in channel,
+// deduplicated by message ts (dual-key entries share one message).
+// Backs the unthreaded-reply path (codex r3): the documented default
+// `gc slack reply-current` posts at channel root with no thread ts,
+// so a delivered root publish clears every busy affordance pending in
+// that conversation rather than leaving hourglasses stuck forever.
+// Expired entries are dropped, not returned.
+func (r *busyReactionRegistry) takeConversation(channel string) []busyTaken {
+	if r == nil || channel == "" {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := r.clock()
+	seen := map[string]bool{}
+	var taken []busyTaken
+	for k, m := range r.entries {
+		if k.channel != channel {
+			continue
+		}
+		delete(r.entries, k)
+		if now.Sub(m.addedAt) > busyReactionTTL {
+			continue
+		}
+		if !seen[m.messageTS] {
+			seen[m.messageTS] = true
+			taken = append(taken, busyTaken{messageTS: m.messageTS, addDone: m.addDone})
+		}
+	}
+	return taken
 }
 
 // take removes and returns the pending mark for (channel, threadKey),

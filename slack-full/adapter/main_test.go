@@ -4161,21 +4161,41 @@ func TestLoadConfigDispatchConcurrencyRejectsNonNumeric(t *testing.T) {
 }
 
 // captureLog redirects log.Printf output to an in-memory buffer for
-// the duration of the returned cleanup. Caller must not call t.Parallel.
+// the duration of the returned cleanup. Caller must not call
+// t.Parallel. The buffer is mutex-guarded so read() is safe while
+// async goroutines under test are still logging.
 func captureLog(t *testing.T) (read func() string, cleanup func()) {
 	t.Helper()
 	prevOut := log.Writer()
 	prevFlags := log.Flags()
 	prevPrefix := log.Prefix()
-	var buf strings.Builder
-	log.SetOutput(&buf)
+	w := &lockedLogBuffer{}
+	log.SetOutput(w)
 	log.SetFlags(0)
 	log.SetPrefix("")
-	return func() string { return buf.String() }, func() {
+	return w.String, func() {
 		log.SetOutput(prevOut)
 		log.SetFlags(prevFlags)
 		log.SetPrefix(prevPrefix)
 	}
+}
+
+// lockedLogBuffer is a mutex-guarded strings.Builder for captureLog.
+type lockedLogBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *lockedLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // TestProcessSlackEventReleasesSlotOnNoAliasPath verifies the

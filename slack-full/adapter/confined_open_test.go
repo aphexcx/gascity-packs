@@ -75,6 +75,27 @@ func TestOpenBeneathRefusesInRootLeafSymlink(t *testing.T) {
 	}
 }
 
+func TestOpenBeneathRefusesInRootIntermediateSymlink(t *testing.T) {
+	// An intermediate directory swapped for a RELATIVE symlink to
+	// another directory INSIDE the root: os.Root follows it (it never
+	// escapes), so both the leaf Lstat and the open would resolve
+	// through the link to a different in-root file than validated.
+	// The per-component Lstat + identity pin must reject it.
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "real"), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "real", "f.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := os.Symlink("real", filepath.Join(root, "alias")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if _, err := openBeneath(root, filepath.Join("alias", "f.txt")); err == nil {
+		t.Fatal("openBeneath followed an in-root intermediate symlink, want failure")
+	}
+}
+
 func TestOpenBeneathRefusesSymlinkedRoot(t *testing.T) {
 	// The ROOT itself swapped for a symlink — the post-swap shape of
 	// the terminal-root race. os.OpenRoot follows it by contract, so

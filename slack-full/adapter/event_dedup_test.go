@@ -115,6 +115,11 @@ func TestHandleSlackEventsDedupsRetriedEventID(t *testing.T) {
 		t.Fatalf("retry delivery status = %d, want 200 (retries must still be acked)", w.Result().StatusCode)
 	}
 	awaitInboundHits(t, hits, 1)
+	// The drop verdict is logged from the async claim goroutine — poll.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !strings.Contains(read(), "slack event dedup") {
+		time.Sleep(10 * time.Millisecond)
+	}
 	if !strings.Contains(read(), "slack event dedup") {
 		t.Errorf("log missing 'slack event dedup' marker:\n%s", read())
 	}
