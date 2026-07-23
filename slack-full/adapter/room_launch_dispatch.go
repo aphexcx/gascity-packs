@@ -78,15 +78,15 @@ func dispatchRoomLaunch(
 	roomLaunchReg *roomLaunchMappingRegistry,
 	msg slackMessageEvent,
 	teamID, handle, remainder string,
-) {
+) (concluded bool) {
 	if roomLaunchReg == nil {
 		emitRoomLaunchNotEnabledEphemeral(cfg, msg, handle)
-		return
+		return true
 	}
 	pool, ok := roomLaunchReg.LookupPoolTemplate(teamID, msg.Channel)
 	if !ok {
 		emitRoomLaunchNotEnabledEphemeral(cfg, msg, handle)
-		return
+		return true
 	}
 
 	// Thread-root resolution: a top-level `@@new-handle ...` post has
@@ -113,20 +113,9 @@ func dispatchRoomLaunch(
 		if err := postSlackEphemeral(cfg.slackBotToken, msg.Channel, msg.User, msg.ThreadTS, body); err != nil {
 			log.Printf("launcher dispatch: ephemeral after spawn failure: %v", err)
 		}
-		return
-	}
-
-	// Bootstrap alias on first spawn so the next `@<handle> ...` post
-	// in the thread (or any other channel) routes via the existing
-	// single-`@` alias dispatch path. Idempotent on Set if the handle
-	// is already registered to this same session.
-	if created && aliasReg != nil {
-		if err := aliasReg.Set(handle, sessionID); err != nil {
-			log.Printf("launcher dispatch: aliasReg.Set handle=%q session=%s: %v",
-				handle, sessionID, err)
-			// Continue — the spawn succeeded; alias bootstrap is best-effort.
-			// The user can re-register manually via /handle-alias if needed.
-		}
+		// Transient: the session never spawned — a Slack redelivery
+		// should retry the launcher forward (codex r6).
+		return false
 	}
 
 	// Post the remainder as the session's first/next message via the
@@ -148,7 +137,33 @@ func dispatchRoomLaunch(
 		if err := postSlackEphemeral(cfg.slackBotToken, msg.Channel, msg.User, msg.ThreadTS, body); err != nil {
 			log.Printf("launcher dispatch: ephemeral after message failure: %v", err)
 		}
-		return
+		// Transient: the session exists but never got the message — a
+		// redelivery re-acquires the same thread session and re-posts.
+		// The alias is deliberately NOT registered yet (below, after
+		// this succeeds): a registered alias would send the redelivery
+		// down handleDoubleHandleDispatch's pre-claimed branch, which
+		// commits without ever re-posting the remainder (codex r7).
+		return false
+	}
+
+	// Bootstrap alias only after the first message actually landed, so
+	// the next `@<handle> ...` post routes via the single-`@` alias
+	// dispatch path. Ordered after postSessionMessage (codex r7) — see
+	// the failure comment above. Gated on the handle being unclaimed
+	// rather than on `created` (codex r8): a retry after a failed
+	// first message re-acquires the existing thread session
+	// (created=false) and must still bind the handle it advertises in
+	// the acknowledgement below.
+	if aliasReg != nil {
+		if _, claimed := aliasReg.Get(handle); !claimed {
+			if err := aliasReg.Set(handle, sessionID); err != nil {
+				log.Printf("launcher dispatch: aliasReg.Set handle=%q session=%s: %v",
+					handle, sessionID, err)
+				// Continue — the message landed; alias bootstrap is
+				// best-effort. The user can re-register manually via
+				// /handle-alias if needed.
+			}
+		}
 	}
 
 	// Acknowledge to the user. Different wording for spawn vs. reuse so
@@ -174,6 +189,7 @@ func dispatchRoomLaunch(
 	}
 	log.Printf("launcher dispatch: handle=%q session=%s created=%v team=%s channel=%s thread=%s pool=%q",
 		handle, sessionID, created, teamID, msg.Channel, threadTS, pool)
+	return true
 }
 
 // emitRoomLaunchNotEnabledEphemeral surfaces the actionable fix-it for
