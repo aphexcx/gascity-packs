@@ -2877,6 +2877,27 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 	if len(msg.Files) > 0 {
 		attachments = downloadSlackFiles(cfg, msg.Channel, msg.TS, msg.Files)
 	}
+	// Channel-binding delivery renders through gc's extmsg pipeline,
+	// which surfaces only the message text to the bound session: the
+	// Attachments field never reaches the session's reminder, and an
+	// image-only message (empty text) produced no reminder at all
+	// (ci-f6x0 / gp-gdo). Fold a file-description block into the text
+	// forwarded via postInbound so attachment-bearing messages always
+	// generate a reminder that names every file and carries the spooled
+	// local path when the download succeeded. Built from msg.Files, not
+	// the downloaded subset — a failed download (or unset
+	// INBOUND_FILE_STORE) must still surface the file id/name rather
+	// than vanish. The alias dispatch below keeps the un-augmented
+	// text: dispatchToAliasedSession renders its own attachments block
+	// and augmenting both would double-list the files.
+	textForChannel := text
+	if filesBlock := formatInboundFilesBlock(msg.Files, attachments); filesBlock != "" {
+		if strings.TrimSpace(textForChannel) == "" {
+			textForChannel = filesBlock
+		} else {
+			textForChannel += "\n\n" + filesBlock
+		}
+	}
 
 	inbound := externalInboundMessage{
 		ProviderMessageID: msg.TS,
@@ -2937,10 +2958,12 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 	// bound session would receive a duplicate turn (codex r12). Only
 	// the failed alias leg below is retried.
 	channelLegDone := cfg.eventDedup.isChannelLegDone(env.EventID)
+	inboundForChannel := inbound
+	inboundForChannel.Text = textForChannel
 	if channelLegDone {
 		log.Printf("inbound: channel leg already delivered event=%s chan=%s ts=%s — retrying alias leg only",
 			env.EventID, msg.Channel, msg.TS)
-	} else if err := postInbound(cfg, inbound); err != nil {
+	} else if err := postInbound(cfg, inboundForChannel); err != nil {
 		log.Printf("inbound POST failed: %v", err)
 		// Nothing reached gc. Cancel the busy mark FIRST — no agent
 		// received the message, so no reply will ever come to clear
@@ -2962,8 +2985,8 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 		cfg.eventDedup.forget(env.EventID)
 		return
 	} else {
-		log.Printf("inbound: chan=%s user=%s ts=%s thread=%s target=%q files=%d text=%dch",
-			msg.Channel, msg.User, msg.TS, msg.ThreadTS, target, len(attachments), len(text))
+		log.Printf("inbound: chan=%s user=%s ts=%s thread=%s target=%q files=%d spooled=%d text=%dch",
+			msg.Channel, msg.User, msg.TS, msg.ThreadTS, target, len(msg.Files), len(attachments), len(text))
 	}
 
 	// Busy-reaction lifecycle, add side: fires once per inbound (the
@@ -3150,6 +3173,56 @@ func downloadSlackFiles(cfg config, channel, ts string, files []slackFile) []ext
 		})
 	}
 	return out
+}
+
+// formatInboundFilesBlock renders a text block describing every file
+// attached to an inbound Slack message, for the channel-binding
+// delivery path whose downstream renderer (gc extmsg → bound-session
+// reminder) surfaces only the message text (ci-f6x0). Iterates the
+// event's files[] — not just the downloaded subset — so every
+// attachment is named even when INBOUND_FILE_STORE is unset or a
+// download failed; downloaded is matched by Slack file id to attach
+// the spooled local path. Every Slack-controlled field is neutralized
+// (cby.33) so a forged </system-reminder> in a filename cannot fake a
+// reminder boundary once gc wraps the text in its envelope. Returns
+// "" when there are no files.
+func formatInboundFilesBlock(files []slackFile, downloaded []externalAttachment) string {
+	if len(files) == 0 {
+		return ""
+	}
+	localPath := make(map[string]string, len(downloaded))
+	for _, att := range downloaded {
+		localPath[att.ProviderID] = strings.TrimPrefix(att.URL, "file://")
+	}
+	noun := "files"
+	if len(files) == 1 {
+		noun = "file"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "[%d Slack %s attached]", len(files), noun)
+	for i, f := range files {
+		name := f.Name
+		if name == "" {
+			name = f.Title
+		}
+		if name == "" {
+			name = f.ID
+		}
+		mime := f.MIMEType
+		if mime == "" {
+			mime = "unknown type"
+		}
+		fmt.Fprintf(&b, "\n  %d. %s (%s, id %s)", i+1,
+			neutralizeMarkupBoundaries(name),
+			neutralizeMarkupBoundaries(mime),
+			neutralizeMarkupBoundaries(f.ID))
+		if p, ok := localPath[f.ID]; ok {
+			fmt.Fprintf(&b, " — saved to %s; Read that path to view it", neutralizeMarkupBoundaries(p))
+		} else {
+			b.WriteString(" — bytes not spooled locally; fetch via Slack API files.info + url_private with the adapter bot token")
+		}
+	}
+	return b.String()
 }
 
 // safePathComponent sanitizes a Slack-supplied identifier (channel id, ts)
