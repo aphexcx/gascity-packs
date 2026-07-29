@@ -4,13 +4,13 @@ Synthesize the workflow result from the requirements, plan, decomposition, imple
 
 Write the final build report to the resolved final report path and ensure that
 path is recorded on the workflow root bead as `gc.build.final_report_path`.
-Use `bd update "<workflow-root-id>" --set-metadata "gc.build.final_report_path=<absolute path>"`.
-Do not use `bd update --metadata 'key=value'`; `--metadata` only accepts a JSON
+Use `gc bd update "<workflow-root-id>" --set-metadata "gc.build.final_report_path=<absolute path>"`.
+Do not use `gc bd update --metadata 'key=value'`; `--metadata` only accepts a JSON
 object.
 Before closing this step, set the claimed step outcome with
-`bd update "<claimed-step-id>" --set-metadata "gc.outcome=pass"`, then close
-with `bd close "<claimed-step-id>" --reason "<concise reason>"`. Do not pass
-`--metadata` or `--set-metadata` to `bd close`.
+`gc bd update "<claimed-step-id>" --set-metadata "gc.outcome=pass"`, then close
+with `gc bd close "<claimed-step-id>" --reason "<concise reason>"`. Do not pass
+`--metadata` or `--set-metadata` to `gc bd close`.
 
 Close this step only after the workflow root bead has the final outcome metadata needed by publish.
 

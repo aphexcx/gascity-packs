@@ -1,0 +1,35 @@
+{
+  "channel_id": "C0AAAAAAA",
+  "compatible_delegation_count": 2,
+  "created_at": "2026-07-17T12:00:05Z",
+  "expected_responder_agent": "riley",
+  "expected_responder_bot_user_id": "U0AAAAAA2",
+  "generation": 2,
+  "nonce": "gcs-0123456789abcdef0123",
+  "pending_delegation_count": 1,
+  "pending_delegations": [
+    {
+      "delegation_key": "dg-T0AAAAAAA-C0AAAAAAA-1700000000.000200-63c6bb5b3717.json",
+      "delegation_ts": "1700000000.000200",
+      "expected_responder_agent": "seth",
+      "expected_responder_bot_user_id": "U0AAAAAA3"
+    }
+  ],
+  "requester_agent": "ollie",
+  "requester_bot_user_id": "U0AAAAAA1",
+  "requester_session": "ollie-main",
+  "responded_delegation_count": 1,
+  "result_claimed_at": "2026-07-17T12:00:07Z",
+  "result_ts": "1700000000.000300",
+  "room": "orchestrator-team",
+  "schema_version": 1,
+  "status": "result_claimed",
+  "synthesis_ready": false,
+  "synthesis_snapshot_at": "2026-07-17T12:00:07Z",
+  "synthesis_state_available": true,
+  "synthesis_state_version": 1,
+  "team_id": "T0AAAAAAA",
+  "thread_root_ts": "1700000000.000100",
+  "ts": "1700000000.000500",
+  "ttl_seconds": 86400
+}

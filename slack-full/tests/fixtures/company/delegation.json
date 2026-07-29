@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "generation": 1,
+  "nonce": "gcs-0123456789abcdef0123",
+  "room": "orchestrator-team",
+  "team_id": "T0AAAAAAA",
+  "channel_id": "C0AAAAAAA",
+  "ts": "1700000000.000500",
+  "thread_root_ts": "1700000000.000100",
+  "requester_agent": "ollie",
+  "requester_bot_user_id": "U0AAAAAA1",
+  "requester_session": "ollie-main",
+  "expected_responder_agent": "riley",
+  "expected_responder_bot_user_id": "U0AAAAAA2",
+  "created_at": "2026-07-17T12:00:05Z",
+  "ttl_seconds": 86400,
+  "status": "pending",
+  "result_ts": "",
+  "result_claimed_at": ""
+}

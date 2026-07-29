@@ -1,0 +1,2 @@
+description = "Delegate the current company-room turn to a peer agent (posts <@peer> into the human root thread)"
+run = "../delegate.sh"

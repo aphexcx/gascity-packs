@@ -27,10 +27,8 @@ on:
         type: choice
         options:
           - all
-          - review
           - build
-          - build-basic
-          - gastown-orchestration
+          - smoke
         default: all
       pack:
         description: "Supported pack or group to exercise for manual subset checks."
@@ -39,6 +37,7 @@ on:
         options:
           - all-supported
           - methodology
+          - model-smoke
           - gascity
           - superpowers
           - compound-engineering
@@ -51,14 +50,14 @@ permissions:
   contents: read
 
 env:
-  DOLT_VERSION: "2.1.0"
-  BD_VERSION: "v1.0.4"
+  DOLT_VERSION: "2.1.7"
+  BD_VERSION: "v1.1.0"
   CLAUDE_VERSION: "2.1.123"
 
 jobs:
   static-contracts:
     name: static pack flow contracts
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
       - name: Check out gascity-packs
@@ -85,62 +84,47 @@ jobs:
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
-      max-parallel: 1
+      # The managed Ollama pool has two credentials. Keep one real full E2E
+      # canary while running the direct pack smokes in bounded pairs.
+      max-parallel: 2
       matrix:
         include:
           - pack: gascity
-            gate: review
-            timeout_minutes: 45
+            # Full E2E canary: artifacts, implementation worktree, and pytest.
+            gate: build
+            timeout_minutes: 30
             gate_timeout: 30m
-          - pack: gascity
-            gate: build-basic
-            timeout_minutes: 110
-            gate_timeout: 90m
           - pack: superpowers
-            gate: review
-            timeout_minutes: 60
-            gate_timeout: 45m
-          - pack: superpowers
-            gate: build
-            timeout_minutes: 120
-            gate_timeout: 100m
+            gate: smoke
+            timeout_minutes: 25
+            gate_timeout: 25m
           - pack: compound-engineering
-            gate: review
-            timeout_minutes: 60
-            gate_timeout: 45m
-          - pack: compound-engineering
-            gate: build
-            timeout_minutes: 120
-            gate_timeout: 100m
+            gate: smoke
+            timeout_minutes: 25
+            gate_timeout: 25m
           - pack: gstack
-            gate: review
-            timeout_minutes: 75
-            gate_timeout: 60m
-          - pack: gstack
-            gate: build
-            timeout_minutes: 150
-            gate_timeout: 130m
+            gate: smoke
+            timeout_minutes: 25
+            gate_timeout: 25m
           - pack: bmad
-            gate: review
-            timeout_minutes: 60
-            gate_timeout: 45m
-          - pack: bmad
-            gate: build
-            timeout_minutes: 120
-            gate_timeout: 100m
+            gate: smoke
+            timeout_minutes: 25
+            gate_timeout: 25m
           - pack: gastown
-            gate: gastown-orchestration
-            timeout_minutes: 120
-            gate_timeout: 110m
+            gate: smoke
+            timeout_minutes: 25
+            gate_timeout: 25m
     env:
-      ANTHROPIC_BASE_URL: https://ollama.com
-      ANTHROPIC_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
-      ANTHROPIC_AUTH_TOKEN: ${{ secrets.OLLAMA_API_KEY }}
+      # Claude Code appends /v1/messages itself, so this base URL intentionally
+      # does not end in /v1.
+      ANTHROPIC_BASE_URL: https://works.gascity.com/manifold-api
+      ANTHROPIC_AUTH_TOKEN: ${{ secrets.MANIFOLD_AUTH_TOKEN }}
       OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: ${{ vars.GC_WORKER_INFERENCE_CLAUDE_OLLAMA_HAIKU_MODEL }}
-      ANTHROPIC_DEFAULT_SONNET_MODEL: ${{ vars.GC_WORKER_INFERENCE_CLAUDE_OLLAMA_SONNET_MODEL }}
-      ANTHROPIC_DEFAULT_OPUS_MODEL: ${{ vars.GC_WORKER_INFERENCE_CLAUDE_OLLAMA_OPUS_MODEL }}
-      CLAUDE_CODE_SUBAGENT_MODEL: ${{ vars.GC_WORKER_INFERENCE_CLAUDE_OLLAMA_SUBAGENT_MODEL }}
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: ${{ vars.GC_WORKER_INFERENCE_CLAUDE_MANIFOLD_HAIKU_MODEL }}
+      ANTHROPIC_DEFAULT_SONNET_MODEL: ${{ vars.GC_WORKER_INFERENCE_CLAUDE_MANIFOLD_SONNET_MODEL }}
+      ANTHROPIC_DEFAULT_OPUS_MODEL: ${{ vars.GC_WORKER_INFERENCE_CLAUDE_MANIFOLD_OPUS_MODEL }}
+      CLAUDE_CODE_SUBAGENT_MODEL: ${{ vars.GC_WORKER_INFERENCE_CLAUDE_MANIFOLD_SUBAGENT_MODEL }}
+      GC_INFERENCE_EXPECTED_MODEL: kimi-k2.7-code
       CLAUDE_CODE_EFFORT_LEVEL: auto
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
       PYTHONUNBUFFERED: "1"
@@ -163,7 +147,17 @@ jobs:
                 pack_match=true
                 ;;
               methodology)
-                if [ "$MATRIX_PACK" != "gastown" ]; then
+                case "$MATRIX_PACK" in
+                  superpowers|compound-engineering|gstack|bmad)
+                    pack_match=true
+                    ;;
+                  *)
+                    pack_match=false
+                    ;;
+                esac
+                ;;
+              model-smoke)
+                if [ "$MATRIX_PACK" != "gascity" ]; then
                   pack_match=true
                 else
                   pack_match=false
@@ -222,7 +216,7 @@ jobs:
         if: steps.subset.outputs.run_gate == 'true'
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
-          go-version: "1.25.10"
+          go-version: "1.26.5"
 
       - name: Set up Node
         if: steps.subset.outputs.run_gate == 'true'
@@ -254,21 +248,23 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
           "$(go env GOPATH)/bin/gc" version
 
-      - name: Validate Ollama Claude configuration
+      - name: Validate Manifold Claude configuration
         if: steps.subset.outputs.run_gate == 'true'
         run: |
           test -n "$OLLAMA_API_KEY" || { echo "Missing OLLAMA_API_KEY GitHub secret" >&2; exit 1; }
-          test -n "$ANTHROPIC_API_KEY" || { echo "ANTHROPIC_API_KEY resolved empty" >&2; exit 1; }
-          test -n "$ANTHROPIC_AUTH_TOKEN" || { echo "ANTHROPIC_AUTH_TOKEN resolved empty" >&2; exit 1; }
+          test -n "$ANTHROPIC_AUTH_TOKEN" || { echo "Missing MANIFOLD_AUTH_TOKEN GitHub secret" >&2; exit 1; }
+          test "$ANTHROPIC_BASE_URL" = "https://works.gascity.com/manifold-api" || { echo "ANTHROPIC_BASE_URL must be the Manifold base URL without /v1" >&2; exit 1; }
           test -n "$ANTHROPIC_DEFAULT_HAIKU_MODEL" || { echo "ANTHROPIC_DEFAULT_HAIKU_MODEL resolved empty" >&2; exit 1; }
           test -n "$ANTHROPIC_DEFAULT_SONNET_MODEL" || { echo "ANTHROPIC_DEFAULT_SONNET_MODEL resolved empty" >&2; exit 1; }
           test -n "$ANTHROPIC_DEFAULT_OPUS_MODEL" || { echo "ANTHROPIC_DEFAULT_OPUS_MODEL resolved empty" >&2; exit 1; }
           test -n "$CLAUDE_CODE_SUBAGENT_MODEL" || { echo "CLAUDE_CODE_SUBAGENT_MODEL resolved empty" >&2; exit 1; }
+          test "$GC_INFERENCE_EXPECTED_MODEL" = "kimi-k2.7-code" || { echo "GC_INFERENCE_EXPECTED_MODEL must pin kimi-k2.7-code" >&2; exit 1; }
           printf 'ANTHROPIC_BASE_URL=%s\n' "$ANTHROPIC_BASE_URL"
           printf 'ANTHROPIC_DEFAULT_HAIKU_MODEL=%s\n' "$ANTHROPIC_DEFAULT_HAIKU_MODEL"
           printf 'ANTHROPIC_DEFAULT_SONNET_MODEL=%s\n' "$ANTHROPIC_DEFAULT_SONNET_MODEL"
           printf 'ANTHROPIC_DEFAULT_OPUS_MODEL=%s\n' "$ANTHROPIC_DEFAULT_OPUS_MODEL"
           printf 'CLAUDE_CODE_SUBAGENT_MODEL=%s\n' "$CLAUDE_CODE_SUBAGENT_MODEL"
+          printf 'GC_INFERENCE_EXPECTED_MODEL=%s\n' "$GC_INFERENCE_EXPECTED_MODEL"
 
       - name: Run supported-pack nightly inference gate
         if: steps.subset.outputs.run_gate == 'true'
@@ -287,6 +283,9 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: supported-pack-nightly-${{ matrix.pack }}-${{ matrix.gate }}
-          path: ${{ runner.temp }}/supported-pack-nightly/${{ matrix.pack }}
+          path: |
+            ${{ runner.temp }}/supported-pack-nightly/${{ matrix.pack }}
+            !${{ runner.temp }}/supported-pack-nightly/${{ matrix.pack }}/gc-home/.dolt/eventsData/**
+            !${{ runner.temp }}/supported-pack-nightly/${{ matrix.pack }}/**/.beads/eventsData/**
           if-no-files-found: ignore
           include-hidden-files: true

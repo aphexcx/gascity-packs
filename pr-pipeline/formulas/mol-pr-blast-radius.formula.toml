@@ -9,7 +9,7 @@ agent is given a free-text `scope` describing what code will change
 report to `.gc/pr-pipeline/blast-radius/<key>.md`. **No code is written.**
 
 The molecule root bead IS the control bead — run state is recorded in
-its notes via `bd update <root-id> --notes "<key>: <value>"`.
+its notes via `gc bd update <root-id> --notes "<key>: <value>"`.
 
 This formula is composable: the planner (`mol-pr-start`) currently does
 its own inline blast-radius analysis, but for changes that don't start
@@ -52,10 +52,10 @@ Confirm we're in a git repo and parse the scope into a list of analyzable
 targets.
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
     echo "Not in a git repository — cannot map blast radius."
-    bd close "$ROOT_ID" --reason "not a git checkout"
+    gc bd close "$ROOT_ID" --reason "not a git checkout"
     exit 1
 }
 cd "$REPO_ROOT"
@@ -78,7 +78,7 @@ if [ -z "$KEY" ]; then
 fi
 mkdir -p .gc/pr-pipeline/blast-radius
 REPORT_PATH=".gc/pr-pipeline/blast-radius/${KEY}.md"
-bd update "$ROOT_ID" --notes "scope: {{scope}}
+gc bd update "$ROOT_ID" --notes "scope: {{scope}}
 key: $KEY
 report_path: $REPORT_PATH
 status: in_progress"
@@ -253,8 +253,8 @@ Write the report to `$REPORT_PATH` using this structure:
 After writing, mark complete:
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
-bd update "$ROOT_ID" --notes "status: complete"
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
+gc bd update "$ROOT_ID" --notes "status: complete"
 echo "[blast-radius] Complete for: {{scope}}"
 echo "[blast-radius]   Path: $REPORT_PATH"
 ```

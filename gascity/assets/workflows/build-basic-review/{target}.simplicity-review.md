@@ -15,11 +15,11 @@ Close with `gc.outcome=pass`,
 Use explicit close metadata so the review loop can detect the lane result:
 
 ```bash
-bd update "$CLAIMED_BEAD_ID" \
+gc bd update "$CLAIMED_BEAD_ID" \
   --set-metadata 'gc.outcome=pass' \
   --set-metadata 'code_review.simplicity_verdict=approve' \
   --set-metadata 'code_review.output_path=<simplicity review report path>'
-bd close "$CLAIMED_BEAD_ID" --reason 'Build-basic simplicity review approved.'
+gc bd close "$CLAIMED_BEAD_ID" --reason 'Build-basic simplicity review approved.'
 ```
 
 If you find required fixes, set

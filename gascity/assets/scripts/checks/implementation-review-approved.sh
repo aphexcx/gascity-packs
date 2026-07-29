@@ -22,14 +22,14 @@ metadata_value() {
   ' 2>/dev/null
 }
 
-ROOT_JSON="$(bd show "$ROOT_ID" --json 2>/dev/null || true)"
+ROOT_JSON="$(gc bd show "$ROOT_ID" --json 2>/dev/null || true)"
 PARENT_ROOT="$(metadata_value "$ROOT_JSON" "gc.root_bead_id")"
 if [ -z "$PARENT_ROOT" ]; then
   PARENT_ROOT="$ROOT_ID"
 fi
 PARENT_JSON="$ROOT_JSON"
 if [ "$PARENT_ROOT" != "$ROOT_ID" ]; then
-  PARENT_JSON="$(bd show "$PARENT_ROOT" --json 2>/dev/null || true)"
+  PARENT_JSON="$(gc bd show "$PARENT_ROOT" --json 2>/dev/null || true)"
 fi
 STEP_ID="$(metadata_value "$ROOT_JSON" "gc.step_id")"
 SCOPE_REF="$(metadata_value "$ROOT_JSON" "gc.scope_ref")"
@@ -37,7 +37,7 @@ if [ -z "$SCOPE_REF" ]; then
   SCOPE_REF="$(metadata_value "$ROOT_JSON" "gc.step_ref")"
 fi
 
-MATCHES="$(bd list --all --metadata-field "gc.root_bead_id=$PARENT_ROOT" --json --limit=0 2>/dev/null || printf '[]')"
+MATCHES="$(gc bd list --all --metadata-field "gc.root_bead_id=$PARENT_ROOT" --json --limit=0 2>/dev/null || printf '[]')"
 
 VERDICT="$(printf '%s\n' "$MATCHES" | jq -r --arg attempt "$ATTEMPT" '
   [

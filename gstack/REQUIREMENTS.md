@@ -110,10 +110,9 @@ for every derived pack.
   write the adapter-consumable report to `{{report_path}}` without posting
   comments, pushing branches, or finalizing external state.
 - Prompt hygiene: all agent prompt templates under
-  `agents/*/prompt.template.md` include the shared `gc-role-worker` fragment,
-  which carries the Gas City claim protocol; every per-agent nested fragment
-  copy is identical to the pack-level
-  `gstack/template-fragments/gc-role-worker.template.md`. Agent prompts and
+  `agents/*/prompt.template.md` include the public `gc-role-worker` fragment
+  supplied by the `gc` import; gstack does not override that shared claim
+  protocol. Agent prompts and
   lane assets carry explicit "Do not invoke provider-native subagents" guards
   and route delegation through Gas City graph lanes. The skill texts under
   `skills/` are methodology source material only — when gstack text asks for
@@ -136,7 +135,7 @@ grep -n -E '^extends' gstack/formulas/gstack-planning.formula.toml gstack/formul
 grep -n -E '^id = |needs = ' gstack/formulas/gstack-build.formula.toml  # qa needs review; release-readiness needs qa; finalize needs release-readiness
 grep -rn 'gc.run_target' gstack/formulas/*.toml  # expect only gstack.* agents, gc.run-operator, gc.publisher, or {implementation_target}
 grep -rL 'gc-role-worker' gstack/agents/*/prompt.template.md  # expect no output
-for f in gstack/agents/*/template-fragments/gc-role-worker.template.md; do diff gstack/template-fragments/gc-role-worker.template.md "$f"; done  # expect no output
+gc lint gstack
 grep -rn 'provider-native' gstack/agents gstack/assets | wc -l  # expect >= 60
 grep -rho 'gc\.build\.[a-z_.]*' gstack/assets gstack/formulas | sort -u
 ls gascity/schemas/build

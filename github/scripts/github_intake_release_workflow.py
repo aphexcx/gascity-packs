@@ -15,11 +15,16 @@ def bead_metadata(bead_id: str) -> dict[str, object]:
     bead_id = bead_id.strip()
     if not bead_id:
         return {}
-    bd_bin = os.environ.get("BD_BIN", "bd")
+    gc_bin = os.environ.get("GC_BIN", "gc")
     city_root = common.city_root() or "."
+    command = [gc_bin]
+    if city_root not in {"", "."}:
+        command.extend(["--city", city_root])
+    command.append("bd")
+    command.extend(["show", bead_id, "--json"])
     try:
         result = subprocess.run(
-            [bd_bin, "show", bead_id, "--json"],
+            command,
             cwd=city_root,
             capture_output=True,
             text=True,

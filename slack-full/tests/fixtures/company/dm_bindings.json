@@ -1,0 +1,14 @@
+{
+  "dm_bindings": [
+    {
+      "agent": "ollie",
+      "session": "ollie"
+    },
+    {
+      "agent": "riley",
+      "city": "riley-city",
+      "session": "riley-main"
+    }
+  ],
+  "schema_version": 1
+}

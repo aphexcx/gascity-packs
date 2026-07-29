@@ -69,16 +69,16 @@ Close with `gc.outcome=pass`,
 `code_review.output_path=<implementation review report path>`.
 
 Use the exact claimed bead id when updating metadata. Do not pass freeform notes
-or additional positional arguments to `bd update`; unquoted words can resolve to
+or additional positional arguments to `gc bd update`; unquoted words can resolve to
 unrelated beads. Use this command shape:
 
 ```bash
-bd update "$CLAIMED_BEAD_ID" \
+gc bd update "$CLAIMED_BEAD_ID" \
   --set-metadata 'gc.outcome=pass' \
   --set-metadata 'code_review.review_verdict=approve' \
   --set-metadata 'code_review.review_report_path=<implementation review report path>' \
   --set-metadata 'code_review.output_path=<implementation review report path>'
-bd close "$CLAIMED_BEAD_ID" --reason 'Implementation review approved with no required findings.'
+gc bd close "$CLAIMED_BEAD_ID" --reason 'Implementation review approved with no required findings.'
 ```
 
 Do not set `code_review.verdict` or `code_review.report_path`; the

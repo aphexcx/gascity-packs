@@ -23,16 +23,16 @@ Always close with `gc.outcome=pass`,
 `code_review.output_path=<starter review summary path>`.
 
 Use the exact claimed bead id when updating metadata. Do not pass freeform notes
-or additional positional arguments to `bd update`; unquoted words can resolve to
+or additional positional arguments to `gc bd update`; unquoted words can resolve to
 unrelated beads. Use this command shape:
 
 ```bash
-bd update "$CLAIMED_BEAD_ID" \
+gc bd update "$CLAIMED_BEAD_ID" \
   --set-metadata 'gc.outcome=pass' \
   --set-metadata 'code_review.verdict=done' \
   --set-metadata 'code_review.report_path=<starter review summary path>' \
   --set-metadata 'code_review.output_path=<starter review summary path>'
-bd close "$CLAIMED_BEAD_ID" --reason 'Build-basic starter review approved.'
+gc bd close "$CLAIMED_BEAD_ID" --reason 'Build-basic starter review approved.'
 ```
 
 Do not invoke provider-native subagents. This starter factory graph lane is the

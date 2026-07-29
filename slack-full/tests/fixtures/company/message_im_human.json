@@ -1,0 +1,14 @@
+{
+  "type": "event_callback",
+  "team_id": "T0AAAAAAA",
+  "api_app_id": "A0AAAAAA1",
+  "event_id": "Ev0DMHUMAN01",
+  "event": {
+    "type": "message",
+    "channel": "D0AAAAAAA",
+    "channel_type": "im",
+    "user": "U0HUMAN01",
+    "ts": "1700000000.000700",
+    "text": "hey ollie, can you check the deploy?"
+  }
+}

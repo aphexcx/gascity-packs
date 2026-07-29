@@ -10,7 +10,7 @@ and produces a structured plan saved to `.gc/pr-pipeline/plans/issue-<N>.md`.
 implement it.
 
 The molecule root bead IS the control bead — run state is recorded in its
-notes via `bd update <root-id> --notes "<key>: <value>"`.
+notes via `gc bd update <root-id> --notes "<key>: <value>"`.
 
 ## Contract
 
@@ -44,10 +44,10 @@ Establish working state and read the issue.
 
 **1. Find the root bead and confirm we're in a git repo:**
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
     echo "Not in a git repository — cannot plan."
-    bd close "$ROOT_ID" --reason "not a git checkout"
+    gc bd close "$ROOT_ID" --reason "not a git checkout"
     exit 1
 }
 cd "$REPO_ROOT"
@@ -65,7 +65,7 @@ so a single record of the issue + closure ends up in bead notes.
 
 **3. Record initial state in root-bead notes:**
 ```bash
-bd update "$ROOT_ID" --notes "issue: {{issue}}
+gc bd update "$ROOT_ID" --notes "issue: {{issue}}
 repo: $REPO
 repo_root: $REPO_ROOT
 status: in_progress"
@@ -84,7 +84,7 @@ time planning an issue someone else is fixing or whose area is being
 consolidated by a refactor that'll supersede the work.
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
 REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
 ```
 
@@ -104,7 +104,7 @@ ISSUE_STATE=$(gh issue view {{issue}} --repo "$REPO" --json state -q .state)
 ```bash
 REASON="competing PR exists or issue already closed"
 DETAIL=$(echo "$COMPETING_PRS" | jq -c '.')
-bd update "$ROOT_ID" --notes "status: blocked
+gc bd update "$ROOT_ID" --notes "status: blocked
 gate: competing_pr
 detail: $DETAIL
 issue_state: $ISSUE_STATE"
@@ -112,7 +112,7 @@ echo "[pr-plan] BLOCKED — $REASON"
 echo "[pr-plan]   Detail: $DETAIL"
 echo "[pr-plan]   Caller options: pivot to a different issue, review the"
 echo "[pr-plan]                   competing PR, or coordinate with author."
-bd close "$ROOT_ID" --reason "$REASON"
+gc bd close "$ROOT_ID" --reason "$REASON"
 exit 0
 ```
 
@@ -159,7 +159,7 @@ The agent uses semantic judgment to decide whether any of these signals
 genuinely overlaps the issue's area. **If the agent determines yes:**
 
 ```bash
-bd update "$ROOT_ID" --notes "status: blocked
+gc bd update "$ROOT_ID" --notes "status: blocked
 gate: architectural_refactor
 active_docs: $ACTIVE_DOCS
 consolidations: $CONSOLIDATIONS
@@ -170,14 +170,14 @@ echo "[pr-plan]   Caller options: a) point-fix the refactor can absorb"
 echo "[pr-plan]                   (ask in the issue first);"
 echo "[pr-plan]                   b) wait for refactor + rebase;"
 echo "[pr-plan]                   c) pivot to an issue outside the area."
-bd close "$ROOT_ID" --reason "active refactor in area"
+gc bd close "$ROOT_ID" --reason "active refactor in area"
 exit 0
 ```
 
 If neither gate triggers, record clearance and proceed:
 
 ```bash
-bd update "$ROOT_ID" --notes "gates: cleared"
+gc bd update "$ROOT_ID" --notes "gates: cleared"
 ```
 
 **Exit criteria:** Both gates cleared (or formula already exited via gate
@@ -225,8 +225,8 @@ Capture:
 Save the analysis as a heredoc into the bead notes for downstream steps:
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
-bd update "$ROOT_ID" --notes "blast_radius: <one-line summary>"
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
+gc bd update "$ROOT_ID" --notes "blast_radius: <one-line summary>"
 ```
 
 **Exit criteria:** Blast-radius summary recorded in root-bead notes.
@@ -288,7 +288,7 @@ description = """
 Produce the structured plan as a markdown file. This is the deliverable.
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
 mkdir -p .gc/pr-pipeline/plans
 PLAN_PATH=".gc/pr-pipeline/plans/issue-{{issue}}.md"
 ```
@@ -336,7 +336,7 @@ Branch prefixes: `fix/`, `feat/`, `refactor/`, `docs/`, `test/`,
 After writing the file:
 
 ```bash
-bd update "$ROOT_ID" --notes "plan_path: $PLAN_PATH
+gc bd update "$ROOT_ID" --notes "plan_path: $PLAN_PATH
 plan_status: draft"
 ```
 
@@ -430,9 +430,9 @@ currently doesn't," update the plan file with the addition.
 After the audit, mark the plan finalized:
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
 PLAN_PATH=".gc/pr-pipeline/plans/issue-{{issue}}.md"
-bd update "$ROOT_ID" --notes "plan_status: finalized
+gc bd update "$ROOT_ID" --notes "plan_status: finalized
 themes_audit: complete"
 ```
 

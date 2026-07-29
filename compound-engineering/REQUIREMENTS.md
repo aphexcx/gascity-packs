@@ -83,9 +83,9 @@ for every derived pack.
   adapter-consumable report to `{{report_path}}` without posting comments,
   pushing branches, or finalizing external state.
 - Prompt hygiene: all agent prompt templates under `agents/*/prompt.template.md`
-  include the shared `gc-role-worker` fragment, which carries the Gas City
-  claim protocol; the pack-level fragment and the
-  `ce-code-review-selector` nested copy are identical. Lane assets and the
+  include the public `gc-role-worker` fragment supplied by the `gc` import;
+  Compound Engineering does not override that shared claim protocol. Lane
+  assets and the
   skill-adopting agent prompts state "Do not invoke provider-native
   subagents, slash commands, task tools, or the upstream plugin runtime" and
   translate upstream subagent requests into Gas City lanes. The vendored
@@ -107,7 +107,7 @@ grep -n -A 2 -E '^\[vars\.(interaction_mode|review_mode)\]' gascity/formulas/bui
 grep -n -E '^extends' compound-engineering/formulas/compound-planning.formula.toml compound-engineering/formulas/compound-decomposition.formula.toml compound-engineering/formulas/compound-review.formula.toml compound-engineering/formulas/compound-fix-loop.formula.toml
 grep -n 'gc.run_target' compound-engineering/formulas/compound-plan-review.formula.toml compound-engineering/formulas/compound-code-review.formula.toml compound-engineering/formulas/compound-resolution.formula.toml
 grep -rL 'gc-role-worker' compound-engineering/agents/*/prompt.template.md  # expect no output
-diff compound-engineering/template-fragments/gc-role-worker.template.md compound-engineering/agents/ce-code-review-selector/template-fragments/gc-role-worker.template.md  # expect identical
+gc lint compound-engineering
 grep -rn 'Do not invoke provider-native subagents' compound-engineering/agents compound-engineering/assets | wc -l  # expect > 30
 grep -rho 'gc\.build\.[a-z_.]*' compound-engineering/assets compound-engineering/formulas | sort -u
 ls gascity/schemas/build

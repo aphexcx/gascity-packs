@@ -26,9 +26,8 @@ type stubExecRecord struct {
 // records the invocations and produces deterministic stdout per command
 // name. It returns a pointer to the recorded slice and a restore func.
 //
-// `bd` invocations emit a JSON line containing {"id": bdID}; `gc`
-// invocations emit a single OK line. Tests asserting failure modes can
-// override behavior by inspecting Name/Args before this stub returns.
+// `gc bd create` invocations emit a JSON line containing {"id": bdID};
+// other `gc bd` invocations emit OK. The gc sling leg uses gcExitCode.
 func installStubExecCommand(t *testing.T, bdID string, gcExitCode int) (*[]stubExecRecord, func()) {
 	t.Helper()
 	prev := dispatchExecCommand
@@ -38,14 +37,23 @@ func installStubExecCommand(t *testing.T, bdID string, gcExitCode int) (*[]stubE
 		records = append(records, stubExecRecord{Name: name, Args: append([]string(nil), args...)})
 
 		// Each invocation routes to a tiny shell script that echoes a
-		// canned line so the dispatcher can parse JSON from `bd create`
+		// canned line so the dispatcher can parse JSON from `gc bd create`
 		// and proceed past `gc sling`.
 		var script string
 		switch name {
-		case "bd":
-			script = "printf '%s\\n' '" + `{"id":"` + bdID + `","title":"x","type":"task"}` + "'"
 		case "gc":
-			if gcExitCode != 0 {
+			bdIndex := -1
+			for i, arg := range args {
+				if arg == "bd" {
+					bdIndex = i
+					break
+				}
+			}
+			if bdIndex >= 0 && bdIndex+1 < len(args) && args[bdIndex+1] == "create" {
+				script = "printf '%s\\n' '" + `{"id":"` + bdID + `","title":"x","type":"task"}` + "'"
+			} else if bdIndex >= 0 {
+				script = "echo ok"
+			} else if gcExitCode != 0 {
 				script = "echo gc-fail >&2; exit 1"
 			} else {
 				script = "echo ok"
@@ -447,7 +455,7 @@ func TestSlackInteractionsRigSlashMissingWorkdir(t *testing.T) {
 // TestSlackInteractionsRigViewSubmissionDispatchesHappyPath — full
 // round-trip: slash opens modal (skipped here; covered by the modal
 // test above), user types summary + context, view_submission with
-// rig_fix metadata fires bd create then gc sling with --var pairs.
+// rig_fix metadata fires gc bd create then gc sling with --var pairs.
 func TestSlackInteractionsRigViewSubmissionDispatchesHappyPath(t *testing.T) {
 	cityPath := t.TempDir()
 	rigDir := filepath.Join(cityPath, "rigs", "alpha")
@@ -518,10 +526,11 @@ func TestSlackInteractionsRigViewSubmissionDispatchesHappyPath(t *testing.T) {
 		t.Fatalf("expected >=2 exec calls, got %+v", *records)
 	}
 
-	// bd create title must contain the user's summary.
+	// gc bd create title must contain the user's summary.
 	bd := (*records)[0]
-	if bd.Name != "bd" || bd.Args[0] != "create" {
-		t.Errorf("first call should be `bd create`; got %+v", bd)
+	if bd.Name != "gc" || len(bd.Args) < 6 || bd.Args[0] != "--city" || bd.Args[1] != cityPath ||
+		bd.Args[2] != "--rig" || bd.Args[3] != "alpha" || bd.Args[4] != "bd" || bd.Args[5] != "create" {
+		t.Errorf("first call should be `gc bd create`; got %+v", bd)
 	}
 	titleSeen := false
 	for _, a := range bd.Args {
@@ -753,7 +762,7 @@ func TestSlackInteractionsRigViewSubmissionRigUnmappedClearsModal(t *testing.T) 
 }
 
 // TestSlackInteractionsRigViewSubmissionGcFailureClosesBead — gc sling
-// fails post-bd-create; the dispatcher invokes bd close
+// fails post-bd-create; the dispatcher invokes gc bd close
 // -r dispatch_failed.
 func TestSlackInteractionsRigViewSubmissionGcFailureClosesBead(t *testing.T) {
 	cityPath := t.TempDir()
@@ -803,11 +812,13 @@ func TestSlackInteractionsRigViewSubmissionGcFailureClosesBead(t *testing.T) {
 		t.Fatal("dispatch goroutine did not finish")
 	}
 	if len(*records) < 3 {
-		t.Fatalf("want >=3 exec records (bd create, gc sling, bd close); got %+v", *records)
+		t.Fatalf("want >=3 exec records (gc bd create, gc sling, gc bd close); got %+v", *records)
 	}
 	last := (*records)[len(*records)-1]
-	if last.Name != "bd" || last.Args[0] != "close" || last.Args[1] != "bd-77" {
-		t.Errorf("expected `bd close bd-77 -r dispatch_failed`; got %+v", last)
+	if last.Name != "gc" || len(last.Args) < 7 || last.Args[0] != "--city" || last.Args[1] != cityPath ||
+		last.Args[2] != "--rig" || last.Args[3] != "alpha" || last.Args[4] != "bd" ||
+		last.Args[5] != "close" || last.Args[6] != "bd-77" {
+		t.Errorf("expected `gc bd close bd-77 -r dispatch_failed`; got %+v", last)
 	}
 }
 
@@ -941,8 +952,9 @@ func TestSlackInteractionsRigDispatchBlockActionsHappyPath(t *testing.T) {
 		t.Fatalf("expected >=2 exec calls; got %+v", *records)
 	}
 	bd := (*records)[0]
-	if bd.Name != "bd" || bd.Args[0] != "create" {
-		t.Errorf("first call should be `bd create`; got %+v", bd)
+	if bd.Name != "gc" || len(bd.Args) < 6 || bd.Args[0] != "--city" || bd.Args[1] != cityPath ||
+		bd.Args[2] != "--rig" || bd.Args[3] != "alpha" || bd.Args[4] != "bd" || bd.Args[5] != "create" {
+		t.Errorf("first call should be `gc bd create`; got %+v", bd)
 	}
 	titleSeen := false
 	for _, a := range bd.Args {

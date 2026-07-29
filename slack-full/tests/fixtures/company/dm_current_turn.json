@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "session": "ollie",
+  "receipt_id": "in-example-dm",
+  "team_id": "T0AAAAAAA",
+  "channel_id": "D0AAAAAAA",
+  "ts": "1700000000.000700",
+  "room": "",
+  "kind": "dm",
+  "thread_root_ts": "1700000000.000700",
+  "agent": "ollie",
+  "owner_app_id": "A0AAAAAA1",
+  "delivered_at": "2026-07-18T00:00:06Z"
+}

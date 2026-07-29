@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"sync/atomic"
@@ -20,9 +21,16 @@ var dispatchDroppedTotal atomic.Uint64
 // handleHealthz reports liveness plus the cumulative dropped-dispatch
 // count. The first line stays exactly "ok" so status-code and
 // grep-based checks keep working; the counter rides on a second line.
+// When a company gateway is wired (production main() only), its barrier
+// state, receipt-store write-failure counter, and snapshot state ride
+// on trailing lines — the sole status surface for the company path
+// (there is no separate gateway status payload; see company_delivery.go).
 func handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = fmt.Fprintf(w, "ok\ndispatch_dropped_total=%d\n", dispatchDroppedTotal.Load())
+	if gw := companyHealthStatus.Load(); gw != nil {
+		_, _ = io.WriteString(w, gw.healthzDetail())
+	}
 }
 
 // dispatchDropSummaryInterval paces the saturation roll-up log. One

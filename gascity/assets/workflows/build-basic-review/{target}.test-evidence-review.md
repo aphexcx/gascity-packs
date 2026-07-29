@@ -16,11 +16,11 @@ Close with `gc.outcome=pass`,
 Use explicit close metadata so the review loop can detect the lane result:
 
 ```bash
-bd update "$CLAIMED_BEAD_ID" \
+gc bd update "$CLAIMED_BEAD_ID" \
   --set-metadata 'gc.outcome=pass' \
   --set-metadata 'code_review.test_evidence_verdict=approve' \
   --set-metadata 'code_review.output_path=<test evidence report path>'
-bd close "$CLAIMED_BEAD_ID" --reason 'Build-basic test evidence review approved.'
+gc bd close "$CLAIMED_BEAD_ID" --reason 'Build-basic test evidence review approved.'
 ```
 
 If proof is missing or insufficient, set

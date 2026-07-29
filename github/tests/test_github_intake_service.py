@@ -885,8 +885,17 @@ GITHUB_INTAKE_APP_IDENTITY = "mayor"
         self.assertEqual(outcome["started"][0]["workflow_root_id"], "ga-root")
         commands = [call.args[0] for call in run_subprocess.call_args_list]
         self.assertEqual(
-            commands[2][:6],
-            ["gc", "--rig", "github-owner-repo", "bd", "create", "GitHub addressed message @mayor in owner/repo#42"],
+            commands[2][:8],
+            [
+                "gc",
+                "--city",
+                self.tempdir.name,
+                "--rig",
+                "github-owner-repo",
+                "bd",
+                "create",
+                "GitHub addressed message @mayor in owner/repo#42",
+            ],
         )
         create_metadata = json.loads(commands[2][commands[2].index("--metadata") + 1])
         self.assertEqual(create_metadata["addressed.city_source_bead_id"], "ga-src1")
@@ -911,9 +920,13 @@ GITHUB_INTAKE_APP_IDENTITY = "mayor"
         self.assertEqual(sling_vars["github_app_installation_id"], "profile-installation")
         self.assertEqual(sling_vars["github_app_identity"], "mayor")
         self.assertEqual(sling_vars["acknowledgement_requested"], "true")
-        self.assertEqual(commands[1][0:3], ["bd", "update", "ga-src1"])
-        self.assertEqual(commands[4][0:3], ["bd", "update", "ga-src1"])
-        self.assertEqual(commands[5], ["bd", "close", "ga-src1", "--reason", "github addressed message dispatched"])
+        city_prefix = ["gc", "--city", self.tempdir.name, "bd"]
+        self.assertEqual(commands[1][0:6], city_prefix + ["update", "ga-src1"])
+        self.assertEqual(commands[4][0:6], city_prefix + ["update", "ga-src1"])
+        self.assertEqual(
+            commands[5],
+            city_prefix + ["close", "ga-src1", "--reason", "github addressed message dispatched"],
+        )
 
     def test_route_addressed_source_marks_failed_when_post_sling_update_fails(self) -> None:
         source = {
@@ -969,7 +982,16 @@ GITHUB_INTAKE_APP_IDENTITY = "mayor"
         self.assertEqual(outcome["reason"], "already_dispatched_closed")
         self.assertEqual(outcome["workflow_root_id"], "ga-root")
         run_subprocess.assert_called_once_with(
-            ["bd", "close", "ga-src1", "--reason", "github addressed message dispatched"],
+            [
+                "gc",
+                "--city",
+                self.tempdir.name,
+                "bd",
+                "close",
+                "ga-src1",
+                "--reason",
+                "github addressed message dispatched",
+            ],
             self.tempdir.name,
         )
 
@@ -1249,9 +1271,12 @@ GITHUB_INTAKE_APP_IDENTITY = "mayor"
         self.assertEqual(outcome["bead_id"], "bd-1")
         self.assertTrue(outcome["bead_closed"])
         commands = [call.args[0] for call in run_subprocess.call_args_list]
-        self.assertEqual(commands[0], ["bd", "update", "bd-1", "--set-metadata", "close_reason=github:bead_update_failed"])
-        self.assertEqual(commands[1], ["bd", "close", "bd-1"])
-        self.assertNotIn("gc", [command[0] for command in commands])
+        prefix = ["gc", "--city", self.tempdir.name, "--rig", "product", "bd"]
+        self.assertEqual(
+            commands[0],
+            prefix + ["update", "bd-1", "--set-metadata", "close_reason=github:bead_update_failed"],
+        )
+        self.assertEqual(commands[1], prefix + ["close", "bd-1"])
 
     def test_run_fix_bugflow_dispatch_creates_source_and_routes_with_app_token(self) -> None:
         request = {
@@ -1388,8 +1413,12 @@ GITHUB_INTAKE_APP_IDENTITY = "mayor"
 
         self.assertTrue(closed)
         commands = [call.args[0] for call in run_subprocess.call_args_list]
-        self.assertEqual(commands[0], ["bd", "update", "bd-1", "--set-metadata", "close_reason=github:dispatch_failed"])
-        self.assertEqual(commands[1], ["bd", "close", "bd-1"])
+        prefix = ["gc", "--city", self.tempdir.name, "bd"]
+        self.assertEqual(
+            commands[0],
+            prefix + ["update", "bd-1", "--set-metadata", "close_reason=github:dispatch_failed"],
+        )
+        self.assertEqual(commands[1], prefix + ["close", "bd-1"])
 
     def test_process_request_releases_workflow_link_after_dispatch_failure_with_bead(self) -> None:
         request = {

@@ -1,0 +1,2 @@
+description = "Redrive failed or parked company-room receipt deliveries, reusing the recorded idempotency keys"
+run = "../company-redrive.sh"

@@ -130,10 +130,9 @@ for every derived pack.
   `{{report_path}}` without posting comments, pushing branches, or
   finalizing external state.
 - Prompt hygiene: all agent prompt templates under
-  `agents/*/prompt.template.md` include the shared `gc-role-worker` fragment,
-  which carries the Gas City claim protocol; every per-agent nested fragment
-  copy is identical to the pack-level
-  `superpowers/template-fragments/gc-role-worker.template.md`. Agent prompts
+  `agents/*/prompt.template.md` include the public `gc-role-worker` fragment
+  supplied by the `gc` import; Superpowers does not override that shared claim
+  protocol. Agent prompts
   and skill-adopting lane assets carry explicit "Do not invoke
   provider-native subagents, slash commands, task tools, or the upstream
   plugin runtime" guards. The skill texts under `skills/` are methodology
@@ -158,7 +157,7 @@ grep -n -E '^extends' superpowers/formulas/superpowers-planning.formula.toml sup
 grep -n -E '^id = |^needs = ' superpowers/formulas/superpowers-development.formula.toml superpowers/formulas/superpowers-development-item.formula.toml  # TDD sequence as durable steps
 grep -rn 'gc.run_target' superpowers/formulas/*.toml  # expect only superpowers.* agents, gc.run-operator, gc.task-decomposer, or {implementation_target}
 grep -rL 'gc-role-worker' superpowers/agents/*/prompt.template.md  # expect no output
-for f in superpowers/agents/*/template-fragments/gc-role-worker.template.md; do diff superpowers/template-fragments/gc-role-worker.template.md "$f"; done  # expect no output
+gc lint superpowers
 grep -rn 'provider-native' superpowers/agents superpowers/assets | wc -l  # expect >= 40
 grep -rho 'gc\.build\.[a-z_.]*' superpowers/assets superpowers/formulas | sort -u
 ls gascity/schemas/build

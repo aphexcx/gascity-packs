@@ -13,7 +13,7 @@ not restate it. The one thing the formula enforces is the hard STOP: push
 and PR open are caller actions gated on human review of the report.
 
 The molecule root bead IS the control bead — run state is recorded in its
-notes via `bd update <root-id> --notes "<key>: <value>"`. The skill's
+notes via `gc bd update <root-id> --notes "<key>: <value>"`. The skill's
 simplify and self-review stages CAN modify files; every other stage is
 read-only.
 
@@ -53,29 +53,29 @@ and prepare the report path. Pure mechanism — the staged review is the
 skill's job.
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
     echo "Not in a git repository — cannot fine-tune."
-    bd close "$ROOT_ID" --reason "not a git checkout"
+    gc bd close "$ROOT_ID" --reason "not a git checkout"
     exit 1
 }
 cd "$REPO_ROOT"
 BRANCH="{{branch}}"
 [ -z "$BRANCH" ] && BRANCH=$(git branch --show-current)
 if [ -z "$BRANCH" ] || [ "$BRANCH" = "HEAD" ]; then
-    bd close "$ROOT_ID" --reason "no branch resolved"
+    gc bd close "$ROOT_ID" --reason "no branch resolved"
     exit 1
 fi
 DEFAULT=$(git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p' || echo "main")
 if [ "$BRANCH" = "$DEFAULT" ] || [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
     echo "Cannot fine-tune from default branch ($BRANCH). Create a feature branch first."
-    bd close "$ROOT_ID" --reason "on default branch"
+    gc bd close "$ROOT_ID" --reason "on default branch"
     exit 1
 fi
 mkdir -p .gc/contributing/fine-tune
 SAFE=$(echo "$BRANCH" | tr '/' '_')
 REPORT_PATH=".gc/contributing/fine-tune/${SAFE}.md"
-bd update "$ROOT_ID" --notes "branch: $BRANCH
+gc bd update "$ROOT_ID" --notes "branch: $BRANCH
 report_path: $REPORT_PATH
 status: in_progress"
 ```
@@ -100,10 +100,10 @@ the skill's Stage 4 readiness report to `$REPORT_PATH`.
 Record the readiness verdict the skill produces:
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
 READINESS="<ready | blocked>"
 BLOCKERS="<one-line summary of what blocks, or 'none'>"
-bd update "$ROOT_ID" --notes "readiness: $READINESS
+gc bd update "$ROOT_ID" --notes "readiness: $READINESS
 blockers: $BLOCKERS
 status: report_written"
 ```
@@ -120,8 +120,8 @@ Display the report path and readiness verdict, then close the bead. The
 caller decides whether to push based on the report.
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
-NOTES=$(bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
+NOTES=$(gc bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""')
 REPORT_PATH=$(echo "$NOTES" | grep -m1 '^report_path:' | sed 's/^report_path: //')
 READINESS=$(echo "$NOTES" | grep -m1 '^readiness:' | sed 's/^readiness: //')
 cat <<EOF
@@ -130,8 +130,8 @@ cat <<EOF
 [contributing-fine-tune]   Path: $REPORT_PATH
 [contributing-fine-tune] STOP — push and PR open are the caller's call, not this formula's.
 EOF
-bd update "$ROOT_ID" --notes "status: complete"
-bd close "$ROOT_ID" --reason "contributor fine-tune report written: $REPORT_PATH"
+gc bd update "$ROOT_ID" --notes "status: complete"
+gc bd close "$ROOT_ID" --reason "contributor fine-tune report written: $REPORT_PATH"
 ```
 
 **Critical:** This formula MUST NOT run `git push` or `gh pr create` under

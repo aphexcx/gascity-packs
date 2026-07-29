@@ -8,7 +8,7 @@ Default fallback behavior must still enforce the worktree contract: resolve the
 source anchor from workflow metadata, read `work_dir` from that source anchor,
 and `cd "$WORKTREE"` before source reads, edits, tests, hashes, or commits.
 `gc.work_dir` is the launcher rig root, not the implementation worktree. When
-reading beads with `bd show --json`, handle both an object and a one-element
+reading beads with `gc bd show --json`, handle both an object and a one-element
 list before reading metadata.
 
 Write the per-item implementation summary as a `gc.build.implementation-summary.v1`

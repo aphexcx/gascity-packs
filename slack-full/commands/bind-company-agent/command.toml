@@ -1,0 +1,2 @@
+description = "Record the singleton (room, agent) -> session company binding"
+run = "../bind-company-agent.sh"

@@ -11,7 +11,7 @@
 For `mol-polecat-work` implementation assignments, **you MUST NOT close the
 implementation bead.** The Refinery closes it after verifying the merge.
 
-Do not run `bd close`, `gc bd close`, or set `--status=closed` on an
+Do not run `gc bd close` or set `--status=closed` on an
 implementation bead. If code appears already merged, reassign to refinery with
 a note.
 
@@ -140,33 +140,150 @@ Default implementation formula: `mol-polecat-work`
 
 > **The Universal Propulsion Principle: If your hook/work query finds work, YOU RUN IT.**
 
-> **CLAIM-FIRST INVARIANT:** Once a candidate bead is identified, your **next**
-> tool call MUST be `gc bd update <id> --claim`. Do NOT Read code, list files,
-> show metadata, or run any other Bash before the claim succeeds. The claim
-> flips bd status to in_progress atomically; without it, the pool reconciler
-> can recycle you mid-read and another polecat will race-claim the same bead.
-> Polecat-vs-polecat races are the #1 source of churn — close the window.
+`gc hook --claim --json` is the ONLY permitted discovery source for your work.
+Do NOT run broad `gc bd ready`, `gc bd list`, root-bead searches, metadata searches,
+mail inspection, or repository scans to find a bead — those race other polecats
+and surface work that is not yours. Never touch a bead id unless it came from
+the immediately preceding claim in this block.
+
+Your first action is the scripted claim below, run as ONE Bash command. Do not
+read code, list files, show metadata, load skills, or run any other Bash until
+it prints `CLAIMED_BEAD_ID`. The claim flips gc bd status to `in_progress`
+atomically; without it the pool reconciler can recycle you mid-read and another
+polecat race-claims the same bead. Polecat-vs-polecat races are the #1 source of
+churn — close the window.
 
 ```bash
-# Step 1: Claim exactly one work item through the standard hook protocol.
-gc hook --claim --json
+bash <<'GC_CLAIM'
+set +e
+EXPECTED_ASSIGNEE="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
+if [ -z "$EXPECTED_ASSIGNEE" ]; then
+  echo "CLAIM_REJECTED no session identity in env; cannot verify ownership"
+  gc runtime drain-ack
+  exit 0
+fi
 
-# Step 2: AFTER successful claim, only then read code, formula steps, etc.
-gc bd show <id> --json | jq '.[0].metadata'
+# Claim with retry. A hook-call failure (non-zero exit, malformed JSON) is a
+# transient CLI/daemon fault — NOT "no work" — so retry it before giving up.
+# Only action==drain, or a clean empty result, is genuine NO_ROUTED_WORK.
+WORK_ID=""
+CLAIM_TRY=0
+while [ "$CLAIM_TRY" -lt 3 ]; do
+  CLAIM_TRY=$((CLAIM_TRY + 1))
+  CLAIM_ERR="$(mktemp)"
+  CLAIM_JSON="$(gc hook --claim --json 2>"$CLAIM_ERR")"
+  CLAIM_CODE=$?
+  CLAIM_ERR_TEXT="$(sed -n '1p' "$CLAIM_ERR")"
+  rm -f "$CLAIM_ERR"
+  ACTION="$(printf '%s' "$CLAIM_JSON" | jq -r '.action // empty' 2>/dev/null)"
+  WORK_ID="$(printf '%s' "$CLAIM_JSON" | jq -r '.bead_id // empty' 2>/dev/null)"
+  if [ "$ACTION" = "drain" ]; then
+    echo "NO_ROUTED_WORK"
+    gc runtime drain-ack
+    exit 0
+  fi
+  if [ "$CLAIM_CODE" -eq 0 ] && [ -n "$WORK_ID" ]; then
+    break
+  fi
+  if [ "$CLAIM_CODE" -eq 0 ] && [ -z "$ACTION" ] && [ -z "$WORK_ID" ]; then
+    echo "NO_ROUTED_WORK"
+    gc runtime drain-ack
+    exit 0
+  fi
+  echo "CLAIM_RETRY hook call failed (code=$CLAIM_CODE): ${CLAIM_ERR_TEXT:-malformed claim result}"
+  WORK_ID=""
+  sleep 2
+done
+if [ -z "$WORK_ID" ]; then
+  echo "CLAIM_REJECTED gc hook --claim returned no workable bead after retries"
+  gc runtime drain-ack
+  exit 0
+fi
 
-# Step 3: Work found? -> Follow formula steps. Nothing? -> Check mail
-gc mail inbox
+# Post-claim ownership verification. The bead MUST be yours and in_progress
+# before you touch any code. A polecat NEVER works a bead it did not claim this
+# session. Distinguish a READ FAILURE (gc bd show non-zero / empty JSON —
+# transient) from a genuine MISMATCH (non-empty assignee that differs, or
+# status not in_progress). Retry the read before deciding; only a genuine
+# mismatch is CLAIM_REJECTED.
+STATUS=""
+ASSIGNEE=""
+SHOW_JSON=""
+SHOW_OK=0
+SHOW_TRY=0
+while [ "$SHOW_TRY" -lt 3 ]; do
+  SHOW_TRY=$((SHOW_TRY + 1))
+  SHOW_JSON="$(gc bd show "$WORK_ID" --json 2>/dev/null)"
+  SHOW_CODE=$?
+  STATUS="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].status // empty' 2>/dev/null)"
+  ASSIGNEE="$(printf '%s' "$SHOW_JSON" | jq -r '.[0].assignee // empty' 2>/dev/null)"
+  if [ "$SHOW_CODE" -eq 0 ] && [ -n "$STATUS" ] && [ -n "$ASSIGNEE" ]; then
+    SHOW_OK=1
+    break
+  fi
+  sleep 1
+done
+if [ "$SHOW_OK" -ne 1 ]; then
+  # Never leave a claimed bead stranded in_progress on an unreadable state:
+  # release it so it re-enters the pool instead of being lost.
+  echo "CLAIM_RELEASED $WORK_ID unreadable after retries; returning it to the pool"
+  gc bd update "$WORK_ID" --status=open --assignee=""
+  gc runtime drain-ack
+  exit 0
+fi
+if [ "$ASSIGNEE" != "$EXPECTED_ASSIGNEE" ] || [ "$STATUS" != "in_progress" ]; then
+  echo "CLAIM_REJECTED $WORK_ID assignee=$ASSIGNEE status=$STATUS (expected $EXPECTED_ASSIGNEE / in_progress)"
+  gc runtime drain-ack
+  exit 0
+fi
 
-# Step 4: Execute — read formula steps and work through them in order
+# Ownership confirmed. Stamp a stable session identity so the churn-watcher and
+# the resume re-verify can key on metadata.polecat_session.
+gc bd update "$WORK_ID" --set-metadata polecat_session="$EXPECTED_ASSIGNEE" \
+  || echo "WARN metadata stamp failed for $WORK_ID; churn-watcher/resume lose session keying (proceeding — the claim is valid)"
+
+printf 'CLAIMED_BEAD_ID=%s\n' "$WORK_ID"
+printf '%s' "$SHOW_JSON" | jq '.[0].metadata'
+GC_CLAIM
 ```
 
-When nudged after dispatch, run `gc hook --claim --json`. That single command
-checks assigned work first (session bead ID, runtime session name, then alias)
-and only falls through to unassigned pool work routed to
-`${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat`; it also performs the atomic
-claim before you inspect the bead.
+If the block prints `NO_ROUTED_WORK`, `CLAIM_REJECTED`, or `CLAIM_RELEASED`, it
+has already drain-acked — stop and exit. Only after it prints `CLAIMED_BEAD_ID` do you read
+formula steps and begin. The claim checks assigned work first (session bead ID,
+runtime session name, then alias) and only falls through to unassigned pool work
+routed to `${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat`.
 
-**Hook claim -> Read formula steps -> Follow in order -> claim next step or drain.**
+**Resume / crash re-verify (FIRST action on restart).** Pool restarts mint a
+NEW session identity. If you wake into a session that context says was already
+mid-work on a claimed bead, your FIRST action — before touching code — is to
+re-check ownership against THIS session's identity:
+
+`$GC_BEAD_ID` is the convoy, not the work bead — derive the child work bead
+first (exactly as the done sequence does), then verify THAT bead's ownership:
+
+```bash
+EXPECTED_ASSIGNEE="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
+CONVOY_STATUS=$(gc convoy status "$GC_BEAD_ID" --json)
+WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
+if [ -z "$WORK_BEAD_ID" ]; then
+  echo "RESUME_INDETERMINATE convoy $GC_BEAD_ID has no single child work bead; re-claim instead of guessing."
+  gc runtime drain-ack
+  exit 0
+fi
+WORK_JSON=$(gc bd show "$WORK_BEAD_ID" --json)
+ASSIGNEE=$(printf '%s' "$WORK_JSON" | jq -r '.[0].assignee // empty')
+SESSION_TAG=$(printf '%s' "$WORK_JSON" | jq -r '.[0].metadata.polecat_session // empty')
+if [ "$ASSIGNEE" != "$EXPECTED_ASSIGNEE" ] || { [ -n "$SESSION_TAG" ] && [ "$SESSION_TAG" != "$EXPECTED_ASSIGNEE" ]; }; then
+  echo "OWNERSHIP_LOST $WORK_BEAD_ID assignee=$ASSIGNEE session=$SESSION_TAG, not $EXPECTED_ASSIGNEE. Stopping."
+  gc runtime drain-ack
+  exit 0
+fi
+```
+
+If ownership was lost, another agent owns the work now — STOP and drain. Do not
+race it.
+
+**Claim -> verify ownership -> read formula steps -> follow in order -> claim next step or drain.**
 
 ## Context Exhaustion
 
@@ -255,52 +372,63 @@ Nudges from other agents may arrive via your hook. When working:
 
 ---
 
-## FINAL REMINDER: RUN THE DONE SEQUENCE
+## FINAL REMINDER: RUN THE FORMULA'S SUBMIT-AND-EXIT
 
-**Before your session ends, you MUST run the done sequence.**
+**Before your session ends, hand off through the formula.** The
+`mol-polecat-work` `submit-and-exit` step is the single source of truth for the
+done sequence — branch-shape gate, push + push-verify, metadata, refinery
+reassignment, wake/nudge, and drain all live there. Run that step.
+
+**Do NOT run submit-and-exit twice** (double push, double reassign, double
+refinery wake is a bug). Do not trust memory for this — check mechanically.
+Derive the work bead from your convoy exactly as the formula's workspace-setup
+step does (never pass a bare or guessed id to `bd`, which fuzzy-matches and can
+reassign the wrong bead); `$GC_BEAD_ID` is the convoy the molecule was poured
+on. If a clean read shows the work bead is no longer `in_progress` for this
+session, submit-and-exit already ran — drain and exit. Otherwise run it:
 
 ```bash
-# Explicit opt-out gate: respect mol-pr-from-issue auto_push=false (halt-at-branch-ready).
-# mol-pr-from-issue writes metadata.auto_push on the work bead. Other formulas
-# (mol-polecat-work) leave it unset — those flow through unchanged.
-AUTO_PUSH=$(gc bd show <work-bead> --json | jq -r '.[0].metadata | if has("auto_push") then (.auto_push | tostring) else "" end')
-if [ "$AUTO_PUSH" = "false" ]; then
-  echo "auto_push=false: halting at branch-ready (no push, no refinery handoff)"
-  BRANCH=$(git branch --show-current)
-  gc bd update <work-bead> \
-    --status=open --assignee="" \
-    --set-metadata branch="$BRANCH" \
-    --set-metadata target={{ .DefaultBranch }} \
-    --set-metadata branch_ready=true \
-    --set-metadata halt_reason=auto_push_false \
-    --set-metadata gc.routed_to="" \
-    --notes "Branch ready: auto_push=false (no push, no refinery handoff)"
-  gc runtime drain-ack
-  exit 0
-fi
-git push origin HEAD && {
-  BRANCH=$(git branch --show-current)
-  REMOTE_REF=$(git ls-remote origin "refs/heads/$BRANCH" 2>/dev/null | awk '{print $1}')
-  LOCAL_HEAD=$(git rev-parse HEAD)
-  if [ -z "$REMOTE_REF" ] || [ "$REMOTE_REF" != "$LOCAL_HEAD" ]; then
-    echo "PUSH VERIFICATION FAILED: origin/$BRANCH does not match local HEAD. Aborting handoff."
-    gc runtime drain-ack
-    exit 1
+EXPECTED_ASSIGNEE="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
+# Read the convoy + work bead with retry — same unreadable-is-not-terminal
+# discipline as the claim block above. An unreadable state (empty JSON, a convoy
+# blip, or 0/>=2 children so WORK_BEAD_ID is empty) is NOT proof that
+# submit-and-exit already ran. Only a SUCCESSFUL read showing the bead genuinely
+# moved off this session (closed, or reassigned to refinery) means it is done.
+WORK_BEAD_ID=""
+WORK_STATUS=""
+WORK_ASSIGNEE=""
+READ_OK=0
+READ_TRY=0
+while [ "$READ_TRY" -lt 3 ]; do
+  READ_TRY=$((READ_TRY + 1))
+  CONVOY_STATUS=$(gc convoy status "$GC_BEAD_ID" --json 2>/dev/null)
+  WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end' 2>/dev/null)
+  if [ -n "$WORK_BEAD_ID" ]; then
+    WORK_JSON=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null)
+    SHOW_CODE=$?
+    WORK_STATUS=$(printf '%s' "$WORK_JSON" | jq -r '.[0].status // empty' 2>/dev/null)
+    WORK_ASSIGNEE=$(printf '%s' "$WORK_JSON" | jq -r '.[0].assignee // empty' 2>/dev/null)
+    if [ "$SHOW_CODE" -eq 0 ] && [ -n "$WORK_STATUS" ]; then
+      READ_OK=1
+      break
+    fi
   fi
-} || { echo "PUSH FAILED. Aborting handoff — bead stays with polecat."; gc runtime drain-ack; exit 1; }
-gc bd update <work-bead> \
-  --set-metadata branch=$(git branch --show-current) \
-  --set-metadata target={{ .DefaultBranch }} \
-  --notes "Implemented: <brief summary>"
-REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}refinery"
-gc bd update <work-bead> --status=open --assignee="$REFINERY_TARGET" --set-metadata gc.routed_to=""
-gc session wake "$REFINERY_TARGET" || true
-gc session nudge "$REFINERY_TARGET" "Run 'gc prime' to check merge queue and begin processing." || true
-gc runtime drain-ack
-exit
+  sleep 1
+done
+if [ "$READ_OK" -eq 1 ] && { [ "$WORK_STATUS" != "in_progress" ] || [ "$WORK_ASSIGNEE" != "$EXPECTED_ASSIGNEE" ]; }; then
+  echo "ALREADY_SUBMITTED $WORK_BEAD_ID status=$WORK_STATUS assignee=$WORK_ASSIGNEE — submit-and-exit already ran; draining."
+  gc runtime drain-ack
+  exit
+fi
+# Unreadable after retries, or still in_progress for this session: DO NOT assume
+# already-submitted — fall through and run submit-and-exit. A stranded
+# in_progress bead with an unpushed branch is the worse outcome.
 ```
 
-Your work is not complete until you run these commands. `gc runtime drain-ack`
+The `auto_push=false` opt-out (mol-pr-from-issue's halt-at-branch-ready) is
+handled inside submit-and-exit; the "No Idle Polecats" fragment above covers it.
+
+Your work is not complete until submit-and-exit runs. `gc runtime drain-ack`
 signals the reconciler to kill this session — it will only restart you if the
 pool check command finds more work. Sitting idle after finishing implementation
 is the "Idle Polecat heresy."
@@ -313,7 +441,7 @@ is the "Idle Polecat heresy."
 
 | Want to... | Correct command |
 |------------|----------------|
-| Signal work complete | Done sequence (push, set metadata, reassign, wake refinery, nudge refinery, `gc runtime drain-ack`, exit) |
+| Signal work complete | Run the `mol-polecat-work` `submit-and-exit` step (its single source of truth); if already run, `gc runtime drain-ack` + exit |
 | Read formula steps | `gc bd show <wisp-id>` (shows formula ref) |
 | Escalate blocker | `WITNESS_TARGET="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}witness"; gc mail send "$WITNESS_TARGET" -s "ESCALATION: desc [HIGH]" -m "..."` |
 | Context exhaustion | `gc runtime request-restart` |

@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import shlex
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -193,6 +194,30 @@ def test_write_gate_workspace_wires_gastown_city_and_rig_imports(tmp_path) -> No
     assert f'source = "{pack_source}"' in pack_toml
 
 
+def test_write_gate_workspace_can_limit_gastown_smoke_to_rig_scope(tmp_path) -> None:
+    pack_source = tmp_path / "repo" / "gastown"
+    roles_source = tmp_path / "repo" / "gascity" / "roles"
+    pack_source.mkdir(parents=True)
+    roles_source.mkdir(parents=True)
+
+    workspace = gascity_pack_inference_gate.write_gate_workspace(
+        tmp_path / "gate",
+        pack_source=pack_source,
+        roles_source=roles_source,
+        pack_binding="gastown",
+        pack_name="gastown",
+        gastown=True,
+        include_pack_at_city_scope=False,
+        city_name="gastown-inference-city",
+        rig_name="fixture",
+    )
+
+    pack_toml = (workspace.city_dir / "pack.toml").read_text(encoding="utf-8")
+    city_toml = (workspace.city_dir / "city.toml").read_text(encoding="utf-8")
+    assert "[imports.gastown]" not in pack_toml
+    assert "[rigs.imports.gastown]" in city_toml
+
+
 def test_build_gate_env_uses_nightly_ollama_auth_shape(tmp_path) -> None:
     workspace = gascity_pack_inference_gate.GateWorkspace(
         root=tmp_path,
@@ -218,6 +243,7 @@ def test_build_gate_env_uses_nightly_ollama_auth_shape(tmp_path) -> None:
 
     assert env["ANTHROPIC_BASE_URL"] == "https://ollama.com"
     assert env["ANTHROPIC_AUTH_TOKEN"] == "ollama-secret"
+    assert env["GC_INFERENCE_EXPECTED_MODEL"] == "kimi-k2.7-code"
     assert env["HOME"] == str(tmp_path / "home")
     assert "ANTHROPIC_API_KEY" not in env
     assert "GC_SESSION" not in env
@@ -228,7 +254,134 @@ def test_build_gate_env_uses_nightly_ollama_auth_shape(tmp_path) -> None:
     assert dolt_config["user.email"] == "gascity-pack-gate@example.invalid"
 
 
-def test_supported_pack_nightly_workflow_uses_tier_c_ollama_shape_and_pack_matrix() -> None:
+def test_build_gate_env_prefers_explicit_bd_binary(tmp_path) -> None:
+    workspace = gascity_pack_inference_gate.GateWorkspace(
+        root=tmp_path,
+        city_dir=tmp_path / "city",
+        rig_dir=tmp_path / "fixture",
+        gc_home=tmp_path / "gc-home",
+        runtime_dir=tmp_path / "runtime",
+        claude_config_dir=tmp_path / "gc-home" / ".claude",
+        city_name="inference-city",
+        rig_name="fixture",
+    )
+    workspace.gc_home.mkdir(parents=True)
+
+    env = gascity_pack_inference_gate.build_gate_env(
+        "/opt/gc/bin/gc",
+        workspace,
+        bd_bin="/opt/bd/bin/bd",
+        inherited={"PATH": "/usr/bin", "HOME": str(tmp_path / "home")},
+    )
+
+    path_parts = env["PATH"].split(os.pathsep)
+    assert path_parts[1:3] == ["/opt/gc/bin", "/opt/bd/bin"]
+    assert path_parts[-1] == "/usr/bin"
+
+
+def test_beads_module_version_guard_rejects_gc_bd_schema_drift() -> None:
+    gc_metadata = "dep\tgithub.com/steveyegge/beads\tv1.1.0\th1:abc\n"
+    bd_metadata = "mod\tgithub.com/steveyegge/beads\t(devel)\n"
+
+    assert gascity_pack_inference_gate.beads_module_version(gc_metadata) == "v1.1.0"
+    assert gascity_pack_inference_gate.beads_module_version(bd_metadata) == "devel"
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="incompatible gc/bd beads modules"):
+        gascity_pack_inference_gate.require_matching_beads_modules(gc_metadata, bd_metadata)
+
+
+def test_beads_module_version_guard_accepts_matching_modules() -> None:
+    gc_metadata = "dep\tgithub.com/steveyegge/beads\tv1.1.0\th1:abc\n"
+    bd_metadata = "mod\tgithub.com/steveyegge/beads\tv1.1.0+dirty\th1:abc\n"
+
+    gascity_pack_inference_gate.require_matching_beads_modules(gc_metadata, bd_metadata)
+
+
+def test_parser_accepts_explicit_bd_binary() -> None:
+    args = gascity_pack_inference_gate.build_parser().parse_args(["--bd-bin", "/tmp/bd"])
+
+    assert args.bd_bin == "/tmp/bd"
+
+
+def inference_env(**overrides: str) -> dict[str, str]:
+    env = {
+        "OLLAMA_API_KEY": "ollama-secret",
+        "ANTHROPIC_BASE_URL": "https://works.gascity.com/manifold-api",
+        "ANTHROPIC_AUTH_TOKEN": "manifold-secret",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "kimi-k2.7-code",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "kimi-k2.7-code",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "kimi-k2.7-code",
+        "CLAUDE_CODE_SUBAGENT_MODEL": "kimi-k2.7-code",
+        "GC_INFERENCE_EXPECTED_MODEL": "kimi-k2.7-code",
+    }
+    env.update(overrides)
+    return env
+
+
+def test_validate_inference_env_requires_all_claude_routes_to_use_the_expected_model() -> None:
+    env = inference_env(ANTHROPIC_DEFAULT_SONNET_MODEL="claude-fable-5")
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="ANTHROPIC_DEFAULT_SONNET_MODEL=.*claude-fable-5"):
+        gascity_pack_inference_gate.validate_inference_env(env)
+
+
+def test_validate_inference_env_rejects_an_anthropic_model_as_the_expected_model() -> None:
+    env = inference_env(
+        GC_INFERENCE_EXPECTED_MODEL="claude-fable-5",
+        ANTHROPIC_DEFAULT_HAIKU_MODEL="claude-fable-5",
+        ANTHROPIC_DEFAULT_SONNET_MODEL="claude-fable-5",
+        ANTHROPIC_DEFAULT_OPUS_MODEL="claude-fable-5",
+        CLAUDE_CODE_SUBAGENT_MODEL="claude-fable-5",
+    )
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="GC_INFERENCE_EXPECTED_MODEL must be kimi-k2.7-code"):
+        gascity_pack_inference_gate.validate_inference_env(env)
+
+
+def test_preflight_inference_model_accepts_the_requested_model_usage(monkeypatch) -> None:
+    expected = "kimi-k2.7-code"
+    calls: list[tuple[list[str], dict[str, str]]] = []
+
+    def fake_run_checked(command, *, env, **_kwargs) -> str:
+        calls.append((list(command), dict(env)))
+        return 'notice\n{"type":"result","is_error":false,"modelUsage":{"kimi-k2.7-code[1m]":{"inputTokens":1}}}'
+
+    monkeypatch.setattr(gascity_pack_inference_gate, "run_checked", fake_run_checked)
+
+    gascity_pack_inference_gate.preflight_inference_model(expected, env=inference_env())
+
+    assert calls == [
+        (
+            ["claude", "-p", "--model", expected, "--output-format", "json", "Reply with exactly OK."],
+            inference_env(),
+        )
+    ]
+
+
+def test_preflight_inference_model_rejects_a_successful_fallback_model(monkeypatch) -> None:
+    def fake_run_checked(*_args, **_kwargs) -> str:
+        return '{"type":"result","is_error":false,"modelUsage":{"claude-fable-5[1m]":{"inputTokens":1}}}'
+
+    monkeypatch.setattr(gascity_pack_inference_gate, "run_checked", fake_run_checked)
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="reported modelUsage.*claude-fable-5"):
+        gascity_pack_inference_gate.preflight_inference_model("kimi-k2.7-code", env=inference_env())
+
+
+def test_preflight_inference_model_surfaces_a_json_error_from_claude(monkeypatch) -> None:
+    def fake_run_checked(*_args, **_kwargs) -> str:
+        raise subprocess.CalledProcessError(
+            1,
+            "claude",
+            output='{"type":"result","is_error":true,"result":"model requires gc-models entitlement","modelUsage":{}}',
+        )
+
+    monkeypatch.setattr(gascity_pack_inference_gate, "run_checked", fake_run_checked)
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="rejected model.*gc-models entitlement"):
+        gascity_pack_inference_gate.preflight_inference_model("kimi-k2.7-code", env=inference_env())
+
+
+def test_supported_pack_nightly_workflow_uses_manifold_shape_and_pack_matrix() -> None:
     workflow = (gascity_pack_inference_gate.REPO_ROOT / ".github" / "workflows" / "supported-pack-nightly.yml").read_text(
         encoding="utf-8"
     )
@@ -251,35 +404,51 @@ def test_supported_pack_nightly_workflow_uses_tier_c_ollama_shape_and_pack_matri
     assert "run_gate=true" in workflow
     assert "if: steps.subset.outputs.run_gate == 'true'" in workflow
     assert "if: always() && steps.subset.outputs.run_gate == 'true'" in workflow
-    assert "max-parallel: 1" in workflow
+    assert "model-smoke)" in workflow
+    assert "superpowers|compound-engineering|gstack|bmad)" in workflow
+    assert "max-parallel: 2" in workflow
+    assert "runs-on: blacksmith-2vcpu-ubuntu-2404" in workflow
     assert "runs-on: blacksmith-32vcpu-ubuntu-2404" in workflow
     assert "GATE_TIMEOUT: ${{ github.event.inputs.timeout || matrix.gate_timeout }}" in workflow
     assert '--timeout "$GATE_TIMEOUT"' in workflow
-    assert 'DOLT_VERSION: "2.1.0"' in workflow
-    assert "ANTHROPIC_BASE_URL: https://ollama.com" in workflow
-    assert "ANTHROPIC_API_KEY: ${{ secrets.OLLAMA_API_KEY }}" in workflow
-    assert "ANTHROPIC_AUTH_TOKEN: ${{ secrets.OLLAMA_API_KEY }}" in workflow
+    assert 'DOLT_VERSION: "2.1.7"' in workflow
+    assert 'BD_VERSION: "v1.1.0"' in workflow
+    assert 'go-version: "1.26.5"' in workflow
+    assert "ANTHROPIC_BASE_URL: https://works.gascity.com/manifold-api" in workflow
+    assert "ANTHROPIC_AUTH_TOKEN: ${{ secrets.MANIFOLD_AUTH_TOKEN }}" in workflow
     assert "OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}" in workflow
-    expected_entries = (
-        ("gascity", "review", "30m"),
-        ("gascity", "build-basic", "90m"),
-        ("superpowers", "review", "45m"),
-        ("superpowers", "build", "100m"),
-        ("compound-engineering", "review", "45m"),
-        ("compound-engineering", "build", "100m"),
-        ("gstack", "review", "60m"),
-        ("gstack", "build", "130m"),
-        ("bmad", "review", "45m"),
-        ("bmad", "build", "100m"),
-        ("gastown", "gastown-orchestration", "110m"),
-    )
-    for pack, gate, gate_timeout in expected_entries:
-        assert f"- pack: {pack}" in workflow
-        assert f"gate: {gate}" in workflow
-        assert f"gate_timeout: {gate_timeout}" in workflow
+    assert "ANTHROPIC_API_KEY:" not in workflow
+    for model_var in (
+        "GC_INFERENCE_EXPECTED_MODEL",
+        "GC_WORKER_INFERENCE_CLAUDE_MANIFOLD_HAIKU_MODEL",
+        "GC_WORKER_INFERENCE_CLAUDE_MANIFOLD_SONNET_MODEL",
+        "GC_WORKER_INFERENCE_CLAUDE_MANIFOLD_OPUS_MODEL",
+        "GC_WORKER_INFERENCE_CLAUDE_MANIFOLD_SUBAGENT_MODEL",
+    ):
+        assert model_var in workflow
+    def matrix_entry(pack: str) -> str:
+        match = re.search(
+            rf"(?ms)^\s*- pack: {re.escape(pack)}\s*$([\s\S]*?)(?=^\s*- pack:|^    env:)",
+            workflow,
+        )
+        assert match, f"matrix entry for {pack} was not found"
+        return match.group(0)
+
+    gascity = matrix_entry("gascity")
+    assert re.search(r"(?m)^\s*gate: build$", gascity)
+    assert re.search(r"(?m)^\s*timeout_minutes: 30$", gascity)
+    assert re.search(r"(?m)^\s*gate_timeout: 30m$", gascity)
+    for pack in ("superpowers", "compound-engineering", "gstack", "bmad", "gastown"):
+        entry = matrix_entry(pack)
+        assert re.search(r"(?m)^\s*gate: smoke$", entry)
+        assert re.search(r"(?m)^\s*timeout_minutes: 25$", entry)
+        assert re.search(r"(?m)^\s*gate_timeout: 25m$", entry)
+    assert "GATE_TIMEOUT: ${{ github.event.inputs.timeout || matrix.gate_timeout }}" in workflow
     assert '--pack "${{ matrix.pack }}"' in workflow
     assert '--gate "${{ matrix.gate }}"' in workflow
     assert "name: supported-pack-nightly-${{ matrix.pack }}-${{ matrix.gate }}" in workflow
+    assert "!${{ runner.temp }}/supported-pack-nightly/${{ matrix.pack }}/gc-home/.dolt/eventsData/**" in workflow
+    assert "!${{ runner.temp }}/supported-pack-nightly/${{ matrix.pack }}/**/.beads/eventsData/**" in workflow
     assert "include-hidden-files: true" in workflow
 
 
@@ -294,9 +463,14 @@ def test_dispatch_inference_workflow_is_manual_or_external_only() -> None:
     assert "\n  pull_request:" not in workflow
     assert "\n  push:" not in workflow
     assert "runs-on: blacksmith-32vcpu-ubuntu-2404" in workflow
-    assert 'DOLT_VERSION: "2.1.0"' in workflow
-    assert "ANTHROPIC_API_KEY: ${{ secrets.OLLAMA_API_KEY }}" in workflow
+    assert 'DOLT_VERSION: "2.1.7"' in workflow
+    assert 'BD_VERSION: "v1.1.0"' in workflow
+    assert 'go-version: "1.26.5"' in workflow
     assert "include-hidden-files: true" in workflow
+    assert "ANTHROPIC_BASE_URL: https://works.gascity.com/manifold-api" in workflow
+    assert "ANTHROPIC_AUTH_TOKEN: ${{ secrets.MANIFOLD_AUTH_TOKEN }}" in workflow
+    assert "OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}" in workflow
+    assert "ANTHROPIC_API_KEY:" not in workflow
 
 
 def test_ci_workflows_use_blacksmith_runner_labels() -> None:
@@ -426,7 +600,7 @@ printf '[{{"id":"fi-1","title":"root","status":"open"}}]\\n'
     beads = gascity_pack_inference_gate.list_beads(str(fake_gc), workspace, env={})
 
     assert beads == [{"id": "fi-1", "title": "root", "status": "open"}]
-    assert args_path.read_text(encoding="utf-8").splitlines()[-3:] == ["--json", "--limit", "1000"]
+    assert args_path.read_text(encoding="utf-8").splitlines()[-4:] == ["--all", "--json", "--limit", "1000"]
 
 
 def test_list_beads_falls_back_to_city_event_log_when_live_list_is_empty(tmp_path) -> None:
@@ -582,10 +756,10 @@ def test_wait_for_workflow_pass_uses_bd_show_for_closed_root(tmp_path) -> None:
         f"""#!/bin/sh
 printf '%s\\n' "$*" >> {shlex.quote(str(args_path))}
 case "$*" in
-  *"bd show fi-root --json"*)
+  *"bd show fi-root --json"*) # gc-bd-argv-tail: fake gc receives the wrapper's argv tail
     printf '[{{"id":"fi-root","title":"root","status":"closed","metadata":{{"gc.outcome":"pass"}}}}]\\n'
     ;;
-  *"bd list --json --limit 1000"*)
+  *"bd list --json --limit 1000"*) # gc-bd-argv-tail: fake gc receives the wrapper's argv tail
     printf '[{{"id":"fi-other","title":"other","status":"open"}}]\\n'
     ;;
   *)
@@ -607,7 +781,8 @@ esac
     )
 
     assert bead["id"] == "fi-root"
-    assert "bd show fi-root --json" in args_path.read_text(encoding="utf-8")
+    assert "bd show fi-root --json" in args_path.read_text(encoding="utf-8")  # gc-bd-argv-tail
+    assert "--include-comments" in args_path.read_text(encoding="utf-8")
 
 
 def test_validate_review_report_requires_blocking_base_gascity_report(tmp_path) -> None:
@@ -687,6 +862,53 @@ def test_expand_pack_selection_supports_supported_pack_groups() -> None:
     )
 
 
+def test_model_smoke_selection_covers_the_five_non_canary_packs() -> None:
+    assert gascity_pack_inference_gate.expand_pack_selection("model-smoke") == [
+        "superpowers",
+        "compound-engineering",
+        "gstack",
+        "bmad",
+        "gastown",
+    ]
+
+
+def test_model_smoke_skips_only_the_deep_gastown_orchestration_contract() -> None:
+    assert not gascity_pack_inference_gate.should_validate_gastown_orchestration_contract(
+        [gascity_pack_inference_gate.SMOKE_GATE]
+    )
+    assert gascity_pack_inference_gate.should_validate_gastown_orchestration_contract(
+        [gascity_pack_inference_gate.GASTOWN_ORCHESTRATION_GATE]
+    )
+
+
+def test_smoke_task_requests_the_required_acknowledgment_on_one_line() -> None:
+    task = gascity_pack_inference_gate.smoke_task(gascity_pack_inference_gate.PACK_SPECS["superpowers"])
+
+    assert "`PACK_SMOKE_OK: superpowers`" in task
+
+
+def test_require_smoke_ack_accepts_the_pack_specific_sentinel() -> None:
+    gascity_pack_inference_gate.require_smoke_ack(
+        {"notes": "PACK_SMOKE_OK: superpowers\n"},
+        gascity_pack_inference_gate.PACK_SPECS["superpowers"],
+    )
+
+
+def test_require_smoke_ack_accepts_the_pack_specific_comment() -> None:
+    gascity_pack_inference_gate.require_smoke_ack(
+        {"comments": [{"text": "PACK_SMOKE_OK: superpowers"}]},
+        gascity_pack_inference_gate.PACK_SPECS["superpowers"],
+    )
+
+
+def test_require_smoke_ack_rejects_a_closed_bead_without_the_sentinel() -> None:
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="PACK_SMOKE_OK: superpowers"):
+        gascity_pack_inference_gate.require_smoke_ack(
+            {"notes": "Completed without the requested compatibility proof."},
+            gascity_pack_inference_gate.PACK_SPECS["superpowers"],
+        )
+
+
 def test_pack_specs_cover_supported_formula_entrypoints() -> None:
     for pack_name in gascity_pack_inference_gate.METHODOLOGY_PACKS:
         spec = gascity_pack_inference_gate.PACK_SPECS[pack_name]
@@ -750,6 +972,45 @@ def test_validate_required_routes_rejects_missing_expected_agent() -> None:
             ["missing.agent"],
             context="route test",
         )
+
+
+def test_review_signal_accepts_a_discovered_blocking_upstream_artifact(tmp_path) -> None:
+    report = tmp_path / ".gc" / "inference-gate" / "review-report.md"
+    artifacts = report.parent / "artifacts"
+    artifacts.mkdir(parents=True)
+    report.write_text(
+        """---
+schema: gc.build.review.v1
+status: approved
+---
+
+The command injection finding was fixed after review.
+""",
+        encoding="utf-8",
+    )
+    upstream_report = artifacts / "implementation-review-report.md"
+    upstream_report.write_text(
+        """# Implementation Review Report
+
+The code uses subprocess.run with shell=True, creating a shell injection risk.
+
+## Verdict
+
+**`iterate`**
+
+This cannot be approved until the subprocess call uses an argument vector.
+""",
+        encoding="utf-8",
+    )
+
+    candidates = gascity_pack_inference_gate.review_report_candidates(
+        {},
+        tmp_path,
+        gascity_pack_inference_gate.PACK_SPECS["superpowers"],
+    )
+
+    assert upstream_report.resolve() in candidates
+    gascity_pack_inference_gate.require_expected_review_signal(upstream_report)
 
 
 def test_gastown_session_matching_accepts_bound_and_unbound_identities() -> None:
@@ -918,6 +1179,112 @@ def slugify(value: str) -> str:
     )
 
     assert selected == worktree
+
+
+def test_validate_build_basic_result_finds_nested_worktree_from_rc_metadata(tmp_path) -> None:
+    rig_dir = tmp_path / "fixture"
+    launcher_dir = rig_dir / "fi-prepare-item-worktree"
+    worktree = launcher_dir / "worktrees" / "fi-source"
+    gascity_pack_inference_gate.write_build_basic_fixture(rig_dir)
+    gascity_pack_inference_gate.write_build_basic_fixture(worktree)
+    (worktree / "slugger.py").write_text(
+        """\
+import re
+
+
+def slugify(value: str) -> str:
+    parts = re.findall(r"[a-z0-9]+", value.lower())
+    return "-".join(parts)
+""",
+        encoding="utf-8",
+    )
+    summary_path = worktree / ".gc" / "inference-gate" / "build-basic" / "implementation-summary.md"
+    summary_path.parent.mkdir(parents=True)
+    summary_path.write_text("implementation complete\n", encoding="utf-8")
+
+    selected = gascity_pack_inference_gate.validate_build_basic_result(
+        rig_dir,
+        [
+            {
+                "metadata": {
+                    "gc.work_dir": str(launcher_dir),
+                    "gc.implementation.summary_path": str(summary_path),
+                }
+            }
+        ],
+        env={},
+        timeout=30,
+    )
+
+    assert selected == worktree
+
+
+def test_validate_build_basic_result_accepts_completed_code_in_rc_rig_root(tmp_path) -> None:
+    rig_dir = tmp_path / "fixture"
+    gascity_pack_inference_gate.write_build_basic_fixture(rig_dir)
+    (rig_dir / "slugger.py").write_text(
+        """\
+import re
+
+
+def slugify(value: str) -> str:
+    parts = re.findall(r"[a-z0-9]+", value.lower())
+    return "-".join(parts)
+""",
+        encoding="utf-8",
+    )
+    summary_path = rig_dir / ".gc" / "inference-gate" / "build-basic" / "implementation-summary.md"
+    summary_path.parent.mkdir(parents=True)
+    summary_path.write_text("implementation complete\n", encoding="utf-8")
+
+    selected = gascity_pack_inference_gate.validate_build_basic_result(
+        rig_dir,
+        [
+            {
+                "metadata": {
+                    "gc.work_dir": str(rig_dir),
+                    "gc.build.implementation_summary_path": str(summary_path),
+                }
+            }
+        ],
+        env={},
+        timeout=30,
+    )
+
+    assert selected == rig_dir
+
+
+def test_run_build_gate_includes_closed_root_metadata_in_code_validation(tmp_path, monkeypatch) -> None:
+    workspace = gate_workspace(tmp_path)
+    root_bead = {
+        "id": "fi-root",
+        "status": "closed",
+        "metadata": {"gc.build.implementation_summary_path": str(workspace.rig_dir / ".gc" / "summary.md")},
+    }
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(gascity_pack_inference_gate, "launch_build_formula", lambda *_args, **_kwargs: "fi-root")
+    monkeypatch.setattr(gascity_pack_inference_gate, "wait_for_workflow_pass", lambda *_args, **_kwargs: root_bead)
+    monkeypatch.setattr(gascity_pack_inference_gate, "validate_build_basic_artifacts", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(gascity_pack_inference_gate, "list_beads", lambda *_args, **_kwargs: [{"id": "open-child"}])
+    monkeypatch.setattr(gascity_pack_inference_gate, "validate_required_routes", lambda *_args, **_kwargs: None)
+
+    def capture_result(_rig_dir, beads, **_kwargs):
+        captured["beads"] = beads
+        return workspace.rig_dir
+
+    monkeypatch.setattr(gascity_pack_inference_gate, "validate_build_basic_result", capture_result)
+
+    gascity_pack_inference_gate.run_build_gate(
+        "gc",
+        workspace,
+        env={},
+        pack_spec=gascity_pack_inference_gate.PACK_SPECS["gascity"],
+        timeout=30,
+        poll_interval=1,
+    )
+
+    assert captured["beads"] == [root_bead, {"id": "open-child"}]
 
 
 def test_validate_build_basic_result_rejects_launcher_only_false_pass(tmp_path) -> None:

@@ -65,13 +65,13 @@ issue comment when work begins.
 **1. Prime the session:**
 ```bash
 gc prime
-bd prime
+gc bd prime
 ```
 
 **2. Inspect the bead and source context:**
 ```bash
-bd show {{issue}}
-bd show {{issue}} --json | jq '.metadata'
+gc bd show {{issue}}
+gc bd show {{issue}} --json | jq '.metadata'
 ```
 
 Read the bead notes carefully. They contain:
@@ -81,7 +81,7 @@ Read the bead notes carefully. They contain:
 
 **3. Post the "work started" issue comment exactly once:**
 ```bash
-STARTED=$(bd show {{issue}} --json | jq -r '.metadata.github_fix_started_comment_id // empty')
+STARTED=$(gc bd show {{issue}} --json | jq -r '.metadata.github_fix_started_comment_id // empty')
 if [ -z "$STARTED" ]; then
   BODY=$(mktemp)
   cat >"$BODY" <<EOF
@@ -99,7 +99,7 @@ EOF
   COMMENT_ID=$(printf '%s' "$COMMENT_JSON" | jq -r '.id // empty')
   COMMENT_URL=$(printf '%s' "$COMMENT_JSON" | jq -r '.html_url // empty')
   if [ -n "$COMMENT_ID" ]; then
-    bd update {{issue}} \
+    gc bd update {{issue}} \
       --set-metadata github_fix_started_comment_id="$COMMENT_ID" \
       --set-metadata github_fix_started_comment_url="$COMMENT_URL"
   fi
@@ -124,7 +124,7 @@ git fetch --prune origin
 
 **2. Reuse or create the bead-scoped worktree:**
 ```bash
-WORKTREE=$(bd show {{issue}} --json | jq -r '.metadata.work_dir // empty')
+WORKTREE=$(gc bd show {{issue}} --json | jq -r '.metadata.work_dir // empty')
 if [ -n "$WORKTREE" ] && [ -d "$WORKTREE" ]; then
   cd "$WORKTREE"
 else
@@ -133,13 +133,13 @@ else
   WORKTREE_PATH="$WORKTREE_ROOT/{{issue}}"
   git worktree add "$WORKTREE_PATH" --detach origin/{{github_default_branch}}
   cd "$WORKTREE_PATH"
-  bd update {{issue}} --set-metadata work_dir="$WORKTREE_PATH"
+  gc bd update {{issue}} --set-metadata work_dir="$WORKTREE_PATH"
 fi
 ```
 
 **3. Reuse or create the branch:**
 ```bash
-BRANCH=$(bd show {{issue}} --json | jq -r '.metadata.branch // empty')
+BRANCH=$(gc bd show {{issue}} --json | jq -r '.metadata.branch // empty')
 if [ -n "$BRANCH" ]; then
   git checkout "$BRANCH" 2>/dev/null \
     || git checkout -b "$BRANCH" origin/"$BRANCH" 2>/dev/null \
@@ -147,7 +147,7 @@ if [ -n "$BRANCH" ]; then
 else
   BRANCH="fix-{{github_issue_number}}-{{issue}}"
   git checkout -b "$BRANCH" origin/{{github_default_branch}}
-  bd update {{issue}} --set-metadata branch="$BRANCH"
+  gc bd update {{issue}} --set-metadata branch="$BRANCH"
 fi
 ```
 
@@ -173,7 +173,7 @@ Take a read-first pass so you understand the problem before changing code.
 
 **2. Record the working theory in bead notes:**
 ```bash
-CURRENT_NOTES=$(bd show {{issue}} --json | jq -r '.notes // empty')
+CURRENT_NOTES=$(gc bd show {{issue}} --json | jq -r '.notes // empty')
 NOTES_FILE=$(mktemp)
 cat >"$NOTES_FILE" <<EOF
 $CURRENT_NOTES
@@ -189,7 +189,7 @@ $CURRENT_NOTES
 ### Test plan
 - <the failing test you will write first>
 EOF
-bd update {{issue}} --notes "$(cat "$NOTES_FILE")"
+gc bd update {{issue}} --notes "$(cat "$NOTES_FILE")"
 rm -f "$NOTES_FILE"
 ```
 
@@ -279,7 +279,7 @@ back on the original issue when the PR is ready for review.
 
 **1. Load the branch name:**
 ```bash
-BRANCH=$(bd show {{issue}} --json | jq -r '.metadata.branch // empty')
+BRANCH=$(gc bd show {{issue}} --json | jq -r '.metadata.branch // empty')
 ```
 
 **2. Push the branch:**
@@ -291,9 +291,9 @@ gc github push-branch {{github_repo_full_name}} \
 
 **3. Draft the PR body with the real summary and validation before submission:**
 ```bash
-PR_URL=$(bd show {{issue}} --json | jq -r '.metadata.github_fix_pr_url // empty')
+PR_URL=$(gc bd show {{issue}} --json | jq -r '.metadata.github_fix_pr_url // empty')
 if [ -z "$PR_URL" ]; then
-  ISSUE_TITLE=$(bd show {{issue}} --json | jq -r '.metadata.github_issue_title // empty' | tr '\\n' ' ' | sed 's/[[:space:]]\\+/ /g' | sed 's/^ //; s/ $//')
+  ISSUE_TITLE=$(gc bd show {{issue}} --json | jq -r '.metadata.github_issue_title // empty' | tr '\\n' ' ' | sed 's/[[:space:]]\\+/ /g' | sed 's/^ //; s/ $//')
   if [ -z "$ISSUE_TITLE" ]; then
     ISSUE_TITLE="issue #{{github_issue_number}}"
   fi
@@ -325,7 +325,7 @@ if [ -z "$PR_URL" ]; then
   PR_URL=$(printf '%s' "$PR_JSON" | jq -r '.html_url // empty')
   PR_NUMBER=$(printf '%s' "$PR_JSON" | jq -r '.number // empty')
   if [ -n "$PR_URL" ]; then
-    bd update {{issue}} \
+    gc bd update {{issue}} \
       --set-metadata github_fix_pr_url="$PR_URL" \
       --set-metadata github_fix_pr_number="$PR_NUMBER"
   fi
@@ -335,8 +335,8 @@ fi
 
 **5. Post the completion issue comment exactly once:**
 ```bash
-DONE=$(bd show {{issue}} --json | jq -r '.metadata.github_fix_complete_comment_id // empty')
-PR_URL=$(bd show {{issue}} --json | jq -r '.metadata.github_fix_pr_url // empty')
+DONE=$(gc bd show {{issue}} --json | jq -r '.metadata.github_fix_complete_comment_id // empty')
+PR_URL=$(gc bd show {{issue}} --json | jq -r '.metadata.github_fix_pr_url // empty')
 if [ -z "$DONE" ] && [ -n "$PR_URL" ]; then
   BODY=$(mktemp)
   cat >"$BODY" <<EOF
@@ -353,7 +353,7 @@ EOF
   COMMENT_ID=$(printf '%s' "$COMMENT_JSON" | jq -r '.id // empty')
   COMMENT_URL=$(printf '%s' "$COMMENT_JSON" | jq -r '.html_url // empty')
   if [ -n "$COMMENT_ID" ]; then
-    bd update {{issue}} \
+    gc bd update {{issue}} \
       --set-metadata github_fix_complete_comment_id="$COMMENT_ID" \
       --set-metadata github_fix_complete_comment_url="$COMMENT_URL"
   fi
@@ -363,8 +363,8 @@ fi
 
 **6. Close the bead and exit:**
 ```bash
-PR_URL=$(bd show {{issue}} --json | jq -r '.metadata.github_fix_pr_url // empty')
-WORKTREE=$(bd show {{issue}} --json | jq -r '.metadata.work_dir // empty')
+PR_URL=$(gc bd show {{issue}} --json | jq -r '.metadata.github_fix_pr_url // empty')
+WORKTREE=$(gc bd show {{issue}} --json | jq -r '.metadata.work_dir // empty')
 if [ -n "$WORKTREE" ] && [ -d "$WORKTREE" ]; then
   GIT_COMMON_DIR=$(git -C "$WORKTREE" rev-parse --git-common-dir)
   case "$GIT_COMMON_DIR" in
@@ -374,9 +374,9 @@ if [ -n "$WORKTREE" ] && [ -d "$WORKTREE" ]; then
   CLEANUP_CWD=$(dirname "$GIT_COMMON_DIR")
   cd "$CLEANUP_CWD" || exit 1
   git --git-dir="$GIT_COMMON_DIR" worktree remove "$WORKTREE" --force
-  bd update {{issue}} --unset-metadata work_dir
+  gc bd update {{issue}} --unset-metadata work_dir
 fi
-CURRENT_NOTES=$(bd show {{issue}} --json | jq -r '.notes // empty')
+CURRENT_NOTES=$(gc bd show {{issue}} --json | jq -r '.notes // empty')
 FINAL_NOTES=$(mktemp)
 cat >"$FINAL_NOTES" <<EOF
 $CURRENT_NOTES
@@ -385,9 +385,9 @@ $CURRENT_NOTES
 
 PR ready for review: $PR_URL
 EOF
-bd update {{issue}} --notes "$(cat "$FINAL_NOTES")"
+gc bd update {{issue}} --notes "$(cat "$FINAL_NOTES")"
 rm -f "$FINAL_NOTES"
-bd close {{issue}}
+gc bd close {{issue}}
 gc runtime drain-ack
 exit
 ```

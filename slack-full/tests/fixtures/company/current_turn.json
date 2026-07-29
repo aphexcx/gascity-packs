@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "session": "riley-main",
+  "receipt_id": "in-example",
+  "team_id": "T0AAAAAAA",
+  "channel_id": "C0AAAAAAA",
+  "ts": "1700000000.000500",
+  "room": "orchestrator-team",
+  "kind": "peer_delegation",
+  "thread_root_ts": "1700000000.000100",
+  "agent": "riley",
+  "delegation_key": "dg-T0AAAAAAA-C0AAAAAAA-1700000000.000500-e1d8abe78d3f.json",
+  "delivered_at": "2026-07-17T12:00:06Z"
+}

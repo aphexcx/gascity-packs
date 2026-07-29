@@ -9,7 +9,7 @@ if [ -z "$BEAD_ID" ]; then
     exit 1
 fi
 
-BEAD_JSON=$(bd show "$BEAD_ID" --json 2>/dev/null)
+BEAD_JSON=$(gc bd show "$BEAD_ID" --json 2>/dev/null)
 ROOT_ID=$(printf '%s\n' "$BEAD_JSON" | jq -r 'if type == "array" then (.[0].metadata["gc.root_bead_id"] // "") else (.metadata["gc.root_bead_id"] // "") end')
 ATTEMPT=$(printf '%s\n' "$BEAD_JSON" | jq -r 'if type == "array" then (.[0].metadata["gc.attempt"] // "") else (.metadata["gc.attempt"] // "") end')
 SCOPE_REF=$(printf '%s\n' "$BEAD_JSON" | jq -r 'if type == "array" then (.[0].metadata["gc.scope_ref"] // .[0].metadata["gc.step_ref"] // "") else (.metadata["gc.scope_ref"] // .metadata["gc.step_ref"] // "") end')
@@ -20,7 +20,7 @@ if [ -z "$ROOT_ID" ]; then
 fi
 
 VERDICT=$(
-    bd list --all --metadata-field "gc.root_bead_id=$ROOT_ID" --json --limit=0 2>/dev/null |
+    gc bd list --all --metadata-field "gc.root_bead_id=$ROOT_ID" --json --limit=0 2>/dev/null |
         jq -r --arg root "$ROOT_ID" --arg attempt "$ATTEMPT" --arg scope "$SCOPE_REF" --arg step "$STEP_ID" '
             [
               .[]

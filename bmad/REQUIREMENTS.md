@@ -98,10 +98,9 @@ for every derived pack.
   `bmad-review` runs write the adapter-consumable report to `{{report_path}}`
   without posting comments, pushing branches, or finalizing external state.
 - Prompt hygiene: all agent prompt templates under
-  `agents/*/prompt.template.md` include the shared `gc-role-worker` fragment,
-  which carries the Gas City claim protocol; every per-agent nested fragment
-  copy is identical to the pack-level
-  `bmad/template-fragments/gc-role-worker.template.md`. Agent prompts and
+  `agents/*/prompt.template.md` include the public `gc-role-worker` fragment
+  supplied by the `gc` import; BMAD does not override that shared claim
+  protocol. Agent prompts and
   skill-adopting lane assets carry explicit "Do not invoke provider-native
   subagents, slash commands, task tools, or the upstream BMAD runtime"
   guards. The skill texts under `skills/` are methodology source material
@@ -125,7 +124,7 @@ grep -n -E '^extends' bmad/formulas/bmad-planning.formula.toml bmad/formulas/bma
 grep -n -E '^id = |needs = ' bmad/formulas/bmad-build.formula.toml  # implementation-readiness sits between decompose and both drains
 grep -rn 'gc.run_target' bmad/formulas/*.toml  # expect only bmad.* agents, gc.run-operator, or {implementation_target}
 grep -rL 'gc-role-worker' bmad/agents/*/prompt.template.md  # expect no output
-for f in bmad/agents/*/template-fragments/gc-role-worker.template.md; do diff bmad/template-fragments/gc-role-worker.template.md "$f"; done  # expect no output
+gc lint bmad
 grep -rn 'provider-native' bmad/agents bmad/assets | wc -l  # expect >= 30
 grep -rho 'gc\.build\.[a-z_.]*' bmad/assets bmad/formulas | sort -u
 ls gascity/schemas/build

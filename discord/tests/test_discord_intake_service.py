@@ -294,13 +294,19 @@ class DiscordIntakeServiceTests(unittest.TestCase):
         with mock.patch.object(
             service,
             "run_subprocess",
-            side_effect=service.DispatchSubprocessTimeout(["bd", "create"], service.DISPATCH_SUBPROCESS_TIMEOUT_SECONDS),
+            side_effect=service.DispatchSubprocessTimeout(
+                ["gc", "--city", self.tempdir.name, "--rig", "product", "bd", "create"],
+                service.DISPATCH_SUBPROCESS_TIMEOUT_SECONDS,
+            ),
         ):
             outcome = service.create_fix_bead(request, "product/polecat")
 
         self.assertEqual(outcome["status"], "dispatch_failed")
         self.assertEqual(outcome["reason"], "dispatch_timeout")
-        self.assertEqual(outcome["dispatch_command"], ["bd", "create"])
+        self.assertEqual(
+            outcome["dispatch_command"],
+            ["gc", "--city", self.tempdir.name, "--rig", "product", "bd", "create"],
+        )
 
     def test_run_fix_dispatch_returns_bead_init_failure_without_slinging(self) -> None:
         self.write_rig_route("product")
@@ -325,10 +331,13 @@ class DiscordIntakeServiceTests(unittest.TestCase):
         self.assertEqual(outcome["bead_id"], "bd-1")
         self.assertTrue(outcome["bead_closed"])
         commands = [call.args[0] for call in run_subprocess.call_args_list]
-        self.assertEqual(commands[0], ["bd", "update", "bd-1", "--set-metadata", "close_reason=discord:bead_update_failed"])
-        self.assertEqual(commands[1], ["bd", "ready", "bd-1"])
-        self.assertEqual(commands[2], ["bd", "close", "bd-1"])
-        self.assertNotIn("gc", [command[0] for command in commands])
+        prefix = ["gc", "--city", self.tempdir.name, "--rig", "product", "bd"]
+        self.assertEqual(
+            commands[0],
+            prefix + ["update", "bd-1", "--set-metadata", "close_reason=discord:bead_update_failed"],
+        )
+        self.assertEqual(commands[1], prefix + ["ready", "bd-1"])
+        self.assertEqual(commands[2], prefix + ["close", "bd-1"])
 
     def test_run_fix_dispatch_returns_dispatch_timeout_when_gc_sling_hangs(self) -> None:
         request = {

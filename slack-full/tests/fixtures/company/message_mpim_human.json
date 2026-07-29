@@ -1,0 +1,48 @@
+{
+ "token": "live",
+ "team_id": "T0ARJCFV8QL",
+ "api_app_id": "A0BHQ812PL7",
+ "type": "event_callback",
+ "event_id": "Ev0BJA11L8H0",
+ "event_time": 1784429861,
+ "event": {
+  "type": "message",
+  "user": "U0AS3U7JWCT",
+  "ts": "1784429861.697649",
+  "client_msg_id": "C19FD728-F14D-42BD-BDDE-5FD86A332952",
+  "text": "<@U0BJ2AA5GMT> <@U0BHZEU1VQT>  hey both of you",
+  "team": "T0ARJCFV8QL",
+  "blocks": [
+   {
+    "type": "rich_text",
+    "block_id": "LedP5",
+    "elements": [
+     {
+      "type": "rich_text_section",
+      "elements": [
+       {
+        "type": "user",
+        "user_id": "U0BJ2AA5GMT"
+       },
+       {
+        "type": "text",
+        "text": " "
+       },
+       {
+        "type": "user",
+        "user_id": "U0BHZEU1VQT"
+       },
+       {
+        "type": "text",
+        "text": "  hey both of you"
+       }
+      ]
+     }
+    ]
+   }
+  ],
+  "channel": "C0BJBGX9QHX",
+  "event_ts": "1784429861.697649",
+  "channel_type": "mpim"
+ }
+}
