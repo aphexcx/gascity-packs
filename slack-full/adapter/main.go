@@ -553,6 +553,13 @@ type config struct {
 	// resolution — raw ids pass through, keeping directly-constructed
 	// test configs network-inert.
 	userNames *userNameCache
+	// userAliases is the operator-curated slack-user-aliases.json view
+	// (outbound handle -> mention). Inbound resolution consults its
+	// inverse first (handleForUserID) so a curated identity renders as
+	// its gc handle without any Slack call (hq-uxln9). Shares the
+	// instance wired for handlePublish, so SIGHUP reloads propagate.
+	// nil-safe: nil skips the curated leg.
+	userAliases *userAliasMap
 }
 
 func loadConfig() (config, error) {
@@ -1237,6 +1244,11 @@ func main() {
 	}
 	log.Printf("user alias map: store=%s entries=%d (read-only; SIGHUP or restart to reload)",
 		cfg.userAliasStorePath, userAliases.Len())
+	// Inbound display-name resolution consults the curated map's inverse
+	// before users.info (hq-uxln9). Must be set on cfg before
+	// handleSlackEvents closes over the cfg value below; sharing the
+	// instance keeps SIGHUP reloads visible to inbound rendering.
+	cfg.userAliases = userAliases
 
 	channelMapReg, err := newChannelMappingRegistry(cfg.channelMappingPath)
 	if err != nil {
@@ -4390,6 +4402,14 @@ func dispatchToAliasedSession(cfg config, sessionID string, msg externalInboundM
 		}
 		attachmentsBlock = ab.String()
 	}
+	// The sender renders as "Display Name (U0…)" when the envelope carries
+	// a resolved name — the raw id stays alongside for audit and reply
+	// plumbing — and as the bare id when resolution failed or is disabled
+	// (Actor.DisplayName then equals the id or is empty). hq-uxln9.
+	sender := msg.Actor.ID
+	if msg.Actor.DisplayName != "" && msg.Actor.DisplayName != msg.Actor.ID {
+		sender = msg.Actor.DisplayName + " (" + msg.Actor.ID + ")"
+	}
 	body := fmt.Sprintf(
 		"<system-reminder>\n"+
 			"Slack address-by-handle: @%s addressed you from channel %s (Slack ts %s) by user %s.\n"+
@@ -4412,7 +4432,7 @@ func dispatchToAliasedSession(cfg config, sessionID string, msg externalInboundM
 		neutralizeMarkupBoundaries(handle),
 		neutralizeMarkupBoundaries(msg.Conversation.ConversationID),
 		neutralizeMarkupBoundaries(msg.ProviderMessageID),
-		neutralizeMarkupBoundaries(msg.Actor.ID),
+		neutralizeMarkupBoundaries(sender),
 		neutralizeMarkupBoundaries(msg.Text),
 		attachmentsBlock, // already per-field neutralized; pass raw
 		neutralizeMarkupBoundaries(msg.Conversation.ConversationID),

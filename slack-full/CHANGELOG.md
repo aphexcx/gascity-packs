@@ -68,7 +68,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in-memory TTL cache (1h success / 5m negative); any lookup failure
   falls back to the raw id (mention tokens are left verbatim, or use
   their `<@U…|label>` label when present). Requires the `users:read`
-  scope — without it, behavior is unchanged.
+  scope — without it, behavior is unchanged. The alias-dispatch
+  (`@handle:`) system-reminder's sender line renders the same way —
+  `by user Afik Cohen (U0…)` instead of the bare id. The
+  operator-curated `slack-user-aliases.json` map is consulted first
+  (inverse lookup, id → handle): a curated identity renders as its gc
+  handle with no Slack call at all, so locked-down workspaces missing
+  `users:read` still get names for the identities the operator cares
+  about.
 - Slack Events API redeliveries are now deduplicated on `event_id`
   with a 10-minute seen-set: Slack retries any delivery it considers
   unacknowledged and each retry re-forwarded the same message into the

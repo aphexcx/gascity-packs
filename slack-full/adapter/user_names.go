@@ -84,13 +84,23 @@ type slackUserInfoResp struct {
 	} `json:"user"`
 }
 
-// resolveUserDisplayName resolves a Slack user id to a human-readable name
-// via users.info. Successes are cached for userNameCacheTTL; failures fall
-// back to the raw id and are negative-cached for userNameFailureTTL. A nil
-// cfg.userNames disables resolution entirely (raw ids pass through) so
-// tests that build a bare config stay network-inert.
+// resolveUserDisplayName resolves a Slack user id to a human-readable name.
+// The operator-curated slack-user-aliases.json wins first (inverse lookup,
+// no Slack call — an id the operator bound to a gc handle always renders as
+// that handle, and locked-down workspaces without users:read still get
+// names for curated identities); otherwise users.info resolves it.
+// Successes are cached for userNameCacheTTL; failures fall back to the raw
+// id and are negative-cached for userNameFailureTTL. A nil cfg.userNames
+// disables the users.info leg entirely (raw ids pass through) so tests
+// that build a bare config stay network-inert.
 func resolveUserDisplayName(cfg config, userID string) string {
-	if userID == "" || cfg.userNames == nil || cfg.slackBotToken == "" {
+	if userID == "" {
+		return userID
+	}
+	if handle, ok := cfg.userAliases.handleForUserID(userID); ok {
+		return handle
+	}
+	if cfg.userNames == nil || cfg.slackBotToken == "" {
 		return userID
 	}
 	now := time.Now()

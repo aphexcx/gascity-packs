@@ -1163,6 +1163,47 @@ func TestDispatchToAliasedSession(t *testing.T) {
 			t.Errorf("body missing %q\n--- body ---\n%s", want, gotBody.Message)
 		}
 	}
+	// No DisplayName on the actor: the sender renders as the bare id
+	// (pre-hq-uxln9 shape preserved when resolution is off or failed).
+	if !strings.Contains(gotBody.Message, "by user U0B1N5KD6HF.") {
+		t.Errorf("body missing bare-id sender\n--- body ---\n%s", gotBody.Message)
+	}
+}
+
+// TestDispatchToAliasedSessionRendersResolvedSender: when the inbound
+// envelope carries a resolved Actor.DisplayName, the reminder's sender line
+// reads "Display Name (U0…)" — name for the human, id for audit/reply
+// plumbing (hq-uxln9).
+func TestDispatchToAliasedSessionRendersResolvedSender(t *testing.T) {
+	var gotBody gcSessionMessageRequest
+	gcStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	t.Cleanup(gcStub.Close)
+
+	cfg := config{gcAPIBase: gcStub.URL, cityName: "ds-research"}
+	inbound := externalInboundMessage{
+		ProviderMessageID: "1234.5678",
+		Conversation:      conversationRef{ConversationID: "C0B1NSK4N3T"},
+		Actor:             externalActor{ID: "U0B1N5KD6HF", DisplayName: "Afik Cohen"},
+		Text:              "ship it",
+	}
+	dispatchToAliasedSession(cfg, "gc-2568", inbound, "mayor")
+	if !strings.Contains(gotBody.Message, "by user Afik Cohen (U0B1N5KD6HF).") {
+		t.Errorf("body missing resolved sender\n--- body ---\n%s", gotBody.Message)
+	}
+
+	// DisplayName equal to the id (resolution fell back) must not
+	// duplicate the id.
+	inbound.Actor.DisplayName = "U0B1N5KD6HF"
+	dispatchToAliasedSession(cfg, "gc-2568", inbound, "mayor")
+	if !strings.Contains(gotBody.Message, "by user U0B1N5KD6HF.") {
+		t.Errorf("body missing bare-id sender for id-valued DisplayName\n--- body ---\n%s", gotBody.Message)
+	}
+	if strings.Contains(gotBody.Message, "U0B1N5KD6HF (U0B1N5KD6HF)") {
+		t.Errorf("id-valued DisplayName duplicated the id\n--- body ---\n%s", gotBody.Message)
+	}
 }
 
 // TestDispatchToAliasedSessionPostsWarningReactOnFailure verifies that when

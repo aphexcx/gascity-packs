@@ -169,3 +169,62 @@ func TestPreambleAuthorsResolve(t *testing.T) {
 		t.Errorf("preamble:\ngot:  %q\nwant: %q", got, want)
 	}
 }
+
+func TestResolveUserDisplayNameCuratedAliasWinsWithoutAPICall(t *testing.T) {
+	calls := withUsersInfoStub(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"user":{"profile":{"display_name":"Profile Name"}}}`))
+	})
+
+	cfg := config{
+		slackBotToken: "xoxb-test",
+		userNames:     newUserNameCache(),
+		userAliases: &userAliasMap{byHandle: map[string]string{
+			"mayor": "<@U0MAYOR001>",
+			"ops":   "<!subteam^S0OPS00001>",
+		}},
+	}
+	if got := resolveUserDisplayName(cfg, "U0MAYOR001"); got != "mayor" {
+		t.Fatalf("resolved = %q, want curated handle %q", got, "mayor")
+	}
+	if calls.Load() != 0 {
+		t.Errorf("users.info calls = %d, want 0 (curated alias short-circuits)", calls.Load())
+	}
+	// An uncurated id still resolves through users.info.
+	if got := resolveUserDisplayName(cfg, "U0OTHER001"); got != "Profile Name" {
+		t.Fatalf("uncurated resolve = %q, want users.info name", got)
+	}
+	if calls.Load() != 1 {
+		t.Errorf("users.info calls = %d, want 1", calls.Load())
+	}
+	// Curated leg works even without a token or cache (locked-down
+	// workspaces missing users:read).
+	tokenless := config{userAliases: cfg.userAliases}
+	if got := resolveUserDisplayName(tokenless, "U0MAYOR001"); got != "mayor" {
+		t.Fatalf("tokenless curated resolve = %q, want %q", got, "mayor")
+	}
+}
+
+func TestHandleForUserID(t *testing.T) {
+	m := &userAliasMap{byHandle: map[string]string{
+		"mayor":   "<@U0MAYOR001>",
+		"witness": "<@U0MAYOR001>",
+		"ops":     "<!subteam^S0OPS00001>",
+	}}
+	if h, ok := m.handleForUserID("U0MAYOR001"); !ok || h != "mayor" {
+		t.Fatalf("handleForUserID = %q,%v — want deterministic smallest handle %q", h, ok, "mayor")
+	}
+	if _, ok := m.handleForUserID("U0ABSENT01"); ok {
+		t.Error("absent id must not resolve")
+	}
+	if _, ok := m.handleForUserID("S0OPS00001"); ok {
+		t.Error("subteam target must not resolve as a user id")
+	}
+	if _, ok := m.handleForUserID(""); ok {
+		t.Error("empty id must not resolve")
+	}
+	var nilM *userAliasMap
+	if _, ok := nilM.handleForUserID("U0MAYOR001"); ok {
+		t.Error("nil map must not resolve")
+	}
+}
