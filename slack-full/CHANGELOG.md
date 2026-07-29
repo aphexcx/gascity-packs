@@ -59,6 +59,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Inbound messages now resolve Slack user ids to display names
+  (hq-uxln9, ported from slack-mini's hq-fh9 fix): the sender line in
+  gc's injected reminder shows a human name instead of a raw id like
+  `U0AN32RPBFT`, inline `<@U…>` mentions in forwarded body text are
+  rewritten to `@display-name`, and thread-context preamble author
+  lines resolve the same way. Backed by a users.info lookup with an
+  in-memory TTL cache (1h success / 5m negative); any lookup failure
+  falls back to the raw id (mention tokens are left verbatim, or use
+  their `<@U…|label>` label when present). Requires the `users:read`
+  scope — without it, behavior is unchanged.
 - Slack Events API redeliveries are now deduplicated on `event_id`
   with a 10-minute seen-set: Slack retries any delivery it considers
   unacknowledged and each retry re-forwarded the same message into the
