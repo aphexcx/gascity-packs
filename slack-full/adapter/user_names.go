@@ -161,6 +161,24 @@ func firstNonEmptyName(values ...string) string {
 // Enterprise Grid users.
 var slackUserMentionRE = regexp.MustCompile(`<@([UW][A-Z0-9]+)(?:\|([^>]*))?>`)
 
+// slackTextMentionsUser reports whether text carries an inline Slack
+// mention token for exactly userID — `<@U…>` or the labeled `<@U…|name>`
+// form, anywhere in the text. Token-boundary matching via
+// slackUserMentionRE: a plain substring check would false-positive on
+// ids sharing a prefix (U0AB matching inside <@U0ABC>). Backs the
+// busy-affordance bot-self-mention gate (gp-4vq).
+func slackTextMentionsUser(text, userID string) bool {
+	if userID == "" || !strings.Contains(text, "<@") {
+		return false
+	}
+	for _, m := range slackUserMentionRE.FindAllStringSubmatch(text, -1) {
+		if m[1] == userID {
+			return true
+		}
+	}
+	return false
+}
+
 // rewriteSlackUserMentions replaces inline `<@U…>` mention tokens in
 // forwarded text with `@<display name>` so bound sessions read names, not
 // ids (hq-uxln9). Resolution failures degrade gracefully: the mention's own

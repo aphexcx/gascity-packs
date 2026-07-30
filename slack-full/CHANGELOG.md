@@ -55,10 +55,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parsed from the message (`@handle:` prefix, User Group mention, or
   sticky thread handle) — plain messages that reach a session solely
   through a channel binding carry no parsed target and get no busy
-  reaction, by design. (hw-94w5k finding #3)
+  reaction, by design. (hw-94w5k finding #3) gp-4vq widens the gate to
+  @-mentions of the adapter's own bot user — see Fixed below.
 
 ### Fixed
 
+- The busy reaction now fires when a human @-mentions the adapter's
+  bot user (gp-4vq): live traffic showed the affordance never fired in
+  practice because nobody addresses agents with the `@handle:` prefix
+  syntax — real messages tag the bot with Slack's native `<@U…>`
+  mention, which parsed as no-target. A mention of the adapter's OWN
+  bot user id (read from the event envelope's `authorizations` block,
+  is_bot-gated; the `app_mention` event type is the fallback signal
+  when a delivery omits it) anywhere in the text now makes the inbound
+  busy-eligible. Routing is deliberately untouched: no `ExplicitTarget`
+  is fabricated (a synthetic target would read as "addressed to someone
+  else" to the channel-bound session and mute it) and no alias dispatch
+  fires. Slack delivers a bot mention twice — `message` + `app_mention`
+  events with distinct event_ids for one ts (hw-vzd5y edge case 2, now
+  with production evidence) — and both deliveries mark the same ts:
+  the registry's same-message merge keeps a single mark, the second
+  `reactions.add` is Slack's benign `already_reacted`, and the reply
+  removes the reaction exactly once. The inbound log line gains
+  `bot_mention=%t` for live verification. Binding-routed generic
+  messages (no tag at all) still get no busy reaction — gc-side
+  routing feedback for those is the tier-2 follow-up spec'd in
+  hw-94w5k notes.
 - Inbound messages now resolve Slack user ids to display names
   (hq-uxln9, ported from slack-mini's hq-fh9 fix): the sender line in
   gc's injected reminder shows a human name instead of a raw id like

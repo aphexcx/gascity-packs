@@ -1106,6 +1106,33 @@ type slackEventEnvelope struct {
 	// what the redelivery seen-set keys on (hw-94w5k finding #4).
 	EventID string          `json:"event_id,omitempty"`
 	Event   json.RawMessage `json:"event,omitempty"`
+	// Authorizations names the app installation this delivery is for.
+	// For a bot-token install the entry's user_id is the app's OWN bot
+	// user id — the `<@U…>` id Slack's @-autocomplete inserts when a
+	// human tags the bot — which lets processSlackEvent recognize a
+	// message tagging the bot without an auth.test round trip (gp-4vq).
+	Authorizations []slackEventAuthorization `json:"authorizations,omitempty"`
+}
+
+// slackEventAuthorization is one entry of an event envelope's
+// authorizations array.
+type slackEventAuthorization struct {
+	UserID string `json:"user_id,omitempty"`
+	IsBot  bool   `json:"is_bot,omitempty"`
+}
+
+// botUserID returns the adapter's own bot user id as carried in the
+// envelope's authorizations, or "" when the delivery names none. The
+// is_bot gate matters: a user-token install's authorization carries a
+// HUMAN user id, and matching mentions of that human would busy-mark
+// messages that never addressed the bot.
+func (env slackEventEnvelope) botUserID() string {
+	for _, a := range env.Authorizations {
+		if a.IsBot && a.UserID != "" {
+			return a.UserID
+		}
+	}
+	return ""
 }
 
 // slackFile is a subset of Slack's file object, just the fields we need
@@ -2922,18 +2949,49 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 		DedupKey:         "slack-" + msg.TS,
 		ReceivedAt:       time.Now().UTC(),
 	}
+	// gp-4vq: humans address agents in bound rooms by @-mentioning the
+	// adapter's bot user — the `@handle:` prefix syntax the parsers
+	// above recognize almost never occurs in real traffic, so gating
+	// the busy affordance on a parsed target alone left it effectively
+	// invisible (live repro: zero busy lines across a full evening of
+	// real mentions). A mention of the adapter's OWN bot user anywhere
+	// in the raw text makes the inbound busy-eligible WITHOUT
+	// fabricating a target: ExplicitTarget stays empty — a synthetic
+	// value would read as "addressed to someone else" to the
+	// channel-bound session and mute it — and no alias dispatch fires,
+	// so routing is untouched. The bot's user id comes from the
+	// envelope's authorizations block; when a delivery omits it, the
+	// app_mention event type is itself proof the bot was tagged.
+	// Detection runs on msg.Text, not the rewritten text — the
+	// hq-uxln9 mention rewrite above replaces `<@U…>` tokens with
+	// display names.
+	//
+	// Slack delivers a bot mention TWICE (message + app_mention,
+	// distinct event_ids, same ts — hw-vzd5y edge case 2, live repro
+	// in gp-4vq), so event_id dedup does not collapse the pair. Both
+	// deliveries compute the same verdict here and mark the same ts:
+	// markBoth's same-message branch MERGES (one registry entry, both
+	// addDone channels chained) rather than displacing, and the
+	// second reactions.add is Slack's benign already_reacted — no
+	// double-mark, no double-remove, no stranded emoji. Each delivery
+	// still fires its own add after its own successful forward, so
+	// one delivery failing cannot suppress the survivor's affordance.
+	botMentioned := msg.Type == "app_mention" ||
+		slackTextMentionsUser(msg.Text, env.botUserID())
+
 	// Busy-reaction lifecycle, mark registration (hq-xizo; replaces the
 	// earlier unconditional "eyes" reaction). The reaction signals to
 	// the human that an agent was explicitly addressed (via `@handle:`
-	// prefix or a Slack User Group mention resolved via subteamAliasMap)
+	// prefix, a Slack User Group mention resolved via subteamAliasMap,
+	// or an @-mention of the adapter's own bot user — gp-4vq)
 	// and is working on the message; handlePublish removes it when the
 	// agent's reply lands in the same conversation/thread — the
 	// channel-native replacement for Slack Assistant-mode
 	// assistant.threads.setStatus, which this adapter deliberately does
-	// not use. Only fires when a target was parsed — generic channel
-	// chatter that merely lands on the bound session via postInbound
-	// does NOT trigger it, because most channel messages aren't
-	// intentionally directed at an agent.
+	// not use. Only fires when a target was parsed or the bot itself
+	// was tagged — generic channel chatter that merely lands on the
+	// bound session via postInbound does NOT trigger it, because most
+	// channel messages aren't intentionally directed at an agent.
 	//
 	// The MARK is recorded BEFORE the forward (codex r4): gc can hand
 	// the inbound to the agent — and the agent can /publish a reply —
@@ -2948,7 +3006,7 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 	// failure). Best-effort: errors are logged and don't block the
 	// dispatch path. BUSY_REACTION= (set-but-empty) disables all of
 	// this — no reaction, no mark.
-	busyEligible := target != "" && cfg.slackBotToken != "" && cfg.busyReaction != ""
+	busyEligible := (target != "" || botMentioned) && cfg.slackBotToken != "" && cfg.busyReaction != ""
 	var busyAddDone chan struct{}
 	var busyDisplacedMarks []busyDisplaced
 	if busyEligible {
@@ -2979,8 +3037,8 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 		cfg.eventDedup.forget(env.EventID)
 		return
 	}
-	log.Printf("inbound: chan=%s user=%s ts=%s thread=%s target=%q files=%d spooled=%d text=%dch",
-		msg.Channel, msg.User, msg.TS, msg.ThreadTS, target, len(msg.Files), len(attachments), len(text))
+	log.Printf("inbound: chan=%s user=%s ts=%s thread=%s target=%q bot_mention=%t files=%d spooled=%d text=%dch",
+		msg.Channel, msg.User, msg.TS, msg.ThreadTS, target, botMentioned, len(msg.Files), len(attachments), len(text))
 
 	// Busy-reaction lifecycle, add side: fires once per inbound (the
 	// alias-dispatch fanout below targets the same Slack TS, so a
