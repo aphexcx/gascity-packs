@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/gastownhall/gascity-packs/board-watcher/schema/own_writes.schema.json",
+  "title": "board-watcher own-writes ledger entry",
+  "description": "One line of own-writes.jsonl — the interop contract between a city's board write path and its board-watcher. The write path appends one entry per own write, immediately after the write lands on the board; the watcher suppresses a settled change when (file, sha256) matches any entry. sha256 '-' is a deletion tombstone recording an own removal.",
+  "type": "object",
+  "required": ["schema", "file", "sha256", "ts"],
+  "properties": {
+    "schema": {
+      "const": 1,
+      "description": "Ledger entry schema version."
+    },
+    "file": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "maxLength": 255,
+      "description": "Board doc basename (no path separators; leading alphanumeric)."
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^([0-9a-f]{64}|-)$",
+      "description": "Lowercase hex sha256 of the written content, or '-' for a deletion tombstone."
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC RFC 3339 timestamp of when the write was recorded."
+    }
+  },
+  "additionalProperties": true
+}
