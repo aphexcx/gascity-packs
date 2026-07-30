@@ -16,6 +16,15 @@ Two routing paths are supported, mirroring ``slack_chat_reply_current``:
   diagnostics — when the gc API is down or you're testing the adapter
   in isolation.
 
+A third, bindingless mode mirrors ``slack_chat_publish_to_channel``:
+pass ``--conversation-id`` (plus optional ``--kind``) to skip the
+extmsg-binding lookup entirely and post the file straight to the
+adapter's ``/publish-file``. This is how sessions without a binding
+(mayor, chief-of-staff) attach files to a channel they were addressed
+from — the text-side equivalent is ``gc slack publish-to-channel``.
+Like that command, the bindingless path exits non-zero when the
+adapter receipt reports ``delivered=false``.
+
 Either path delegates to the adapter (``adapter/``, pack-relative),
 which handles Slack's three-step files-upload-v2 protocol
 (``files.getUploadURLExternal`` → ``PUT`` bytes →
@@ -70,6 +79,17 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--session", default="",
                         help="Session id whose binding to upload into. "
                              "Defaults to the current session ($GC_SESSION_ID).")
+    parser.add_argument("--conversation-id", default="",
+                        help="Explicit Slack channel id (C..., G..., or D...). "
+                             "Skips the extmsg-binding lookup and posts direct "
+                             "to the adapter (files-upload-v2), matching "
+                             "publish-to-channel. For sessions with no binding "
+                             "(mayor / chief-of-staff).")
+    parser.add_argument("--kind", default="",
+                        choices=("dm", "room", "thread"),
+                        help="Conversation kind for the conversation envelope "
+                             "when --conversation-id is used. Defaults to "
+                             "'room' (channels).")
     parser.add_argument("--filename", default="",
                         help="Override the displayed filename. Defaults to "
                              "basename(--file).")
@@ -87,14 +107,34 @@ def main(argv: list[str]) -> int:
                              "Mutually exclusive with --thread-ts.")
     parser.add_argument("--idempotency-key", default="",
                         help="Caller-supplied idempotency key for retries.")
-    parser.add_argument("--via", choices=("gc", "adapter"), default="gc",
+    parser.add_argument("--via", choices=("gc", "adapter"), default="",
                         help="Routing path. 'gc' (default) records the upload "
                              "in the transcript and fans out to peer sessions; "
-                             "'adapter' bypasses gc for diagnostics only.")
+                             "'adapter' bypasses gc for diagnostics only. "
+                             "--conversation-id implies 'adapter' (gc's "
+                             "outbound-file endpoint requires a binding).")
     args = parser.parse_args(argv)
 
     if args.thread_ts and args.thread_current:
         raise SystemExit("pass --thread-ts OR --thread-current, not both")
+
+    conversation_id = args.conversation_id.strip()
+    if args.kind and not conversation_id:
+        raise SystemExit(
+            "--kind only applies with --conversation-id; without it the "
+            "kind comes from the session's binding")
+    if conversation_id:
+        if args.via == "gc":
+            raise SystemExit(
+                "--conversation-id posts bindingless via the adapter and "
+                "cannot be combined with --via gc (gc's outbound-file "
+                "endpoint requires an extmsg binding)")
+        if args.thread_current:
+            raise SystemExit(
+                "--thread-current resolves the latest inbound via the "
+                "session's binding and cannot be combined with "
+                "--conversation-id; pass --thread-ts <ts> explicitly")
+    via = args.via or ("adapter" if conversation_id else "gc")
 
     file_path = pathlib.Path(args.file_path).expanduser().resolve()
     if not file_path.exists():
@@ -109,11 +149,24 @@ def main(argv: list[str]) -> int:
         except common.GCAPIError as exc:
             raise SystemExit(str(exc)) from exc
 
-    conv = _resolve_conversation(session_id)
-    if not conv.get("conversation_id"):
-        raise SystemExit(
-            f"session {session_id!r} binding has no conversation_id "
-            "(corrupt binding record?)")
+    if conversation_id:
+        if not os.environ.get("SLACK_WORKSPACE_ID", "").strip():
+            raise SystemExit(
+                "SLACK_WORKSPACE_ID is not set; cannot construct "
+                "conversation envelope")
+        conv = {
+            "scope_id": common.gc_city_name(),
+            "provider": "slack",
+            "account_id": os.environ["SLACK_WORKSPACE_ID"],
+            "conversation_id": conversation_id,
+            "kind": args.kind or "room",
+        }
+    else:
+        conv = _resolve_conversation(session_id)
+        if not conv.get("conversation_id"):
+            raise SystemExit(
+                f"session {session_id!r} binding has no conversation_id "
+                "(corrupt binding record?)")
 
     thread_ts = args.thread_ts.strip()
     if args.thread_current:
@@ -125,7 +178,7 @@ def main(argv: list[str]) -> int:
         thread_ts = match[0]
 
     try:
-        if args.via == "adapter":
+        if via == "adapter":
             result = common.upload_via_adapter(
                 session_id=session_id,
                 conversation_id=conv["conversation_id"],
@@ -161,9 +214,22 @@ def main(argv: list[str]) -> int:
         "kind": conv["kind"],
         "file_path": str(file_path),
         "thread_ts": thread_ts,
-        "via": args.via,
+        "via": via,
         "result": result,
     }, indent=2))
+
+    if conversation_id:
+        # Bindingless mode mirrors publish-to-channel's receipt contract:
+        # an HTTP 200 with delivered=false (auth, missing scope, archived
+        # channel) must surface as a non-zero exit so the caller notices.
+        delivered, failure_kind = common.interpret_publish_receipt(result)
+        if not delivered:
+            print(
+                f"slack upload failed: delivered=false "
+                f"failure_kind={failure_kind or 'unknown'}",
+                file=sys.stderr,
+            )
+            return 1
     return 0
 
 
