@@ -7,6 +7,11 @@ fans out a peer notification to other sessions bound to the same
 room. Pass `--via adapter` to fall back to the legacy direct-to-adapter
 path for diagnostics.
 
+Sessions with no extmsg binding (mayor, chief-of-staff) pass
+`--conversation-id` instead: the binding lookup is skipped and the
+file posts straight to the adapter, the file-side twin of
+`gc slack publish-to-channel`.
+
 Either way the local adapter handles Slack's three-step
 files-upload-v2 protocol (`files.getUploadURLExternal` →
 `PUT bytes` → `files.completeUploadExternal`).
@@ -32,6 +37,12 @@ gc slack upload --file ./out/plot.png --thread-ts 1730000000.123456
 
 # Override displayed filename / title
 gc slack upload --file /tmp/raw.csv --filename results.csv --title "Run 42 metrics"
+
+# Bindingless (mayor/cos): explicit channel id, no binding required
+gc slack upload --file ./evidence.jpg \
+                --conversation-id C0B1NSK4N3T \
+                --thread-ts 1234.5678 \
+                --initial-comment "camera frame from the incident"
 ```
 
 ## Flags
@@ -39,6 +50,14 @@ gc slack upload --file /tmp/raw.csv --filename results.csv --title "Run 42 metri
 - `--file PATH` — local file to upload (required).
 - `--session SID` — session id whose binding to upload into. Defaults
   to `$GC_SESSION_ID`.
+- `--conversation-id ID` — explicit Slack channel id (`C…`, `G…`,
+  `D…`). Skips the binding lookup and posts direct to the adapter,
+  matching `publish-to-channel`. Implies `--via adapter`; incompatible
+  with `--via gc` and `--thread-current` (pass `--thread-ts`
+  explicitly). Unlike the binding paths, this mode exits non-zero
+  when the receipt reports `delivered=false`.
+- `--kind {dm,room,thread}` — conversation kind for the envelope when
+  `--conversation-id` is used (`room` default).
 - `--filename NAME` — override displayed filename (defaults to
   `basename(--file)`).
 - `--title TITLE` — display title in Slack (defaults to filename).
@@ -78,7 +97,9 @@ explanatory text — that reply will carry the per-session identity.
 ## How it works
 
 1. Resolves the session's active extmsg binding to find the
-   target channel id.
+   target channel id — or, with `--conversation-id`, uses the given
+   id directly (no binding needed) and follows the `--via adapter`
+   path below.
 2. **`--via gc` (default)** — POSTs the file metadata to
    `/v0/city/{city}/extmsg/outbound-file`. gc verifies the binding,
    hands off to the adapter via the FileTransportAdapter interface,
@@ -102,4 +123,11 @@ gc slack upload --file out/snr_plot.png \
 
 # cos session: post a status digest with attached CSV
 gc slack upload --file /tmp/digest.csv --title "overnight digest"
+
+# mayor session (no binding): attach an evidence photo to the channel
+# named in a `Slack address-by-handle` reminder, threaded under the ask
+gc slack upload --file /tmp/leo-cam-frame.jpg \
+                --conversation-id C0B1NSK4N3T \
+                --thread-ts 1234.5678 \
+                --initial-comment "live camera frame, taken 00:41Z"
 ```

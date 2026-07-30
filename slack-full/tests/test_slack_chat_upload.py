@@ -199,3 +199,222 @@ def test_thread_current_unwraps_helper_tuple(
     # Critical: a plain string, NOT the (msg_id, conversation) tuple.
     assert body["reply_to_message_id"] == "1777779766.848799"
     assert isinstance(body["reply_to_message_id"], str)
+
+
+# --- bindingless mode (--conversation-id), added for ci-ta49 / gp-8z7 -----
+#
+# Mirrors `gc slack publish-to-channel`: an explicit conversation id
+# skips the extmsg-binding lookup and posts straight to the adapter's
+# /publish-file, so sessions with no binding (mayor / chief-of-staff)
+# can attach files to any channel.
+
+
+def _forbid_binding_lookup(common, monkeypatch: pytest.MonkeyPatch) -> None:
+    def _boom(_sid: str):
+        raise AssertionError(
+            "look_up_binding must not be called in bindingless mode")
+    monkeypatch.setattr(common, "look_up_binding", _boom)
+
+
+def test_conversation_id_posts_bindingless_via_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    upload, common = _import_modules()
+    captured: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, body: dict[str, Any] | None = None,
+                     *, csrf: bool = True, timeout: float = 30.0) -> dict[str, Any]:
+        captured["method"] = method
+        captured["url"] = url
+        captured["body"] = body
+        return {"delivered": True, "file_id": "F0EVIDENCE"}
+
+    monkeypatch.setattr(common, "_request", fake_request)
+    _forbid_binding_lookup(common, monkeypatch)
+
+    file_path = _make_file(tmp_path)
+    exit_code = upload.main([
+        "--file", str(file_path),
+        "--session", "gc-mayor",
+        "--conversation-id", "C0INCIDENT",
+        "--initial-comment", "evidence photo",
+    ])
+    assert exit_code == 0
+    assert captured["method"] == "POST"
+    assert captured["url"].endswith("/publish-file")
+    assert "/extmsg/" not in captured["url"]
+    body = captured["body"]
+    assert body["session_id"] == "gc-mayor"
+    assert body["conversation"] == {
+        "scope_id": "test-city",
+        "provider": "slack",
+        "account_id": "T0TESTWS",
+        "conversation_id": "C0INCIDENT",
+        "kind": "room",
+    }
+    assert body["initial_comment"] == "evidence photo"
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["via"] == "adapter"
+    assert out["conversation_id"] == "C0INCIDENT"
+    assert out["kind"] == "room"
+
+
+def test_conversation_id_kind_and_thread_ts_propagate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    upload, common = _import_modules()
+    captured: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, body: dict[str, Any] | None = None,
+                     *, csrf: bool = True, timeout: float = 30.0) -> dict[str, Any]:
+        captured["body"] = body
+        return {"delivered": True, "file_id": "F1"}
+
+    monkeypatch.setattr(common, "_request", fake_request)
+    _forbid_binding_lookup(common, monkeypatch)
+
+    file_path = _make_file(tmp_path)
+    exit_code = upload.main([
+        "--file", str(file_path),
+        "--session", "gc-mayor",
+        "--conversation-id", "D0DMCHAN",
+        "--kind", "dm",
+        "--thread-ts", "1785000000.000200",
+    ])
+    assert exit_code == 0
+    body = captured["body"]
+    assert body["conversation"]["kind"] == "dm"
+    assert body["reply_to_message_id"] == "1785000000.000200"
+
+
+def test_conversation_id_delivered_false_exits_nonzero(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """HTTP 200 + delivered=false must exit 1, like publish-to-channel."""
+    upload, common = _import_modules()
+
+    def fake_request(method: str, url: str, body: dict[str, Any] | None = None,
+                     *, csrf: bool = True, timeout: float = 30.0) -> dict[str, Any]:
+        return {"delivered": False, "failure_kind": "auth",
+                "error": "missing_scope"}
+
+    monkeypatch.setattr(common, "_request", fake_request)
+    _forbid_binding_lookup(common, monkeypatch)
+
+    file_path = _make_file(tmp_path)
+    exit_code = upload.main([
+        "--file", str(file_path),
+        "--session", "gc-mayor",
+        "--conversation-id", "C0INCIDENT",
+    ])
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "delivered=false" in err
+    assert "failure_kind=auth" in err
+
+
+def test_conversation_id_schema_mismatch_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    upload, common = _import_modules()
+
+    def fake_request(method: str, url: str, body: dict[str, Any] | None = None,
+                     *, csrf: bool = True, timeout: float = 30.0) -> dict[str, Any]:
+        return {"some_other_field": "value"}
+
+    monkeypatch.setattr(common, "_request", fake_request)
+    _forbid_binding_lookup(common, monkeypatch)
+
+    file_path = _make_file(tmp_path)
+    exit_code = upload.main([
+        "--file", str(file_path),
+        "--session", "gc-mayor",
+        "--conversation-id", "C0INCIDENT",
+    ])
+    assert exit_code == 1
+    assert "schema_mismatch" in capsys.readouterr().err
+
+
+def test_binding_path_receipt_still_not_gated(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """Pins the legacy contract: without --conversation-id, upload prints
+    the receipt and exits 0 even when delivered=false (documented
+    fall-through for missing_scope). Changing that is out of scope for
+    gp-8z7 — this test exists so a future change to it is deliberate."""
+    upload, common = _import_modules()
+
+    def fake_request(method: str, url: str, body: dict[str, Any] | None = None,
+                     *, csrf: bool = True, timeout: float = 30.0) -> dict[str, Any]:
+        return {"Receipt": {"Delivered": False, "FailureKind": "auth"}}
+
+    monkeypatch.setattr(common, "_request", fake_request)
+    monkeypatch.setattr(common, "look_up_binding", lambda _sid: _fake_binding())
+
+    file_path = _make_file(tmp_path)
+    exit_code = upload.main([
+        "--file", str(file_path),
+        "--session", "gc-test-session",
+    ])
+    assert exit_code == 0
+
+
+def test_conversation_id_rejects_via_gc(tmp_path: pathlib.Path) -> None:
+    upload, _ = _import_modules()
+    file_path = _make_file(tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        upload.main([
+            "--file", str(file_path),
+            "--conversation-id", "C0INCIDENT",
+            "--via", "gc",
+        ])
+    assert "--via gc" in str(exc.value)
+
+
+def test_conversation_id_rejects_thread_current(tmp_path: pathlib.Path) -> None:
+    upload, _ = _import_modules()
+    file_path = _make_file(tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        upload.main([
+            "--file", str(file_path),
+            "--conversation-id", "C0INCIDENT",
+            "--thread-current",
+        ])
+    assert "--thread-ts" in str(exc.value)
+
+
+def test_kind_requires_conversation_id(tmp_path: pathlib.Path) -> None:
+    upload, _ = _import_modules()
+    file_path = _make_file(tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        upload.main([
+            "--file", str(file_path),
+            "--kind", "dm",
+        ])
+    assert "--conversation-id" in str(exc.value)
+
+
+def test_conversation_id_requires_workspace_id(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    upload, common = _import_modules()
+    monkeypatch.setenv("SLACK_WORKSPACE_ID", "")
+    _forbid_binding_lookup(common, monkeypatch)
+    file_path = _make_file(tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        upload.main([
+            "--file", str(file_path),
+            "--session", "gc-mayor",
+            "--conversation-id", "C0INCIDENT",
+        ])
+    assert "SLACK_WORKSPACE_ID" in str(exc.value)

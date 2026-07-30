@@ -10,6 +10,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `gc slack upload` accepts `--conversation-id` (plus `--kind
+  dm|room|thread`, default `room`), the file-side twin of
+  `publish-to-channel` (ci-ta49 / gp-8z7): an explicit channel id
+  skips the extmsg-binding lookup and posts the file straight to the
+  adapter's `/publish-file` (files-upload-v2), so sessions with no
+  binding — mayor, chief-of-staff — can attach files to any channel
+  they were addressed from. Implies `--via adapter` (gc's
+  outbound-file endpoint requires a binding; combining with `--via
+  gc` errors), rejects `--thread-current` (its latest-inbound lookup
+  is binding-oriented; pass `--thread-ts` explicitly), and mirrors
+  publish-to-channel's receipt gate — exit 1 when the adapter
+  returns `delivered=false`. The default binding paths are
+  unchanged, including their exit-0-on-undelivered contract (now
+  pinned by a regression test).
+
 - Busy-reaction lifecycle (hq-xizo, ported from
   `feat/hq-xizo-slack-full-hardening`): a targeted inbound gets a busy
   reaction (`BUSY_REACTION`, default `hourglass`; set-but-empty
