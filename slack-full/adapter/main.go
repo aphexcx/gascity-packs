@@ -3274,9 +3274,15 @@ func safePathComponent(s string) string {
 // safeFilename strips path separators and other dangerous characters from
 // a Slack-supplied filename so it can't escape the inbound file store
 // directory. More permissive than safePathComponent: keeps spaces and
-// non-ASCII characters that humans expect in filenames. Length is capped
-// at 200 chars (well under the typical 255 filename limit) to leave room
-// for the leading ts prefix.
+// non-ASCII characters that humans expect in filenames. Angle brackets are
+// replaced too (codex r14): every path presented to a session runs through
+// neutralizeMarkupBoundaries, which inserts a zero-width space after '<' —
+// a stored name containing '<' would therefore be displayed as a path that
+// does not exist on disk. With '<' banned here, neutralization is a
+// byte-for-byte no-op on the stored path (assuming the operator-configured
+// INBOUND_FILE_STORE itself contains no '<'). Length is capped at 200
+// chars (well under the typical 255 filename limit) to leave room for the
+// leading ts prefix.
 func safeFilename(name string) string {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -3287,6 +3293,8 @@ func safeFilename(name string) string {
 	for _, r := range name {
 		switch {
 		case r == '/' || r == '\\' || r == 0:
+			b.WriteRune('_')
+		case r == '<' || r == '>':
 			b.WriteRune('_')
 		case r < 0x20:
 			b.WriteRune('_')

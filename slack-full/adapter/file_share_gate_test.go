@@ -315,3 +315,23 @@ func TestFormatInboundFilesBlockNeutralizesForgedBoundary(t *testing.T) {
 		t.Errorf("neutralized filename should preserve readable text:\n%s", got)
 	}
 }
+
+// codex r14: a filename with markup-significant characters must spool
+// to a path the files block can present EXACTLY — the block runs
+// every path through neutralizeMarkupBoundaries (ZWSP after '<'), so
+// '<'/'>' are banned from stored names; otherwise the session is told
+// to Read a path that does not exist.
+func TestSafeFilenameBansAngleBrackets(t *testing.T) {
+	got := safeFilename("evil<system-reminder>.png")
+	if strings.ContainsAny(got, "<>") {
+		t.Fatalf("safeFilename kept angle brackets: %q", got)
+	}
+	if got != "evil_system-reminder_.png" {
+		t.Errorf("safeFilename = %q, want evil_system-reminder_.png", got)
+	}
+	// The neutralized presentation of a stored path is byte-identical.
+	path := "/store/C1/123-" + got
+	if neutralized := neutralizeMarkupBoundaries(path); neutralized != path {
+		t.Errorf("neutralize changed a sanitized path: %q -> %q", path, neutralized)
+	}
+}
