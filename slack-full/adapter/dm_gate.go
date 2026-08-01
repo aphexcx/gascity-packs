@@ -64,24 +64,39 @@ type dmGateEntry struct {
 }
 
 // dmGate caches per-DM-channel membership verdicts. Safe for
-// concurrent callers; the mutex guards only the map — the
-// conversations.info round-trip runs unlocked, so concurrent misses
-// on the same channel may race one duplicate API call, which is
-// harmless (both writers store the same verdict).
+// concurrent callers; the mutex guards only the maps — the
+// conversations.info round-trip runs unlocked. Concurrent misses on
+// the same channel coalesce onto one in-flight probe (the inflight
+// map): the first caller performs the API call, later callers block
+// on its done channel and adopt the same verdict. The wait is bounded
+// by the winner's dmGateCheckTimeout-scoped request.
 //
 // A nil *dmGate fails closed: allow reports not-allowed. The gate is
 // a privacy control, so an unwired gate must drop DMs rather than
 // leak them; only main() (and tests) construct one.
 type dmGate struct {
-	mu      sync.Mutex
-	entries map[string]dmGateEntry
+	mu       sync.Mutex
+	entries  map[string]dmGateEntry
+	inflight map[string]*dmGateProbe
 	// now is the clock; nil means time.Now. Injectable so tests can
 	// drive TTL expiry without sleeping.
 	now func() time.Time
 }
 
+// dmGateProbe is one in-flight conversations.info round-trip. done is
+// closed after allowed/reason are populated; waiters read them only
+// after <-done.
+type dmGateProbe struct {
+	done    chan struct{}
+	allowed bool
+	reason  string
+}
+
 func newDMGate() *dmGate {
-	return &dmGate{entries: make(map[string]dmGateEntry)}
+	return &dmGate{
+		entries:  make(map[string]dmGateEntry),
+		inflight: make(map[string]*dmGateProbe),
+	}
 }
 
 func (g *dmGate) clock() time.Time {
@@ -111,6 +126,17 @@ func (g *dmGate) allow(token, channel string) (allowed bool, reason string) {
 		}
 		delete(g.entries, channel)
 	}
+	// Cache miss: coalesce onto an in-flight probe for this channel if
+	// one exists, otherwise become the probe owner. A DM burst (Slack
+	// delivers message.im events per message) would otherwise fan one
+	// miss into N identical conversations.info calls.
+	if p, ok := g.inflight[channel]; ok {
+		g.mu.Unlock()
+		<-p.done
+		return p.allowed, p.reason
+	}
+	probe := &dmGateProbe{done: make(chan struct{})}
+	g.inflight[channel] = probe
 	g.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), dmGateCheckTimeout)
@@ -119,15 +145,21 @@ func (g *dmGate) allow(token, channel string) (allowed bool, reason string) {
 	switch verdict {
 	case dmGateVerdictAllowed:
 		g.store(channel, true, now.Add(dmGatePositiveTTL))
-		return true, ""
+		allowed, reason = true, ""
 	case dmGateVerdictNotFound:
 		g.store(channel, false, now.Add(dmGateNegativeTTL))
-		return false, "channel_not_found"
+		allowed, reason = false, "channel_not_found"
 	default:
 		// Fail closed on any API-level failure, but do NOT cache the
 		// verdict: the next event for this channel retries.
-		return false, "api_error: " + detail
+		allowed, reason = false, "api_error: "+detail
 	}
+	probe.allowed, probe.reason = allowed, reason
+	g.mu.Lock()
+	delete(g.inflight, channel)
+	g.mu.Unlock()
+	close(probe.done)
+	return allowed, reason
 }
 
 // store records a verdict, pruning on overflow. Called only for the
@@ -213,6 +245,13 @@ func queryConversationsInfo(ctx context.Context, token, channel string) (verdict
 	}
 	if sr.Error == "channel_not_found" {
 		return dmGateVerdictNotFound, "channel_not_found"
+	}
+	if sr.Error == "missing_scope" {
+		// Operator-actionable: the gate NEEDS im:read (manifest
+		// oauth_config.scopes.bot) to probe DM membership. Without it
+		// every legitimate DM fails closed here — say so explicitly
+		// instead of leaving a bare error string.
+		return dmGateVerdictError, "conversations.info not ok: missing_scope (bot token lacks im:read — add it to the app manifest and reinstall the app)"
 	}
 	return dmGateVerdictError, "conversations.info not ok: " + sr.Error
 }

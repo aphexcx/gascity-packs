@@ -278,7 +278,12 @@ func (c config) tryAcquireDispatchSlot() (release func(), capacity int, ok bool)
 	semCap := cap(sem)
 	select {
 	case sem <- struct{}{}:
-		return func() { <-sem }, semCap, true
+		// Idempotent: the slot may be released early (deliverInbound
+		// frees it before its first retry sleep so a gc outage cannot
+		// starve admission) and then again by the owner's normal
+		// defer/transfer path. Only the first call returns the slot.
+		var once sync.Once
+		return func() { once.Do(func() { <-sem }) }, semCap, true
 	default:
 		return nil, semCap, false
 	}
@@ -1384,10 +1389,12 @@ func main() {
 	}
 
 	// Re-deliver any inbound events a previous run spooled but never
-	// confirmed forwarded (hq-xizo: Slack was already 200-acked, so
+	// confirmed done (hq-xizo: Slack was already 200-acked, so
 	// dropping them on crash would lose messages). Runs before the
 	// listeners start serving; delivery itself is async per entry.
-	replaySpool(cfg)
+	// aliasReg lets replay redo the targeted alias dispatch a crash
+	// may have cut off after the forward succeeded.
+	replaySpool(cfg, aliasReg)
 
 	janitorCtx, janitorCancel := context.WithCancel(context.Background())
 	defer janitorCancel()
@@ -2793,7 +2800,22 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 	// entry dead-letters under <spool>/dead and startup replay covers
 	// a crash mid-retry. deliverInbound logs the outcome either way,
 	// including the one-time success line.
-	if !deliverInbound(cfg, inbound, spoolInbound(cfg.inboundSpoolDir, inbound)) {
+	//
+	// The dispatch slot (release) is handed to deliverInbound as its
+	// onFirstRetry hook: the retry schedule sleeps ~2 minutes, and
+	// holding the slot across those sleeps would let ~dispatchSem-cap
+	// concurrent failures starve admission for the whole gc outage —
+	// fresh events would be dropped UN-spooled, strictly worse than
+	// running the spooled stragglers outside the semaphore. release is
+	// idempotent, so the later transfer/defer paths stay correct.
+	//
+	// The spool entry stays on disk past forward success: it is
+	// removed only after the remaining durable work — the targeted
+	// alias dispatch below — has completed (or was never needed), so a
+	// crash in between replays the entry, alias dispatch included,
+	// instead of silently losing the targeted copy.
+	spoolPath := spoolInbound(cfg.inboundSpoolDir, inbound)
+	if !deliverInbound(cfg, inbound, spoolPath, release) {
 		return
 	}
 
@@ -2813,23 +2835,71 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 	// per inbound (the alias-dispatch fanout below targets the same
 	// Slack TS, so a duplicate react would be a Slack no-op). The mark
 	// is recorded synchronously before the async reactions.add so a
-	// fast reply cannot race the registry; a mark whose reply never
-	// arrives expires after busyReactionTTL. If alias dispatch later
-	// fails, reactAliasDispatchFailure posts ⚠️ on the same TS — that
-	// is semantically distinct (busy affordance vs. delivery failure)
-	// and not a duplicate. Best-effort: errors are logged and don't
-	// block the dispatch path. BUSY_REACTION= (set-but-empty) disables
-	// this block entirely — no reaction, no mark.
+	// fast reply cannot race the registry: take() defers to the
+	// in-flight add (confirmAdd reports the deferred removal) rather
+	// than firing a remove that would lose to the add. A re-mark of
+	// the same thread displaces the previous mark and its emoji is
+	// removed here (or by its own in-flight add completer). A mark
+	// whose reply never arrives expires after busyReactionTTL. If
+	// alias dispatch later fails, reactAliasDispatchFailure posts ⚠️
+	// on the same TS — that is semantically distinct (busy affordance
+	// vs. delivery failure) and not a duplicate. Best-effort: errors
+	// are logged and don't block the dispatch path. BUSY_REACTION=
+	// (set-but-empty) disables this block entirely — no reaction, no
+	// mark.
 	if target != "" && cfg.slackBotToken != "" && cfg.busyReaction != "" {
-		cfg.busyMarks.mark(msg.Channel, busyThreadKey(msg.ThreadTS, msg.TS), msg.TS)
+		displaced := cfg.busyMarks.mark(msg.Channel, busyThreadKey(msg.ThreadTS, msg.TS), msg.TS)
+		for _, oldTS := range displaced {
+			go func(channel, ts, emoji string) {
+				resp, err := removeReactionFromSlack(cfg.slackBotToken, slackReactionsAddReq{
+					Channel:   channel,
+					Name:      emoji,
+					Timestamp: ts,
+				})
+				if err != nil {
+					log.Printf("busy reaction displace-remove failed: chan=%s ts=%s emoji=%s: %v", channel, ts, emoji, err)
+					return
+				}
+				if !resp.OK && resp.Error != "no_reaction" {
+					log.Printf("busy reaction displace-remove: chan=%s ts=%s emoji=%s: slack error=%s", channel, ts, emoji, resp.Error)
+				}
+			}(msg.Channel, oldTS, cfg.busyReaction)
+		}
 		go func(channel, ts, emoji string) {
-			_, err := postReactionToSlack(cfg.slackBotToken, slackReactionsAddReq{
+			resp, err := postReactionToSlack(cfg.slackBotToken, slackReactionsAddReq{
 				Channel:   channel,
 				Name:      emoji,
 				Timestamp: ts,
 			})
-			if err != nil {
-				log.Printf("react busy %s failed: chan=%s ts=%s: %v", emoji, channel, ts, err)
+			landed := err == nil && resp != nil && (resp.OK || resp.Error == "already_reacted")
+			if !landed {
+				// The emoji never made it onto the message: retire the
+				// in-flight add state so a later take() doesn't wait on
+				// a removal that will never be owed.
+				cfg.busyMarks.abandonAdd(channel, ts)
+				if err != nil {
+					log.Printf("react busy %s failed: chan=%s ts=%s: %v", emoji, channel, ts, err)
+				} else {
+					log.Printf("react busy %s failed: chan=%s ts=%s: slack error=%s", emoji, channel, ts, resp.Error)
+				}
+				return
+			}
+			if cfg.busyMarks.confirmAdd(channel, ts) {
+				// The reply (or a displacing re-mark) consumed the mark
+				// while this add was in flight — complete the deferred
+				// removal now that the emoji actually exists.
+				resp, err := removeReactionFromSlack(cfg.slackBotToken, slackReactionsAddReq{
+					Channel:   channel,
+					Name:      emoji,
+					Timestamp: ts,
+				})
+				if err != nil {
+					log.Printf("busy reaction deferred-remove failed: chan=%s ts=%s emoji=%s: %v", channel, ts, emoji, err)
+					return
+				}
+				if !resp.OK && resp.Error != "no_reaction" {
+					log.Printf("busy reaction deferred-remove: chan=%s ts=%s emoji=%s: slack error=%s", channel, ts, emoji, resp.Error)
+				}
 			}
 		}(msg.Channel, msg.TS, cfg.busyReaction)
 	}
@@ -2839,7 +2909,10 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 	// session via gc's session-message API, regardless of channel
 	// binding. The originating channel's bound session still sees the
 	// inbound (above) and is expected to stay silent (per its prompt)
-	// because target != its handle.
+	// because target != its handle. The dispatching goroutine owns the
+	// spool entry's retirement: removed on dispatch success,
+	// dead-lettered on failure (⚠️ already signals the human; leaving
+	// it in the live spool would re-⚠️ on every restart).
 	if target != "" && aliasReg != nil {
 		if aliasedSessionID, ok := aliasReg.Get(target); ok {
 			// Thread-stickiness bind: record (channel, msg.TS) -> target
@@ -2855,18 +2928,31 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 			// Transfer the slot we already hold to the alias goroutine.
 			// No new acquireDispatchSlot — that would double-count
 			// against dispatchSem (gc-cby.26 Phase 4 review fix).
+			// release is idempotent, so this stays correct when
+			// deliverInbound already freed the slot on its retry path.
 			released = true
 			dispatchInflightWG.Add(1)
 			go func() {
 				defer dispatchInflightWG.Done()
 				defer release()
-				if !dispatchToAliasedSession(cfg, aliasedSessionID, inbound, target) {
+				if dispatchToAliasedSession(cfg, aliasedSessionID, inbound, target) {
+					removeSpoolEntry(spoolPath)
+				} else {
 					reactAliasDispatchFailure(cfg.slackBotToken,
 						inbound.Conversation.ConversationID, inbound.ProviderMessageID)
+					if spoolPath != "" {
+						log.Printf("alias dispatch failed chan=%s ts=%s target=%q (dead-letter=%s)",
+							inbound.Conversation.ConversationID, inbound.ProviderMessageID,
+							target, moveToDeadLetter(spoolPath))
+					}
 				}
 			}()
+			return
 		}
 	}
+	// No alias dispatch fired: the confirmed forward was the only
+	// durable work, so the spool entry is done.
+	removeSpoolEntry(spoolPath)
 }
 
 // downloadSlackFiles fetches each file's bytes from Slack (Bearer-auth

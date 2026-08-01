@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -73,9 +74,13 @@ func TestInboundSpoolDirFromEnv(t *testing.T) {
 }
 
 // TestDeliverInboundRetriesUntilSuccess confirms a transient gc failure
-// is retried and the spool entry is removed once the forward lands
-// (hq-xizo: the adapter has already 200-acked Slack, so it must not
-// drop the event).
+// is retried until the forward lands (hq-xizo: the adapter has already
+// 200-acked Slack, so it must not drop the event). The spool entry
+// survives the success — the CALLER retires it after the remaining
+// durable work (alias dispatch), so a crash in between still replays.
+// onFirstRetry must fire exactly once, before the first sleep, with
+// exactly one forward attempt behind it — that hook releases the
+// dispatch slot so retry sleeps cannot starve admission.
 func TestDeliverInboundRetriesUntilSuccess(t *testing.T) {
 	compressRetries(t)
 	var calls atomic.Int32
@@ -100,15 +105,30 @@ func TestDeliverInboundRetriesUntilSuccess(t *testing.T) {
 		t.Errorf("spoolInbound left tmp files behind: %v", leftovers)
 	}
 
-	if !deliverInbound(cfg, msg, path) {
+	var hookFires, attemptsAtHook int32
+	onFirstRetry := func() {
+		atomic.AddInt32(&hookFires, 1)
+		atomic.StoreInt32(&attemptsAtHook, calls.Load())
+	}
+	if !deliverInbound(cfg, msg, path, onFirstRetry) {
 		t.Error("deliverInbound = false, want true (third attempt succeeds)")
 	}
 
 	if got := calls.Load(); got != 3 {
 		t.Errorf("gc calls = %d, want 3 (two failures then success)", got)
 	}
+	if got := atomic.LoadInt32(&hookFires); got != 1 {
+		t.Errorf("onFirstRetry fired %d times, want exactly 1", got)
+	}
+	if got := atomic.LoadInt32(&attemptsAtHook); got != 1 {
+		t.Errorf("onFirstRetry fired after %d attempts, want 1 (before the first retry sleep)", got)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("spool entry must survive delivery for the caller to retire: %v", err)
+	}
+	removeSpoolEntry(path)
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("spool entry not removed after successful delivery: %v", err)
+		t.Errorf("removeSpoolEntry left the entry behind: %v", err)
 	}
 }
 
@@ -137,7 +157,7 @@ func TestDeliverInboundDeadLettersOnExhaustion(t *testing.T) {
 		t.Fatal("spoolInbound returned no path")
 	}
 
-	if deliverInbound(cfg, msg, path) {
+	if deliverInbound(cfg, msg, path, nil) {
 		t.Error("deliverInbound = true, want false (every attempt fails)")
 	}
 
@@ -189,7 +209,7 @@ func TestReplaySpoolRedelivers(t *testing.T) {
 	}
 
 	cfg := config{gcAPIBase: srv.URL, cityName: "test-city", inboundSpoolDir: spool}
-	replaySpool(cfg)
+	replaySpool(cfg, nil)
 
 	// Replay delivers asynchronously; wait for the spool entry to clear.
 	deadline := time.Now().Add(5 * time.Second)
@@ -217,12 +237,111 @@ func TestReplaySpoolDeadLettersCorruptEntries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	replaySpool(config{gcAPIBase: "http://127.0.0.1:1", cityName: "test-city", inboundSpoolDir: spool})
+	replaySpool(config{gcAPIBase: "http://127.0.0.1:1", cityName: "test-city", inboundSpoolDir: spool}, nil)
 
 	if _, err := os.Stat(corrupt); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("corrupt entry should have moved to dead-letter: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(spool, "dead", "1-corrupt.json")); err != nil {
 		t.Errorf("corrupt entry missing from dead-letter dir: %v", err)
+	}
+}
+
+// TestReplaySpoolRedispatchesAliasTarget confirms replay redoes the
+// targeted alias dispatch, not just the forward: a spool entry
+// surviving a crash means the dispatch was never confirmed, so replay
+// must re-resolve ExplicitTarget against the alias registry and POST
+// the session message again before retiring the entry (P1: the old
+// replay dropped the targeted copy silently).
+func TestReplaySpoolRedispatchesAliasTarget(t *testing.T) {
+	compressRetries(t)
+	var inboundPosts, sessionPosts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/extmsg/inbound"):
+			inboundPosts.Add(1)
+		case strings.Contains(r.URL.Path, "/session/"):
+			sessionPosts.Add(1)
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	spool := t.TempDir()
+	msg := externalInboundMessage{
+		ProviderMessageID: "1700000000.0004",
+		DedupKey:          "slack-1700000000.0004",
+		Text:              "@mayor: crashed before dispatch",
+		ExplicitTarget:    "mayor",
+		Conversation:      conversationRef{ConversationID: "C1"},
+	}
+	path := spoolInbound(spool, msg)
+	if path == "" {
+		t.Fatal("spoolInbound returned no path")
+	}
+
+	aliasReg := newTestHandleAliasRegistry(t)
+	if err := aliasReg.Set("mayor", "gc-42"); err != nil {
+		t.Fatalf("aliasReg.Set: %v", err)
+	}
+	cfg := config{gcAPIBase: srv.URL, cityName: "test-city", inboundSpoolDir: spool}
+	replaySpool(cfg, aliasReg)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("spool entry not retired within deadline")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := inboundPosts.Load(); got != 1 {
+		t.Errorf("inbound POSTs = %d, want 1", got)
+	}
+	if got := sessionPosts.Load(); got != 1 {
+		t.Errorf("alias session POSTs = %d, want 1 (replay must redo the dispatch)", got)
+	}
+}
+
+// TestReplaySpoolRetiresEntryWhenAliasGone: a spooled targeted entry
+// whose handle no longer resolves has nothing left to dispatch to —
+// replay forwards it and retires the entry instead of dead-lettering
+// or looping on it.
+func TestReplaySpoolRetiresEntryWhenAliasGone(t *testing.T) {
+	compressRetries(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	spool := t.TempDir()
+	msg := externalInboundMessage{
+		ProviderMessageID: "1700000000.0005",
+		DedupKey:          "slack-1700000000.0005",
+		ExplicitTarget:    "ghost",
+		Conversation:      conversationRef{ConversationID: "C1"},
+	}
+	path := spoolInbound(spool, msg)
+	if path == "" {
+		t.Fatal("spoolInbound returned no path")
+	}
+
+	cfg := config{gcAPIBase: srv.URL, cityName: "test-city", inboundSpoolDir: spool}
+	replaySpool(cfg, newTestHandleAliasRegistry(t))
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("spool entry not retired within deadline")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if entries, _ := os.ReadDir(filepath.Join(spool, "dead")); len(entries) != 0 {
+		t.Errorf("entry dead-lettered on missing alias; want plain retirement")
 	}
 }

@@ -132,6 +132,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `inbound POST failed` substring external log-watchers key on), and
   replayed at startup if a crash interrupted the retries. Duplicate
   redelivery is safe — gc dedups on the message's `dedup_key`.
+- Codex review round on this branch (8 findings, all fixed):
+  - The app manifest now grants `im:read` — the DM membership gate's
+    `conversations.info` probe requires it, and without it the gate
+    failed closed on `missing_scope` and dropped every legitimate DM.
+    The gate's drop log now names the missing scope and the fix.
+  - `openBeneath` rejects a symlinked upload root (Lstat + pinned-fd
+    `os.SameFile` identity check): `os.OpenRoot` follows a root-level
+    symlink, which would have re-anchored confinement at an
+    attacker-chosen directory and weakened the old walk's
+    O_NOFOLLOW-on-root TOCTOU defense.
+  - The spool entry now outlives forward success until the targeted
+    alias dispatch completes (removed on dispatch success,
+    dead-lettered on dispatch failure), and startup replay re-resolves
+    `ExplicitTarget` and redoes the dispatch — a crash between forward
+    and dispatch used to lose the targeted copy silently. Both legs
+    are at-least-once (forward deduped by `dedup_key`; a crash after
+    dispatch can duplicate the session message).
+  - Spooled retries no longer hold a dispatch-semaphore slot across
+    their ~2-minute sleep schedule: the slot is released before the
+    first retry sleep (release is now idempotent), so a gc outage
+    cannot pin all slots on sleeping goroutines and starve admission —
+    fresh events would have been dropped un-spooled.
+  - Busy-reaction lifecycle races: a thread-reply inbound registers
+    its mark under both the thread root and its own ts so either reply
+    threading shape clears the emoji; a reply landing while the async
+    `reactions.add` is still in flight defers the removal to the add's
+    completer instead of firing a remove that would lose the race and
+    strand the emoji; and re-tagging the same thread removes the
+    displaced mark's emoji instead of silently forgetting it.
+  - Concurrent DM-gate cache misses for the same channel coalesce onto
+    one in-flight `conversations.info` probe (waiters adopt the
+    winner's verdict) instead of fanning a DM burst into N identical
+    API calls.
 
 ### Security
 

@@ -93,26 +93,36 @@ func sanitizeSpoolName(s string) string {
 }
 
 // deliverInbound forwards one inbound message to gc, retrying failures
-// per inboundRetryDelays. On first success the spool entry is removed
-// and the canonical "inbound:" line is logged once; when every attempt
-// fails the entry moves to the dead-letter directory and deliverInbound
-// returns false so processSlackEvent skips the post-forward work (eyes
-// reaction, alias dispatch). The final failure line deliberately
-// contains "inbound POST failed" — external log-watchers key on that
-// exact substring.
-func deliverInbound(cfg config, msg externalInboundMessage, spoolPath string) bool {
+// per inboundRetryDelays. On success the canonical "inbound:" line is
+// logged once and the CALLER owns the spool entry — it must remove it
+// only after all remaining durable work (the targeted alias dispatch)
+// has completed, so a crash between forward and dispatch replays the
+// entry instead of silently losing the targeted copy. When every
+// attempt fails the entry moves to the dead-letter directory here and
+// deliverInbound returns false so processSlackEvent skips the
+// post-forward work (busy reaction, alias dispatch). The final failure
+// line deliberately contains "inbound POST failed" — external
+// log-watchers key on that exact substring.
+//
+// onFirstRetry, when non-nil, fires once before the first retry sleep.
+// processSlackEvent passes its dispatch-slot release: the retry
+// schedule sleeps ~2 minutes, and a gc outage would otherwise pin
+// every slot on sleeping goroutines and starve admission of fresh
+// events (which then get dropped un-spooled — strictly worse than
+// letting spooled stragglers retry outside the semaphore).
+func deliverInbound(cfg config, msg externalInboundMessage, spoolPath string, onFirstRetry func()) bool {
 	delays := snapshotInboundRetryDelays()
 	attempts := len(delays) + 1
 	var lastErr error
 	for i := range attempts {
 		if i > 0 {
+			if i == 1 && onFirstRetry != nil {
+				onFirstRetry()
+			}
 			time.Sleep(delays[i-1])
 		}
 		err := postInbound(cfg, msg)
 		if err == nil {
-			if spoolPath != "" {
-				_ = os.Remove(spoolPath)
-			}
 			log.Printf("inbound: chan=%s user=%s ts=%s thread=%s target=%q files=%d text=%dch",
 				msg.Conversation.ConversationID, msg.Actor.ID, msg.ProviderMessageID,
 				msg.ReplyToMessageID, msg.ExplicitTarget, len(msg.Attachments), len(msg.Text))
@@ -128,6 +138,14 @@ func deliverInbound(cfg config, msg externalInboundMessage, spoolPath string) bo
 		attempts, moveToDeadLetter(spoolPath), msg.Conversation.ConversationID,
 		msg.ProviderMessageID, lastErr)
 	return false
+}
+
+// removeSpoolEntry deletes a confirmed-done spool entry. "" (spooling
+// disabled or the write failed) is a no-op.
+func removeSpoolEntry(spoolPath string) {
+	if spoolPath != "" {
+		_ = os.Remove(spoolPath)
+	}
 }
 
 // moveToDeadLetter quarantines an exhausted spool entry in the sibling
@@ -153,14 +171,20 @@ func moveToDeadLetter(spoolPath string) string {
 }
 
 // replaySpool re-delivers inbound events a previous run persisted but
-// never confirmed forwarded (crash mid-retry). main() calls it before
-// the listeners start serving. Redelivery may duplicate an event gc
-// already accepted — the message DedupKey makes that safe. Undecodable
-// entries are quarantined to the dead-letter dir instead of
-// crash-looping replay on every restart; dead-lettered entries are NOT
-// replayed automatically — they stay under <spoolDir>/dead for manual
-// replay. A missing spool dir is a no-op.
-func replaySpool(cfg config) {
+// never confirmed done (crash mid-retry, or crash between the forward
+// and the targeted alias dispatch). main() calls it before the
+// listeners start serving. Each entry is re-forwarded and — when it
+// carries an ExplicitTarget that still resolves to a registered alias
+// — re-dispatched to the aliased session, because the spool entry
+// outliving the crash means the dispatch was never confirmed.
+// Delivery is at-least-once on both legs: the forward is deduped by
+// the message DedupKey, and a crash after dispatch but before spool
+// removal duplicates the targeted session message — preferred over
+// losing it. Undecodable entries are quarantined to the dead-letter
+// dir instead of crash-looping replay on every restart; dead-lettered
+// entries are NOT replayed automatically — they stay under
+// <spoolDir>/dead for manual replay. A missing spool dir is a no-op.
+func replaySpool(cfg config, aliasReg *handleAliasRegistry) {
 	if cfg.inboundSpoolDir == "" {
 		return
 	}
@@ -186,8 +210,27 @@ func replaySpool(cfg config) {
 			log.Printf("spool replay: decode %s: %v (dead-letter=%s)", path, err, moveToDeadLetter(path))
 			continue
 		}
-		log.Printf("spool replay: re-delivering %s (chan=%s ts=%s)",
-			e.Name(), msg.Conversation.ConversationID, msg.ProviderMessageID)
-		go deliverInbound(cfg, msg, path)
+		log.Printf("spool replay: re-delivering %s (chan=%s ts=%s target=%q)",
+			e.Name(), msg.Conversation.ConversationID, msg.ProviderMessageID, msg.ExplicitTarget)
+		go func(path string, msg externalInboundMessage) {
+			if !deliverInbound(cfg, msg, path, nil) {
+				return // dead-lettered by deliverInbound
+			}
+			if msg.ExplicitTarget != "" && aliasReg != nil {
+				if sessionID, ok := aliasReg.Get(msg.ExplicitTarget); ok {
+					if !dispatchToAliasedSession(cfg, sessionID, msg, msg.ExplicitTarget) {
+						reactAliasDispatchFailure(cfg.slackBotToken,
+							msg.Conversation.ConversationID, msg.ProviderMessageID)
+						log.Printf("spool replay: alias dispatch failed chan=%s ts=%s target=%q (dead-letter=%s)",
+							msg.Conversation.ConversationID, msg.ProviderMessageID,
+							msg.ExplicitTarget, moveToDeadLetter(path))
+						return
+					}
+				}
+				// Target no longer registered: nothing left to dispatch
+				// to — fall through and retire the entry.
+			}
+			removeSpoolEntry(path)
+		}(path, msg)
 	}
 }

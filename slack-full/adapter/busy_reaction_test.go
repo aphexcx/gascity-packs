@@ -228,6 +228,7 @@ func TestBusyReaction_PublishToSameThreadRemovesBusy(t *testing.T) {
 
 			marks := newBusyReactionRegistry()
 			marks.mark("C1", tc.threadKey, tc.markedTS)
+			marks.confirmAdd("C1", tc.markedTS) // simulate the landed reactions.add
 			cfg := config{slackBotToken: "xoxb-fake", busyReaction: "hourglass", busyMarks: marks}
 
 			req := httptest.NewRequest(http.MethodPost, "/publish", strings.NewReader(publishBody("C1", tc.threadKey)))
@@ -278,6 +279,7 @@ func TestBusyReaction_UnrelatedPublishDoesNotRemove(t *testing.T) {
 
 			marks := newBusyReactionRegistry()
 			marks.mark("C1", "100.000010", "100.000010")
+			marks.confirmAdd("C1", "100.000010")
 			cfg := config{slackBotToken: "xoxb-fake", busyReaction: "hourglass", busyMarks: marks}
 
 			req := httptest.NewRequest(http.MethodPost, "/publish", strings.NewReader(publishBody(tc.conversation, tc.replyTo)))
@@ -415,6 +417,7 @@ func TestBusyReaction_ExpiredMarkDoesNotRemove(t *testing.T) {
 		return current
 	}
 	marks.mark("C1", "100.000010", "100.000010")
+	marks.confirmAdd("C1", "100.000010")
 	mu.Lock()
 	current = current.Add(busyReactionTTL + time.Minute)
 	mu.Unlock()
@@ -450,6 +453,7 @@ func TestBusyReactionRegistry_TakeAndSweep(t *testing.T) {
 	}
 
 	r.mark("C1", "1.0", "1.0")
+	r.confirmAdd("C1", "1.0")
 	if ts, ok := r.take("C1", "1.0"); !ok || ts != "1.0" {
 		t.Fatalf("take = (%q, %v), want (1.0, true)", ts, ok)
 	}
@@ -507,7 +511,13 @@ func TestBusyReactionRegistry_CapEvictsOldest(t *testing.T) {
 // without busyMarks).
 func TestBusyReactionRegistry_NilSafe(t *testing.T) {
 	var r *busyReactionRegistry
-	r.mark("C1", "1.0", "1.0")
+	if displaced := r.mark("C1", "1.0", "1.0"); displaced != nil {
+		t.Error("mark on nil registry reported displaced marks")
+	}
+	if r.confirmAdd("C1", "1.0") {
+		t.Error("confirmAdd on nil registry reported a deferred removal")
+	}
+	r.abandonAdd("C1", "1.0")
 	if _, ok := r.take("C1", "1.0"); ok {
 		t.Error("take on nil registry reported a mark")
 	}
@@ -516,5 +526,93 @@ func TestBusyReactionRegistry_NilSafe(t *testing.T) {
 	}
 	if n := r.size(); n != 0 {
 		t.Errorf("size on nil registry = %d, want 0", n)
+	}
+}
+
+// Fast-reply race (hq-xizo P2): the reply's take() arrives while the
+// async reactions.add is still in flight. take must NOT hand the ts
+// to the caller (its remove would no-op before the add lands and
+// strand the emoji); instead the add's completer learns via
+// confirmAdd that it owes the removal.
+func TestBusyReactionRegistry_TakeDuringInflightAddDefersToCompleter(t *testing.T) {
+	r := newBusyReactionRegistry()
+	r.mark("C1", "1.0", "1.0")
+	if ts, ok := r.take("C1", "1.0"); ok {
+		t.Fatalf("take during in-flight add returned (%q, true); want deferred", ts)
+	}
+	if !r.confirmAdd("C1", "1.0") {
+		t.Fatal("confirmAdd = false after deferred take; want removeNow=true")
+	}
+	// The deferral consumed the mark: nothing left to take.
+	if _, ok := r.take("C1", "1.0"); ok {
+		t.Fatal("mark survived the deferred take")
+	}
+}
+
+// A thread-reply inbound registers under BOTH the thread root and its
+// own ts, so a reply publish carrying either key clears the reaction
+// (hq-xizo P2: reply shapes differ between gc reply-current and
+// thread-root threading).
+func TestBusyReactionRegistry_SiblingKeysBothClear(t *testing.T) {
+	for _, key := range []string{"root.1", "msg.2"} {
+		r := newBusyReactionRegistry()
+		r.mark("C1", "root.1", "msg.2")
+		r.confirmAdd("C1", "msg.2")
+		ts, ok := r.take("C1", key)
+		if !ok || ts != "msg.2" {
+			t.Fatalf("take(%q) = (%q, %v), want (msg.2, true)", key, ts, ok)
+		}
+		// Consuming either key retires the sibling too.
+		other := "msg.2"
+		if key == "msg.2" {
+			other = "root.1"
+		}
+		if _, ok := r.take("C1", other); ok {
+			t.Fatalf("sibling key %q survived take(%q)", other, key)
+		}
+	}
+}
+
+// Re-marking the same thread with a new targeted message must not
+// strand the displaced mark's emoji (hq-xizo P2). Landed add: the old
+// ts comes back from mark() for the caller to remove. In-flight add:
+// removal is delegated to that add's completer.
+func TestBusyReactionRegistry_RemarkDisplacesOldReaction(t *testing.T) {
+	t.Run("landed add returns displaced ts", func(t *testing.T) {
+		r := newBusyReactionRegistry()
+		r.mark("C1", "root.1", "msg.1")
+		r.confirmAdd("C1", "msg.1")
+		displaced := r.mark("C1", "root.1", "msg.2")
+		if len(displaced) != 1 || displaced[0] != "msg.1" {
+			t.Fatalf("displaced = %v, want [msg.1]", displaced)
+		}
+		// The new mark is live for the eventual reply.
+		r.confirmAdd("C1", "msg.2")
+		if ts, ok := r.take("C1", "root.1"); !ok || ts != "msg.2" {
+			t.Fatalf("take = (%q, %v), want (msg.2, true)", ts, ok)
+		}
+	})
+	t.Run("in-flight add delegates removal to completer", func(t *testing.T) {
+		r := newBusyReactionRegistry()
+		r.mark("C1", "root.1", "msg.1")
+		displaced := r.mark("C1", "root.1", "msg.2")
+		if len(displaced) != 0 {
+			t.Fatalf("displaced = %v, want [] (add still in flight)", displaced)
+		}
+		if !r.confirmAdd("C1", "msg.1") {
+			t.Fatal("confirmAdd(msg.1) = false; want removeNow=true for the displaced in-flight add")
+		}
+	})
+}
+
+// abandonAdd after a failed reactions.add leaves the surviving
+// entries inert: a later take returns the ts (the remove will no-op
+// benignly) instead of deferring to a completer that will never run.
+func TestBusyReactionRegistry_AbandonAddLeavesTakeUsable(t *testing.T) {
+	r := newBusyReactionRegistry()
+	r.mark("C1", "1.0", "1.0")
+	r.abandonAdd("C1", "1.0")
+	if ts, ok := r.take("C1", "1.0"); !ok || ts != "1.0" {
+		t.Fatalf("take after abandonAdd = (%q, %v), want (1.0, true)", ts, ok)
 	}
 }

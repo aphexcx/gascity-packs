@@ -26,6 +26,15 @@ import (
 // inside the root is followed rather than rejected. The caller's
 // contract — confinement to rootAbs — holds either way; any link that
 // would resolve outside the root fails the open.
+//
+// The root itself gets the same swap detection: os.OpenRoot follows a
+// symlink at rootAbs (pinning the link target instead of rejecting),
+// which would let a root swapped for a symlink in the race window
+// re-anchor "confinement" at an attacker-chosen directory. rootAbs is
+// therefore Lstat-checked (must be a real directory, not a link) and
+// the pinned fd is fstat-compared against that Lstat via os.SameFile —
+// a mismatch means the root moved between check and open, and the open
+// is rejected.
 func openBeneath(rootAbs, rel string) (*os.File, error) {
 	if rel == "" || rel == "." || filepath.IsAbs(rel) {
 		return nil, fmt.Errorf("openBeneath: invalid relative path %q", rel)
@@ -36,11 +45,28 @@ func openBeneath(rootAbs, rel string) (*os.File, error) {
 			return nil, fmt.Errorf("openBeneath: invalid path component %q in %q", c, rel)
 		}
 	}
+	lst, err := os.Lstat(rootAbs)
+	if err != nil {
+		return nil, fmt.Errorf("openBeneath: lstat root %q: %w", rootAbs, err)
+	}
+	if lst.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("openBeneath: root %q is a symlink", rootAbs)
+	}
+	if !lst.IsDir() {
+		return nil, fmt.Errorf("openBeneath: root %q is not a directory", rootAbs)
+	}
 	root, err := os.OpenRoot(rootAbs)
 	if err != nil {
 		return nil, fmt.Errorf("openBeneath: open root %q: %w", rootAbs, err)
 	}
 	defer root.Close()
+	rst, err := root.Stat(".")
+	if err != nil {
+		return nil, fmt.Errorf("openBeneath: stat pinned root %q: %w", rootAbs, err)
+	}
+	if !os.SameFile(lst, rst) {
+		return nil, fmt.Errorf("openBeneath: root %q changed identity between check and open", rootAbs)
+	}
 	f, err := root.OpenFile(rel, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, fmt.Errorf("openBeneath: open %q beneath %q: %w", rel, rootAbs, err)

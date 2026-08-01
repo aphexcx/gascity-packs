@@ -99,3 +99,26 @@ func TestReadConfinedFileStillReadsAndStillConfines(t *testing.T) {
 		t.Errorf("escape attempt error = %v, want outside-root rejection", err)
 	}
 }
+
+// A symlinked upload root must be rejected outright (hq-xizo P1):
+// os.OpenRoot would follow it and re-anchor "confinement" at the link
+// target, undoing the old walk's O_NOFOLLOW-on-root defense against a
+// root swapped in the race window.
+func TestOpenBeneathRejectsSymlinkedRoot(t *testing.T) {
+	base := t.TempDir()
+	realRoot := filepath.Join(base, "real-root")
+	if err := os.MkdirAll(realRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(realRoot, "f.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	linkRoot := filepath.Join(base, "link-root")
+	if err := os.Symlink(realRoot, linkRoot); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := openBeneath(linkRoot, "f.txt"); err == nil {
+		f.Close()
+		t.Fatal("openBeneath accepted a symlinked root; want rejection")
+	}
+}

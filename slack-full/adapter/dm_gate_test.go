@@ -340,3 +340,60 @@ func TestDMGateAllow_PositiveVerdictExpiresAfter5m(t *testing.T) {
 		t.Errorf("conversations.info calls = %d, want 2 (positive verdict must expire after 5m)", got)
 	}
 }
+
+// Concurrent cache misses for the same channel must coalesce onto one
+// conversations.info probe (hq-xizo P2): Slack delivers message.im
+// per message, so a DM burst would otherwise fan one miss into N
+// identical API calls. The stub delays its answer long enough that
+// every goroutine reaches the gate before the first probe resolves;
+// with the singleflight in place exactly one call may reach Slack.
+func TestDMGate_ConcurrentMissesCoalesce(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		time.Sleep(100 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	t.Cleanup(srv.Close)
+	withSlackAPIStub(t, srv)
+
+	gate := newDMGate()
+	const workers = 8
+	var wg sync.WaitGroup
+	results := make([]bool, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			allowed, _ := gate.allow("xoxb-fake", "D_COALESCE")
+			results[i] = allowed
+		}(i)
+	}
+	wg.Wait()
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("conversations.info calls = %d, want 1 (coalesced)", got)
+	}
+	for i, allowed := range results {
+		if !allowed {
+			t.Errorf("worker %d: allowed = false, want true (winner's verdict shared)", i)
+		}
+	}
+}
+
+// A missing_scope failure must name the fix (im:read in the app
+// manifest): the gate fails closed on it, and a bare error string
+// cost a live workspace every DM until someone read the Slack docs.
+func TestDMGate_MissingScopeDetailActionable(t *testing.T) {
+	_, srv := newFakeConversationsInfo(t, http.StatusOK, `{"ok":false,"error":"missing_scope"}`)
+	withSlackAPIStub(t, srv)
+
+	gate := newDMGate()
+	allowed, reason := gate.allow("xoxb-fake", "D_SCOPE")
+	if allowed {
+		t.Fatal("allowed = true on missing_scope, want fail-closed")
+	}
+	if !strings.Contains(reason, "im:read") {
+		t.Errorf("reason = %q, want the im:read manifest hint", reason)
+	}
+}
