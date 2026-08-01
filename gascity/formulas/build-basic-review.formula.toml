@@ -76,6 +76,13 @@ needs = ["{target}.synthesize-review"]
 metadata = { "gc.run_target" = "{implementation_target}", "gc.continuation_group" = "build-basic-review-fixes" }
 description_file = "../assets/workflows/build-basic-review/{target}.apply-review-findings.md"
 
+[[template.children]]
+id = "{target}.human-review-gate"
+title = "Human review gate (interactive mode)"
+needs = ["{target}.apply-review-findings"]
+metadata = { "gc.run_target" = "gc.run-operator" }
+description_file = "../assets/workflows/build-basic-review/{target}.human-review-gate.md"
+
 [[template]]
 id = "{target}"
 title = "Finalize build-basic starter review"

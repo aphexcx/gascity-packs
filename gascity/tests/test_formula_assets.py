@@ -1373,7 +1373,7 @@ class FormulaAssetTests(unittest.TestCase):
         stage_gate_keys = {
             "assets/workflows/build-basic/plan-review.md": "gc.build.plan_review_gate",
             "assets/workflows/build-from-plan-base/plan-review.md": "gc.build.plan_review_gate",
-            "assets/workflows/build-basic-review/{target}.build-basic-review-loop.md": "gc.build.review_gate",
+            "assets/workflows/build-basic-review/{target}.human-review-gate.md": "gc.build.review_gate",
         }
         for relative_path, gate_key in stage_gate_keys.items():
             text = (root / relative_path).read_text(encoding="utf-8")
@@ -1841,6 +1841,7 @@ class FormulaAssetTests(unittest.TestCase):
                 "{target}.simplicity-review",
                 "{target}.synthesize-review",
                 "{target}.apply-review-findings",
+                "{target}.human-review-gate",
             ],
         )
         for target in (
@@ -1858,7 +1859,7 @@ class FormulaAssetTests(unittest.TestCase):
                     ],
                 )
         self.assertEqual(
-            loop["children"][-1]["metadata"]["gc.continuation_group"],
+            loop["children"][-2]["metadata"]["gc.continuation_group"],
             "build-basic-review-fixes",
         )
 
