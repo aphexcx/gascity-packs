@@ -65,9 +65,9 @@ as more issue ids and may fuzzy-match unrelated beads.
 gc bd close "$CLAIMED_BEAD_ID" --reason '...'
 ```
 
-Publish handoff — PR deliverables. If the bead's deliverable is a pull request,
-do not close it done until one of these holds; never silently drop the merge
-baton:
+Publish handoff — PR deliverables. If the bead's deliverable is a
+merge-ready pull request, do not close it done until one of these holds; never
+silently drop the merge baton:
 
 - the PR is merged — a mayor merges it, you never merge your own, or
 - you mailed the mayor a merge request AND referenced that mail in the close
@@ -76,6 +76,15 @@ baton:
 ```bash
 gc mail send mayor -s 'MERGE REQUEST: PR #<n>' -m '<branch> green; ready to merge'
 gc bd close "$CLAIMED_BEAD_ID" --reason 'PR #<n>; merge-request mailed to mayor.'
+```
+
+A deliberately-draft PR (the workflow ran with `pr_mode=draft`, or the bead
+asks for a draft) is NOT merge-ready: do not merge it and do not send a merge
+request for it. Hand it off for review instead — reference the draft PR URL in
+the close reason so the baton stays visible:
+
+```bash
+gc bd close "$CLAIMED_BEAD_ID" --reason 'Draft PR published per pr_mode=draft: <canonical PR URL>; awaiting review.'
 ```
 
 ## Continue
