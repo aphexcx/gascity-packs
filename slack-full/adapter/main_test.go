@@ -655,7 +655,7 @@ func TestHandlePublishInjectsIdentity(t *testing.T) {
 			cfg := config{slackBotToken: "xoxb-test"}
 			req := httptest.NewRequest(http.MethodPost, "/publish", strings.NewReader(tc.publishBody))
 			rec := httptest.NewRecorder()
-			handlePublish(cfg, reg, nil, newPublishDedupCache(publishDedupTTL))(rec, req)
+			handlePublish(cfg, reg, nil, nil, newPublishDedupCache(publishDedupTTL))(rec, req)
 
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status = %d, want 200 (body=%q)", rec.Code, rec.Body.String())
@@ -723,7 +723,7 @@ func TestHandlePublishIdentityFallsBackToMetadataSourceSessionID(t *testing.T) {
 			cfg := config{slackBotToken: "xoxb-test"}
 			req := httptest.NewRequest(http.MethodPost, "/publish", strings.NewReader(tc.body))
 			rec := httptest.NewRecorder()
-			handlePublish(cfg, reg, nil, newPublishDedupCache(publishDedupTTL))(rec, req)
+			handlePublish(cfg, reg, nil, nil, newPublishDedupCache(publishDedupTTL))(rec, req)
 
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status = %d, want 200 (body=%q)", rec.Code, rec.Body.String())
@@ -779,7 +779,7 @@ func TestHandlePublishRejectsEmptySession(t *testing.T) {
 			cfg := config{slackBotToken: "xoxb-test"}
 			req := httptest.NewRequest(http.MethodPost, "/publish", strings.NewReader(tc.body))
 			rec := httptest.NewRecorder()
-			handlePublish(cfg, reg, nil, newPublishDedupCache(publishDedupTTL))(rec, req)
+			handlePublish(cfg, reg, nil, nil, newPublishDedupCache(publishDedupTTL))(rec, req)
 
 			if rec.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, want 400 (body=%q)", rec.Code, rec.Body.String())
@@ -822,7 +822,7 @@ func TestHandlePublishDedupesOnIdempotencyKey(t *testing.T) {
 
 	cfg := config{slackBotToken: "xoxb-test"}
 	dedup := newPublishDedupCache(publishDedupTTL)
-	handler := handlePublish(cfg, reg, nil, dedup)
+	handler := handlePublish(cfg, reg, nil, nil, dedup)
 	body := `{"session_id":"gc-1","conversation":{"conversation_id":"C1","kind":"room"},"text":"hello","idempotency_key":"k-1"}`
 
 	publish := func() *httptest.ResponseRecorder {
@@ -875,7 +875,7 @@ func TestHandlePublishNoDedupWithoutKey(t *testing.T) {
 	slackAPIBase = fakeSlack.URL
 
 	cfg := config{slackBotToken: "xoxb-test"}
-	handler := handlePublish(cfg, reg, nil, newPublishDedupCache(publishDedupTTL))
+	handler := handlePublish(cfg, reg, nil, nil, newPublishDedupCache(publishDedupTTL))
 	body := `{"session_id":"gc-1","conversation":{"conversation_id":"C1","kind":"room"},"text":"hi"}`
 	for i := 0; i < 2; i++ {
 		req := httptest.NewRequest(http.MethodPost, "/publish", strings.NewReader(body))
@@ -2215,7 +2215,7 @@ func TestHandlePublishFile(t *testing.T) {
 			}
 			req := httptest.NewRequest(tc.method, "/publish-file", strings.NewReader(body))
 			rec := httptest.NewRecorder()
-			handlePublishFile(cfg, reg)(rec, req)
+			handlePublishFile(cfg, reg, nil)(rec, req)
 
 			if rec.Code != tc.wantStatus {
 				t.Fatalf("status = %d, want %d (body=%q)", rec.Code, tc.wantStatus, rec.Body.String())

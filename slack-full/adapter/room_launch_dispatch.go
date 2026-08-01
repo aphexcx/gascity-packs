@@ -99,7 +99,7 @@ func dispatchRoomLaunch(
 		threadTS = msg.TS
 	}
 
-	sessionID, created, err := threadReg.AcquireOrCreate(msg.Channel, threadTS, func() (string, error) {
+	sessionID, boundHandle, created, err := threadReg.AcquireOrCreate(msg.Channel, threadTS, handle, func() (string, error) {
 		return roomLaunchSpawnSession(cfg, pool, handle, msg)
 	})
 	if err != nil {
@@ -150,11 +150,16 @@ func dispatchRoomLaunch(
 	// the next `@<handle> ...` post routes via the single-`@` alias
 	// dispatch path. Ordered after postSessionMessage (codex r7) — see
 	// the failure comment above. Gated on the handle being unclaimed
-	// rather than on `created` (codex r8): a retry after a failed
-	// first message re-acquires the existing thread session
+	// rather than on `created` alone (codex r8): a retry after a
+	// failed first message re-acquires the existing thread session
 	// (created=false) and must still bind the handle it advertises in
-	// the acknowledgement below.
-	if aliasReg != nil {
+	// the acknowledgement below. But ONLY when the stored binding was
+	// created for this same handle (codex r9): a DIFFERENT `@@handle`
+	// converging on an existing thread session must not register its
+	// unclaimed handle globally onto that old session — that would
+	// route every later `@handle` post anywhere to the wrong session
+	// and permanently block the handle from launching its own.
+	if aliasReg != nil && (created || boundHandle == handle) {
 		if _, claimed := aliasReg.Get(handle); !claimed {
 			if err := aliasReg.Set(handle, sessionID); err != nil {
 				log.Printf("launcher dispatch: aliasReg.Set handle=%q session=%s: %v",

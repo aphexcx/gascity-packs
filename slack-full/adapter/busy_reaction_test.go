@@ -240,13 +240,13 @@ func TestBusyReaction_PublishToSameThreadRemovesBusy(t *testing.T) {
 
 			marks := newBusyReactionRegistry()
 			// Close addDone: the add already completed in this scenario.
-			done, _ := marks.markBoth("C1", tc.seedThreadTS, tc.seedTS)
+			done, _ := marks.markBoth("C1", tc.seedThreadTS, tc.seedTS, "")
 			close(done)
 			cfg := config{slackBotToken: "xoxb-fake", busyReaction: "hourglass", busyMarks: marks}
 
 			req := httptest.NewRequest(http.MethodPost, "/publish", strings.NewReader(publishBody("C1", tc.replyTo)))
 			rec := httptest.NewRecorder()
-			handlePublish(cfg, nil, nil, newPublishDedupCache(publishDedupTTL))(rec, req)
+			handlePublish(cfg, nil, nil, nil, newPublishDedupCache(publishDedupTTL))(rec, req)
 			if rec.Code != http.StatusOK {
 				t.Fatalf("publish status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
 			}
@@ -296,7 +296,7 @@ func TestBusyReaction_UnrelatedPublishDoesNotRemove(t *testing.T) {
 
 			req := httptest.NewRequest(http.MethodPost, "/publish", strings.NewReader(publishBody(tc.conversation, tc.replyTo)))
 			rec := httptest.NewRecorder()
-			handlePublish(cfg, nil, nil, newPublishDedupCache(publishDedupTTL))(rec, req)
+			handlePublish(cfg, nil, nil, nil, newPublishDedupCache(publishDedupTTL))(rec, req)
 			if rec.Code != http.StatusOK {
 				t.Fatalf("publish status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
 			}
@@ -319,15 +319,15 @@ func TestBusyReaction_RootPublishClearsConversationMarks(t *testing.T) {
 	withSlackAPIStub(t, slackStub)
 
 	marks := newBusyReactionRegistry()
-	doneA, _ := marks.markBoth("C1", "", "100.000010")
+	doneA, _ := marks.markBoth("C1", "", "100.000010", "")
 	close(doneA)
-	doneB, _ := marks.markBoth("C1", "200.000001", "200.000020")
+	doneB, _ := marks.markBoth("C1", "200.000001", "200.000020", "")
 	close(doneB)
 	cfg := config{slackBotToken: "xoxb-fake", busyReaction: "hourglass", busyMarks: marks}
 
 	req := httptest.NewRequest(http.MethodPost, "/publish", strings.NewReader(publishBody("C1", "")))
 	rec := httptest.NewRecorder()
-	handlePublish(cfg, nil, nil, newPublishDedupCache(publishDedupTTL))(rec, req)
+	handlePublish(cfg, nil, nil, nil, newPublishDedupCache(publishDedupTTL))(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("publish status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
 	}
@@ -484,7 +484,7 @@ func TestBusyReaction_CustomEmojiHonored(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/publish", strings.NewReader(publishBody("C1", "100.000010")))
 	rec := httptest.NewRecorder()
-	handlePublish(cfg, nil, nil, newPublishDedupCache(publishDedupTTL))(rec, req)
+	handlePublish(cfg, nil, nil, nil, newPublishDedupCache(publishDedupTTL))(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("publish status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
 	}
@@ -537,7 +537,7 @@ func TestBusyReaction_FastReplyWaitsForAddBeforeRemove(t *testing.T) {
 	// Reply immediately — well before the 400ms add completes.
 	req := httptest.NewRequest(http.MethodPost, "/publish", strings.NewReader(publishBody("C1", "100.000010")))
 	rec := httptest.NewRecorder()
-	handlePublish(cfg, nil, nil, newPublishDedupCache(publishDedupTTL))(rec, req)
+	handlePublish(cfg, nil, nil, nil, newPublishDedupCache(publishDedupTTL))(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("publish status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
 	}
@@ -599,7 +599,7 @@ func TestBusyReaction_PublishFileToSameThreadRemovesBusy(t *testing.T) {
 	body := fmt.Sprintf(`{"conversation":{"conversation_id":"C1"},"file_path":%q,"reply_to_message_id":"100.000010"}`, filePath)
 	req := httptest.NewRequest(http.MethodPost, "/publish-file", strings.NewReader(body))
 	rec := httptest.NewRecorder()
-	handlePublishFile(cfg, nil)(rec, req)
+	handlePublishFile(cfg, nil, nil)(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("publish-file status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
 	}
@@ -670,7 +670,7 @@ func TestBusyReaction_ReplyDuringForwardFindsMark(t *testing.T) {
 	// Reply while the forward is still in flight: the mark must exist.
 	req := httptest.NewRequest(http.MethodPost, "/publish", strings.NewReader(publishBody("C1", "100.000010")))
 	rec := httptest.NewRecorder()
-	handlePublish(cfg, nil, nil, newPublishDedupCache(publishDedupTTL))(rec, req)
+	handlePublish(cfg, nil, nil, nil, newPublishDedupCache(publishDedupTTL))(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("publish status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
 	}
@@ -719,7 +719,7 @@ func TestBusyReaction_FailedRetargetRestoresDisplacedMark(t *testing.T) {
 
 	cfg := busyTestConfig(gcStub.URL)
 	// Pre-existing mark: root message M1, its add already completed.
-	doneM1, _ := cfg.busyMarks.markBoth("C1", "", "100.000010")
+	doneM1, _ := cfg.busyMarks.markBoth("C1", "", "100.000010", "")
 	close(doneM1)
 
 	// Targeted thread reply M2 in M1's thread; its forward fails.
@@ -745,13 +745,13 @@ func TestBusyReactionRegistry_FailedMiddleRetargetPreservesAncestors(t *testing.
 	r := newBusyReactionRegistry()
 	const m1, m2, m3 = "1.0", "2.0", "3.0"
 
-	d1, disp := r.markBoth("C1", "", m1)
+	d1, disp := r.markBoth("C1", "", m1, "")
 	close(d1)
 	if len(disp) != 0 {
 		t.Fatalf("M1 displaced %v, want none", disp)
 	}
-	d2, disp2 := r.markBoth("C1", m1, m2) // M2 re-targets M1's thread
-	d3, disp3 := r.markBoth("C1", m1, m3) // M3 re-targets again
+	d2, disp2 := r.markBoth("C1", m1, m2, "") // M2 re-targets M1's thread
+	d3, disp3 := r.markBoth("C1", m1, m3, "") // M3 re-targets again
 	close(d3)
 	if len(disp2) == 0 || disp2[0].mark.messageTS != m1 {
 		t.Fatalf("M2 displaced %v, want M1", disp2)
@@ -767,7 +767,7 @@ func TestBusyReactionRegistry_FailedMiddleRetargetPreservesAncestors(t *testing.
 		t.Fatalf("key owner after failed M2 = (%q, %v), want M3", ts, ok)
 	}
 
-	taken := r.take("C1", m1)
+	taken := r.take("C1", m1, nil)
 	got := map[string]bool{}
 	for _, tk := range taken {
 		got[tk.messageTS] = true
@@ -786,10 +786,10 @@ func TestBusyReactionRegistry_FailedMiddleRetargetPreservesAncestors(t *testing.
 func TestBusyReactionRegistry_TakeMessageReparksAncestors(t *testing.T) {
 	r := newBusyReactionRegistry()
 	const m1, m2, m3 = "1.0", "2.0", "3.0"
-	d1, _ := r.markBoth("C1", "", m1)
+	d1, _ := r.markBoth("C1", "", m1, "")
 	close(d1)
-	d2, disp2 := r.markBoth("C1", m1, m2)
-	d3, disp3 := r.markBoth("C1", m1, m3)
+	d2, disp2 := r.markBoth("C1", m1, m2, "")
+	d3, disp3 := r.markBoth("C1", m1, m3, "")
 	close(d3)
 	r.cancelBoth("C1", m1, m2, d2, disp2) // M1 → M3's stale
 	_ = disp3
@@ -799,7 +799,7 @@ func TestBusyReactionRegistry_TakeMessageReparksAncestors(t *testing.T) {
 		t.Fatalf("takeMessage = %v, want exactly M3", taken)
 	}
 	// M1 must have been re-parked under the key, still clearable.
-	remaining := r.take("C1", m1)
+	remaining := r.take("C1", m1, nil)
 	got := map[string]bool{}
 	for _, tk := range remaining {
 		got[tk.messageTS] = true
@@ -814,10 +814,10 @@ func TestBusyReactionRegistry_TakeMessageReparksAncestors(t *testing.T) {
 // inbound's own ts is the clearing event for the root-key sibling too.
 func TestBusyReactionRegistry_TakeConsumesBothDualKeys(t *testing.T) {
 	r := newBusyReactionRegistry()
-	d, _ := r.markBoth("C1", "1.0", "2.0") // root key 1.0 + own-ts key 2.0
+	d, _ := r.markBoth("C1", "1.0", "2.0", "") // root key 1.0 + own-ts key 2.0
 	close(d)
 
-	taken := r.take("C1", "2.0") // reply threads under the inbound's own ts
+	taken := r.take("C1", "2.0", nil) // reply threads under the inbound's own ts
 	if len(taken) != 1 || taken[0].messageTS != "2.0" {
 		t.Fatalf("take = %v, want exactly the 2.0 mark once", taken)
 	}
@@ -842,15 +842,15 @@ func TestBusyReactionRegistry_TombstoneBlocksRestoreAfterConsume(t *testing.T) {
 	r := newBusyReactionRegistry()
 	const m1, m2 = "1.0", "2.0"
 
-	d1, _ := r.markBoth("C1", "", m1)
+	d1, _ := r.markBoth("C1", "", m1, "")
 	close(d1)
-	d2, disp2 := r.markBoth("C1", m1, m2) // M2 displaces M1
+	d2, disp2 := r.markBoth("C1", m1, m2, "") // M2 displaces M1
 	if len(disp2) == 0 || disp2[0].mark.messageTS != m1 {
 		t.Fatalf("displaced = %v, want M1", disp2)
 	}
 	// A reply lands while M2's dispatch is in flight and consumes the
 	// thread (root key + own-ts key).
-	if taken := r.take("C1", m1); len(taken) == 0 {
+	if taken := r.take("C1", m1, nil); len(taken) == 0 {
 		t.Fatal("reply take found no mark")
 	}
 	// M2's dispatch fails: restore must be blocked by the tombstone and
@@ -868,7 +868,7 @@ func TestBusyReactionRegistry_TombstoneBlocksRestoreAfterConsume(t *testing.T) {
 	}
 
 	// A fresh targeted inbound re-arms the key despite the tombstone.
-	d3, _ := r.markBoth("C1", "", m1)
+	d3, _ := r.markBoth("C1", "", m1, "")
 	close(d3)
 	if _, ok := r.pending("C1", m1); !ok {
 		t.Error("fresh mark did not re-arm the tombstoned key")
@@ -880,10 +880,10 @@ func TestBusyReactionRegistry_TombstoneBlocksRestoreAfterConsume(t *testing.T) {
 // concluded (codex r4).
 func TestBusyReactionRegistry_SameMessageRemarkMergesAddDone(t *testing.T) {
 	r := newBusyReactionRegistry()
-	d1, _ := r.markBoth("C1", "", "1.0")
-	d2, _ := r.markBoth("C1", "", "1.0")
+	d1, _ := r.markBoth("C1", "", "1.0", "")
+	d2, _ := r.markBoth("C1", "", "1.0", "")
 
-	taken := r.take("C1", "1.0")
+	taken := r.take("C1", "1.0", nil)
 	if len(taken) != 1 || taken[0].addDone == nil {
 		t.Fatalf("take = %v, want one entry with a merged done channel", taken)
 	}
@@ -929,7 +929,7 @@ func TestBusyReaction_ExpiredMarkDoesNotRemove(t *testing.T) {
 	cfg := config{slackBotToken: "xoxb-fake", busyReaction: "hourglass", busyMarks: marks}
 	req := httptest.NewRequest(http.MethodPost, "/publish", strings.NewReader(publishBody("C1", "100.000010")))
 	rec := httptest.NewRecorder()
-	handlePublish(cfg, nil, nil, newPublishDedupCache(publishDedupTTL))(rec, req)
+	handlePublish(cfg, nil, nil, nil, newPublishDedupCache(publishDedupTTL))(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("publish status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
 	}
@@ -957,10 +957,10 @@ func TestBusyReactionRegistry_TakeAndSweep(t *testing.T) {
 	}
 
 	r.mark("C1", "1.0", "1.0")
-	if taken := r.take("C1", "1.0"); len(taken) != 1 || taken[0].messageTS != "1.0" {
+	if taken := r.take("C1", "1.0", nil); len(taken) != 1 || taken[0].messageTS != "1.0" {
 		t.Fatalf("take = %v, want one entry for 1.0", taken)
 	}
-	if taken := r.take("C1", "1.0"); len(taken) != 0 {
+	if taken := r.take("C1", "1.0", nil); len(taken) != 0 {
 		t.Fatal("second take succeeded; want consumed on first take")
 	}
 
@@ -1017,7 +1017,7 @@ func TestBusyReactionRegistry_NilSafe(t *testing.T) {
 	if done := r.mark("C1", "1.0", "1.0"); done == nil {
 		t.Error("mark on nil registry returned a nil addDone channel; want closable")
 	}
-	if taken := r.take("C1", "1.0"); len(taken) != 0 {
+	if taken := r.take("C1", "1.0", nil); len(taken) != 0 {
 		t.Error("take on nil registry reported a mark")
 	}
 	if _, ok := r.pending("C1", "1.0"); ok {
@@ -1025,5 +1025,80 @@ func TestBusyReactionRegistry_NilSafe(t *testing.T) {
 	}
 	if n := r.size(); n != 0 {
 		t.Errorf("size on nil registry = %d, want 0", n)
+	}
+}
+
+// codex r11: a reply may only clear marks recorded for the publishing
+// agent. M1 targets alpha, M2 re-targets beta in the same thread —
+// alpha's late reply must not consume beta's mark.
+func TestBusyReactionRegistry_TakeRespectsHandleMatcher(t *testing.T) {
+	r := newBusyReactionRegistry()
+	done, _ := r.markBoth("C1", "", "1.0", "beta")
+	close(done)
+
+	if taken := r.take("C1", "1.0", func(h string) bool { return h == "alpha" }); len(taken) != 0 {
+		t.Fatalf("non-matching publisher consumed %d marks; want 0", len(taken))
+	}
+	if _, ok := r.pending("C1", "1.0"); !ok {
+		t.Fatal("beta's mark gone after non-matching take; want left in place")
+	}
+	taken := r.take("C1", "1.0", func(h string) bool { return h == "beta" })
+	if len(taken) != 1 || taken[0].messageTS != "1.0" {
+		t.Fatalf("matching take = %v, want the 1.0 mark", taken)
+	}
+}
+
+// codex r11: an unthreaded (channel-root) reply clears only the
+// publisher's own marks in the conversation, leaving other agents'
+// pending affordances alone. Unattributed (empty-handle) marks still
+// clear for any publisher.
+func TestBusyReactionRegistry_TakeConversationRespectsHandleMatcher(t *testing.T) {
+	r := newBusyReactionRegistry()
+	dA, _ := r.markBoth("C1", "", "1.0", "alpha")
+	close(dA)
+	dB, _ := r.markBoth("C1", "", "2.0", "beta")
+	close(dB)
+	dU, _ := r.markBoth("C1", "", "3.0", "")
+	close(dU)
+
+	taken := r.takeConversation("C1", func(h string) bool { return h == "" || h == "alpha" })
+	got := map[string]bool{}
+	for _, tk := range taken {
+		got[tk.messageTS] = true
+	}
+	if !got["1.0"] || !got["3.0"] || got["2.0"] || len(taken) != 2 {
+		t.Fatalf("takeConversation = %v, want exactly [1.0 3.0]", taken)
+	}
+	if _, ok := r.pending("C1", "2.0"); !ok {
+		t.Fatal("beta's mark gone after alpha's root reply; want left in place")
+	}
+}
+
+// codex r11 wiring: clearBusyReaction resolves the publisher via the
+// alias registry — a session that does not own the mark's handle
+// cannot clear it; the owning session can.
+func TestClearBusyReactionMatchesPublisherSession(t *testing.T) {
+	slackStub, reactions := newReactionRecordingSlackStub(t)
+	withSlackAPIStub(t, slackStub)
+
+	aliasReg := newTestHandleAliasRegistry(t)
+	if err := aliasReg.Set("beta", "gc-beta"); err != nil {
+		t.Fatalf("aliasReg.Set: %v", err)
+	}
+	marks := newBusyReactionRegistry()
+	done, _ := marks.markBoth("C1", "", "1.0", "beta")
+	close(done)
+	cfg := config{slackBotToken: "xoxb-fake", busyReaction: "hourglass", busyMarks: marks}
+
+	clearBusyReaction(cfg, aliasReg, "gc-alpha", "C1", "1.0")
+	reactions.assertNoCall(t, 300*time.Millisecond)
+	if _, ok := marks.pending("C1", "1.0"); !ok {
+		t.Fatal("foreign session's reply consumed beta's mark")
+	}
+
+	clearBusyReaction(cfg, aliasReg, "gc-beta", "C1", "1.0")
+	got := reactions.await(t, 2*time.Second)
+	if got.op != "remove" || got.timestamp != "1.0" {
+		t.Fatalf("owning session's reply: got (%s on %s), want remove on 1.0", got.op, got.timestamp)
 	}
 }

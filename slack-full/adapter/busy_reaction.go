@@ -117,9 +117,15 @@ type busyReactionKey struct {
 // is eventually removed when the key's current mark concludes.
 type busyReactionMark struct {
 	messageTS string
-	addedAt   time.Time
-	addDone   chan struct{}
-	stale     []busyTaken
+	// handle is the parsed target handle the mark was recorded for
+	// ("" for legacy/unattributed marks). The remove side matches the
+	// publishing session against it (via the alias registry) so agent
+	// A's late reply cannot clear agent B's pending affordance in the
+	// same thread (codex r11).
+	handle  string
+	addedAt time.Time
+	addDone chan struct{}
+	stale   []busyTaken
 }
 
 // busyThreadKey derives the registry thread key for an inbound
@@ -223,6 +229,7 @@ func (r *busyReactionRegistry) clock() time.Time {
 // ordering).
 type busyTaken struct {
 	messageTS string
+	handle    string
 	addDone   chan struct{}
 }
 
@@ -243,7 +250,7 @@ type busyDisplaced struct {
 // superseded marks so their reactions can be cleaned up.
 func (r *busyReactionRegistry) mark(channel, threadKey, messageTS string) chan struct{} {
 	addDone := make(chan struct{})
-	r.markWithDone(channel, threadKey, messageTS, addDone)
+	r.markWithDone(channel, threadKey, messageTS, "", addDone)
 	return addDone
 }
 
@@ -265,7 +272,7 @@ func (r *busyReactionRegistry) mark(channel, threadKey, messageTS string) chan s
 // deletes metadata, never the Slack-side emoji); if the forward
 // fails, the caller restores them via cancelBoth instead (codex r5).
 // Deduplicated by message ts and never includes messageTS itself.
-func (r *busyReactionRegistry) markBoth(channel, threadTS, messageTS string) (addDone chan struct{}, superseded []busyDisplaced) {
+func (r *busyReactionRegistry) markBoth(channel, threadTS, messageTS, handle string) (addDone chan struct{}, superseded []busyDisplaced) {
 	addDone = make(chan struct{})
 	seen := map[string]bool{messageTS: true}
 	collect := func(key string, old busyTaken, ok bool) {
@@ -275,11 +282,11 @@ func (r *busyReactionRegistry) markBoth(channel, threadTS, messageTS string) (ad
 		}
 	}
 	rootKey := busyThreadKey(threadTS, messageTS)
-	for _, old := range r.markWithDone(channel, rootKey, messageTS, addDone) {
+	for _, old := range r.markWithDone(channel, rootKey, messageTS, handle, addDone) {
 		collect(rootKey, old, true)
 	}
 	if threadTS != "" && threadTS != messageTS {
-		for _, old := range r.markWithDone(channel, messageTS, messageTS, addDone) {
+		for _, old := range r.markWithDone(channel, messageTS, messageTS, handle, addDone) {
 			collect(messageTS, old, true)
 		}
 	}
@@ -296,7 +303,7 @@ func (r *busyReactionRegistry) markBoth(channel, threadTS, messageTS string) (ad
 // reactions.add may still be in flight and could land after a remove
 // that only waited for the newer add — and keeps the previous entry's
 // stale ancestors.
-func (r *busyReactionRegistry) markWithDone(channel, threadKey, messageTS string, addDone chan struct{}) (displaced []busyTaken) {
+func (r *busyReactionRegistry) markWithDone(channel, threadKey, messageTS, handle string, addDone chan struct{}) (displaced []busyTaken) {
 	if r == nil || channel == "" || threadKey == "" || messageTS == "" {
 		return nil
 	}
@@ -310,7 +317,7 @@ func (r *busyReactionRegistry) markWithDone(channel, threadKey, messageTS string
 	if prev, present := r.entries[key]; present {
 		switch {
 		case prev.messageTS != messageTS:
-			displaced = append([]busyTaken{{messageTS: prev.messageTS, addDone: prev.addDone}}, prev.stale...)
+			displaced = append([]busyTaken{{messageTS: prev.messageTS, handle: prev.handle, addDone: prev.addDone}}, prev.stale...)
 		default:
 			keepStale = prev.stale
 			if prev.addDone != nil && prev.addDone != addDone {
@@ -325,7 +332,7 @@ func (r *busyReactionRegistry) markWithDone(channel, threadKey, messageTS string
 			}
 		}
 	}
-	r.entries[key] = busyReactionMark{messageTS: messageTS, addedAt: now, addDone: storeDone, stale: keepStale}
+	r.entries[key] = busyReactionMark{messageTS: messageTS, handle: handle, addedAt: now, addDone: storeDone, stale: keepStale}
 	// A fresh targeted inbound re-arms the thread: the next reply is a
 	// legitimate clearing event, so any consumed-key tombstone stops
 	// applying (tombstones only block RESTORING old marks, codex r8).
@@ -407,6 +414,7 @@ func (r *busyReactionRegistry) restoreLocked(channel string, now time.Time, perK
 		}
 		r.entries[key] = busyReactionMark{
 			messageTS: marks[0].messageTS,
+			handle:    marks[0].handle,
 			addedAt:   now,
 			addDone:   marks[0].addDone,
 			stale:     mergeStale(nil, marks[1:]),
@@ -441,7 +449,11 @@ func (r *busyReactionRegistry) restoreDisplaced(channel string, restore []busyDi
 // so a delivered root publish clears every busy affordance pending in
 // that conversation rather than leaving hourglasses stuck forever.
 // Expired entries are dropped, not returned.
-func (r *busyReactionRegistry) takeConversation(channel string) []busyTaken {
+// allow gates consumption by the mark's target handle (codex r11):
+// a live mark whose handle the publisher does not match is left in
+// place — untouched, untombstoned — for its own agent's reply (or
+// TTL) to clear. A nil allow consumes everything (legacy behavior).
+func (r *busyReactionRegistry) takeConversation(channel string, allow func(handle string) bool) []busyTaken {
 	if r == nil || channel == "" {
 		return nil
 	}
@@ -454,12 +466,16 @@ func (r *busyReactionRegistry) takeConversation(channel string) []busyTaken {
 		if k.channel != channel {
 			continue
 		}
-		delete(r.entries, k)
-		r.tombstoneLocked(k, now)
-		if now.Sub(m.addedAt) > busyReactionTTL {
+		expired := now.Sub(m.addedAt) > busyReactionTTL
+		if !expired && allow != nil && !allow(m.handle) {
 			continue
 		}
-		for _, t := range append([]busyTaken{{messageTS: m.messageTS, addDone: m.addDone}}, m.stale...) {
+		delete(r.entries, k)
+		r.tombstoneLocked(k, now)
+		if expired {
+			continue
+		}
+		for _, t := range append([]busyTaken{{messageTS: m.messageTS, handle: m.handle, addDone: m.addDone}}, m.stale...) {
 			if !seen[t.messageTS] {
 				seen[t.messageTS] = true
 				taken = append(taken, t)
@@ -501,13 +517,14 @@ func (r *busyReactionRegistry) takeMessage(channel, threadTS, messageTS string) 
 		expired := now.Sub(m.addedAt) > busyReactionTTL
 		if !expired && !seen[m.messageTS] {
 			seen[m.messageTS] = true
-			taken = append(taken, busyTaken{messageTS: m.messageTS, addDone: m.addDone})
+			taken = append(taken, busyTaken{messageTS: m.messageTS, handle: m.handle, addDone: m.addDone})
 		}
 		if len(m.stale) > 0 && !expired {
 			// Re-park the ancestors: first becomes the key's mark,
 			// the rest stay stale on it.
 			r.entries[key] = busyReactionMark{
 				messageTS: m.stale[0].messageTS,
+				handle:    m.stale[0].handle,
 				addedAt:   now,
 				addDone:   m.stale[0].addDone,
 				stale:     mergeStale(nil, m.stale[1:]),
@@ -529,7 +546,12 @@ func (r *busyReactionRegistry) takeMessage(channel, threadTS, messageTS string) 
 // deleted but NOT returned — the caller must not fire a
 // reactions.remove for a mark past its TTL (its stale ancestors
 // expire with it).
-func (r *busyReactionRegistry) take(channel, threadKey string) []busyTaken {
+// allow gates consumption by the mark's target handle (codex r11): a
+// live mark whose handle the publisher does not match is left in
+// place — untouched, untombstoned — so agent A's late reply into a
+// thread re-targeted at agent B cannot strip B's affordance. A nil
+// allow consumes unconditionally (legacy behavior).
+func (r *busyReactionRegistry) take(channel, threadKey string, allow func(handle string) bool) []busyTaken {
 	if r == nil {
 		return nil
 	}
@@ -540,17 +562,20 @@ func (r *busyReactionRegistry) take(channel, threadKey string) []busyTaken {
 	if !present {
 		return nil
 	}
-	delete(r.entries, key)
 	now := r.clock()
-	r.tombstoneLocked(key, now)
 	expired := now.Sub(m.addedAt) > busyReactionTTL
+	if !expired && allow != nil && !allow(m.handle) {
+		return nil
+	}
+	delete(r.entries, key)
+	r.tombstoneLocked(key, now)
 	seen := map[string]bool{}
 	var taken []busyTaken
 	collect := func(cm busyReactionMark, cmExpired bool) {
 		if cmExpired {
 			return
 		}
-		for _, t := range append([]busyTaken{{messageTS: cm.messageTS, addDone: cm.addDone}}, cm.stale...) {
+		for _, t := range append([]busyTaken{{messageTS: cm.messageTS, handle: cm.handle, addDone: cm.addDone}}, cm.stale...) {
 			if !seen[t.messageTS] {
 				seen[t.messageTS] = true
 				taken = append(taken, t)

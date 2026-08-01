@@ -10,6 +10,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Busy-reaction clears are now attributed to the publishing agent
+  (codex r11): each mark records the parsed target handle, and a
+  delivered reply consumes only marks whose handle resolves (via the
+  handle-alias registry) to the publishing session — so when M1
+  targets agent A and M2 re-targets agent B in the same thread, A's
+  late reply can no longer strip B's pending hourglass. Marks with no
+  recorded handle, an unregistered handle, or an unattributable
+  publisher clear unconditionally, preserving the prior behavior.
+- Launcher alias bootstrap no longer hijacks a handle onto another
+  handle's thread session (codex r9): the thread-session registry
+  records which `@@handle` created each binding (persisted; absent on
+  pre-existing records), and the unclaimed-handle alias bootstrap on
+  thread reuse fires only for the same handle (the codex r8 retry
+  case) — a different `@@handle` converging on an existing thread
+  still posts into that session but is not globally alias-bound to
+  it.
 - Busy-reaction lifecycle (hq-xizo, ported from
   `feat/hq-xizo-slack-full-hardening`): a targeted inbound gets a busy
   reaction (`BUSY_REACTION`, default `hourglass`; set-but-empty

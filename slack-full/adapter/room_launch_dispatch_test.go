@@ -228,7 +228,7 @@ func TestRoomLaunchDispatchReuseOnHitSkipsCreateAndPostsToExistingSession(t *tes
 
 	// Pre-bind the thread → existing session.
 	threadTS := "1700000000.000100"
-	_, _, err := threadReg.AcquireOrCreate("C1", threadTS, func() (string, error) {
+	_, _, _, err := threadReg.AcquireOrCreate("C1", threadTS, "h", func() (string, error) {
 		return "sess-existing-9", nil
 	})
 	if err != nil {
@@ -259,6 +259,60 @@ func TestRoomLaunchDispatchReuseOnHitSkipsCreateAndPostsToExistingSession(t *tes
 	wantPath := "/v0/city/test-city/session/sess-existing-9/messages"
 	if msgPath != wantPath {
 		t.Errorf("message path = %q, want %q", msgPath, wantPath)
+	}
+	// codex r9: the reused thread session was created for handle "h" —
+	// the converging @@new-handle must NOT be globally alias-bound onto
+	// it, or every later `@new-handle` post anywhere routes to the old
+	// session and new-handle can never launch its own.
+	if sid, ok := aliasReg.Get("new-handle"); ok {
+		t.Errorf("new-handle alias-bound to %q on thread reuse; want no binding", sid)
+	}
+}
+
+// TestRoomLaunchDispatchRetrySameHandleStillBootstrapsAlias — the
+// codex r8 retry case survives the r9 hijack fix: a redelivery after a
+// failed first message re-acquires the thread session CREATED FOR THE
+// SAME handle (created=false, boundHandle==handle) and must still bind
+// the alias it advertises in the acknowledgement.
+func TestRoomLaunchDispatchRetrySameHandleStillBootstrapsAlias(t *testing.T) {
+	srv, _ := newGCStub(t)
+	_ = captureSlackPostEphemeral(t)
+
+	cfg := config{
+		gcAPIBase:           srv.URL,
+		cityName:            "test-city",
+		provider:            "slack",
+		accountID:           "T1",
+		handlePrefix:        "@",
+		slackBotToken:       "xoxb-test",
+		dispatchConcurrency: 8,
+		dispatchSem:         defaultTestDispatchSem,
+	}
+	aliasReg := newTestHandleAliasRegistry(t)
+	threadReg := newTestThreadSessionRegistry(t)
+	roomReg := newTestRoomLaunchRegistry(t, "T1", "C1", "mission-control/launcher")
+
+	threadTS := "1700000000.000100"
+	if _, _, _, err := threadReg.AcquireOrCreate("C1", threadTS, "new-handle", func() (string, error) {
+		return "sess-existing-9", nil
+	}); err != nil {
+		t.Fatalf("seed AcquireOrCreate: %v", err)
+	}
+
+	rawMsg, _ := json.Marshal(slackMessageEvent{
+		Type:     "message",
+		Channel:  "C1",
+		User:     "U1",
+		TS:       "1700000000.000200",
+		ThreadTS: threadTS,
+		Text:     "@@new-handle follow up",
+	})
+	env := slackEventEnvelope{Type: "event_callback", Event: rawMsg, TeamID: "T1"}
+
+	processSlackEvent(cfg, aliasReg, threadReg, roomReg, nil, nil, env, func() {})
+
+	if sid, ok := aliasReg.Get("new-handle"); !ok || sid != "sess-existing-9" {
+		t.Errorf("alias after same-handle retry = (%q, %v), want (sess-existing-9, true)", sid, ok)
 	}
 }
 

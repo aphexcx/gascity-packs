@@ -1311,8 +1311,8 @@ func main() {
 	// proxies through /svc/{name}/ (proxy_process mode), or on a
 	// 127.0.0.1 TCP listener (legacy nohup mode).
 	internalMux := http.NewServeMux()
-	internalMux.HandleFunc("/publish", handlePublish(cfg, identityReg, userAliases, newPublishDedupCache(publishDedupTTL)))
-	internalMux.HandleFunc("/publish-file", handlePublishFile(cfg, identityReg))
+	internalMux.HandleFunc("/publish", handlePublish(cfg, identityReg, userAliases, aliasReg, newPublishDedupCache(publishDedupTTL)))
+	internalMux.HandleFunc("/publish-file", handlePublishFile(cfg, identityReg, aliasReg))
 	internalMux.HandleFunc("/react", handleReact(cfg))
 	internalMux.HandleFunc("POST /identity", handleIdentity(identityReg))
 	internalMux.HandleFunc("DELETE /identity", handleIdentityDelete(identityReg))
@@ -1562,7 +1562,7 @@ func (c *publishDedupCache) Put(key string, receipt publishReceipt) {
 	}
 }
 
-func handlePublish(cfg config, reg *identityRegistry, userAliases *userAliasMap, dedup *publishDedupCache) http.HandlerFunc {
+func handlePublish(cfg config, reg *identityRegistry, userAliases *userAliasMap, aliasReg *handleAliasRegistry, dedup *publishDedupCache) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1666,7 +1666,7 @@ func handlePublish(cfg config, reg *identityRegistry, userAliases *userAliasMap,
 		// emoji. The dedup-replay path above returns earlier without
 		// re-checking: the original delivery already consumed the mark.
 		if receipt.Delivered {
-			clearBusyReaction(cfg, req.Conversation.ConversationID, req.ReplyToMessageID)
+			clearBusyReaction(cfg, aliasReg, identitySessionID, req.Conversation.ConversationID, req.ReplyToMessageID)
 		}
 		// Remember delivered receipts so a subsequent retry with the same
 		// idempotency key replays this receipt instead of re-posting. Put
@@ -1689,7 +1689,7 @@ func handlePublish(cfg config, reg *identityRegistry, userAliases *userAliasMap,
 // identity even when an identity record is registered for the source
 // session. This is a Slack platform limitation, not an adapter bug.
 // The identity lookup still happens for log parity with /publish.
-func handlePublishFile(cfg config, reg *identityRegistry) http.HandlerFunc {
+func handlePublishFile(cfg config, reg *identityRegistry, aliasReg *handleAliasRegistry) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1834,7 +1834,7 @@ func handlePublishFile(cfg config, reg *identityRegistry) http.HandlerFunc {
 		// Busy-reaction lifecycle, remove side: a threaded file upload
 		// may be the agent's entire reply — it must clear the pending
 		// busy mark exactly like a text publish (hw-94w5k codex r1).
-		clearBusyReaction(cfg, req.Conversation.ConversationID, req.ReplyToMessageID)
+		clearBusyReaction(cfg, aliasReg, identitySessionID, req.Conversation.ConversationID, req.ReplyToMessageID)
 		writeJSON(w, receipt)
 	}
 }
@@ -2173,15 +2173,32 @@ func handleReact(cfg config) http.HandlerFunc {
 // in-flight add, Slack applies the delayed add after the remove, and
 // the busy emoji sticks forever. Best-effort and async — failures are
 // logged and never affect the caller's receipt.
-func clearBusyReaction(cfg config, conversationID, threadKey string) {
+// The publisher's session id gates WHICH marks the reply may clear
+// (codex r11): a mark recorded for handle H whose alias registry
+// entry resolves to a different session belongs to another agent —
+// M1 targeting A then M2 re-targeting B in the same thread must not
+// let A's late reply consume B's mark and strip B's hourglass before
+// B answered. Marks with no recorded handle, an unregistered handle,
+// or an unattributable publisher (empty session id) clear
+// unconditionally — the pre-r11 behavior.
+func clearBusyReaction(cfg config, aliasReg *handleAliasRegistry, publisherSessionID, conversationID, threadKey string) {
 	if cfg.busyReaction == "" || conversationID == "" {
 		return
 	}
+	allow := func(markHandle string) bool {
+		if markHandle == "" || aliasReg == nil || publisherSessionID == "" {
+			return true
+		}
+		if sid, ok := aliasReg.Get(markHandle); ok {
+			return sid == publisherSessionID
+		}
+		return true
+	}
 	var taken []busyTaken
 	if threadKey == "" {
-		taken = cfg.busyMarks.takeConversation(conversationID)
+		taken = cfg.busyMarks.takeConversation(conversationID, allow)
 	} else {
-		taken = cfg.busyMarks.take(conversationID, threadKey)
+		taken = cfg.busyMarks.take(conversationID, threadKey, allow)
 	}
 	for _, tk := range taken {
 		go removeBusyReaction(cfg, conversationID, tk)
@@ -2901,7 +2918,7 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 	var busyAddDone chan struct{}
 	var busyDisplacedMarks []busyDisplaced
 	if busyEligible {
-		busyAddDone, busyDisplacedMarks = cfg.busyMarks.markBoth(msg.Channel, msg.ThreadTS, msg.TS)
+		busyAddDone, busyDisplacedMarks = cfg.busyMarks.markBoth(msg.Channel, msg.ThreadTS, msg.TS, target)
 	}
 
 	if err := postInbound(cfg, inbound); err != nil {
