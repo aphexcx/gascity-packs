@@ -73,7 +73,7 @@ func TestFileShareSubtypeForwards(t *testing.T) {
 	if !strings.HasPrefix(got[0].Text, "look at this") {
 		t.Errorf("forwarded text = %q, want prefix %q", got[0].Text, "look at this")
 	}
-	for _, want := range []string{"[1 Slack file attached]", "screenshot.png", "id F1"} {
+	for _, want := range []string{"[1 Slack file attached — Read a saved path only if relevant", "screenshot.png", "id F1"} {
 		if !strings.Contains(got[0].Text, want) {
 			t.Errorf("forwarded text missing %q:\n%s", want, got[0].Text)
 		}
@@ -99,7 +99,7 @@ func TestFileOnlyMessageForwards(t *testing.T) {
 	if strings.TrimSpace(got[0].Text) == "" {
 		t.Fatalf("file-only post forwarded with empty text — bound session would get no reminder")
 	}
-	for _, want := range []string{"[1 Slack file attached]", "screenshot.png", "id F1", "not spooled"} {
+	for _, want := range []string{"[1 Slack file attached — Read a saved path only if relevant", "screenshot.png", "id F1", "not spooled"} {
 		if !strings.Contains(got[0].Text, want) {
 			t.Errorf("forwarded text missing %q:\n%s", want, got[0].Text)
 		}
@@ -192,7 +192,7 @@ func TestFileMessageSpoolsAndForwardsLocalPath(t *testing.T) {
 	if len(got[0].Attachments) != 1 || got[0].Attachments[0].URL != "file://"+wantPath {
 		t.Errorf("attachments = %+v, want single file://%s", got[0].Attachments, wantPath)
 	}
-	for _, want := range []string{"[1 Slack file attached]", "saved to " + wantPath, "Read that path"} {
+	for _, want := range []string{"[1 Slack file attached — Read a saved path only if relevant", "saved to " + wantPath, "Read that path"} {
 		if !strings.Contains(got[0].Text, want) {
 			t.Errorf("forwarded text missing %q:\n%s", want, got[0].Text)
 		}
@@ -250,10 +250,10 @@ func TestAliasDispatchTextStaysUnaugmented(t *testing.T) {
 			t.Fatalf("timed out waiting for both deliveries; inbound=%q alias=%q", inboundBody, aliasBody)
 		}
 	}
-	if !strings.Contains(inboundBody, "[1 Slack file attached]") {
+	if !strings.Contains(inboundBody, "[1 Slack file attached — Read a saved path only if relevant") {
 		t.Errorf("channel inbound missing files block:\n%s", inboundBody)
 	}
-	if strings.Contains(aliasBody, "[1 Slack file attached]") {
+	if strings.Contains(aliasBody, "[1 Slack file attached — Read a saved path only if relevant") {
 		t.Errorf("alias dispatch body must not carry the channel files block:\n%s", aliasBody)
 	}
 }
@@ -276,8 +276,8 @@ func TestFormatInboundFilesBlockMixedSpool(t *testing.T) {
 	}
 	got := formatInboundFilesBlock(files, downloaded)
 	for _, want := range []string{
-		"[2 Slack files attached]",
-		"1. a.png (image/png, id F1) — saved to /spool/C1/1.0-a.png; Read that path to view it",
+		"[2 Slack files attached — Read a saved path only if relevant",
+		"1. a.png (image/png, id F1) — saved to /spool/C1/1.0-a.png",
 		"2. b.pdf (application/pdf, id F2) — bytes not spooled locally",
 	} {
 		if !strings.Contains(got, want) {

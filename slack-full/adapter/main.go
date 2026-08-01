@@ -3199,7 +3199,7 @@ func formatInboundFilesBlock(files []slackFile, downloaded []externalAttachment)
 		noun = "file"
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "[%d Slack %s attached]", len(files), noun)
+	fmt.Fprintf(&b, "[%d Slack %s attached — Read a saved path only if relevant; NEVER paste these paths into your reply (a bare local image path triggers Claude Code auto-attach, which re-reads the image every turn and can wedge the session)]", len(files), noun)
 	for i, f := range files {
 		name := f.Name
 		if name == "" {
@@ -3217,7 +3217,7 @@ func formatInboundFilesBlock(files []slackFile, downloaded []externalAttachment)
 			neutralizeMarkupBoundaries(mime),
 			neutralizeMarkupBoundaries(f.ID))
 		if p, ok := localPath[f.ID]; ok {
-			fmt.Fprintf(&b, " — saved to %s; Read that path to view it", neutralizeMarkupBoundaries(p))
+			fmt.Fprintf(&b, " — saved to %s", neutralizeMarkupBoundaries(p))
 		} else {
 			b.WriteString(" — bytes not spooled locally; fetch via Slack API files.info + url_private with the adapter bot token")
 		}
