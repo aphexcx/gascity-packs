@@ -2035,7 +2035,18 @@ func slackPutFileBytes(uploadURL string, filename string, body []byte) error {
 	if err := mw.Close(); err != nil {
 		return fmt.Errorf("close multipart writer: %w", err)
 	}
-	req, err := http.NewRequest(http.MethodPost, uploadURL, &buf)
+	// Size-aware deadline (codex r17): the fixed 120s client rejected
+	// otherwise-valid large/slow uploads (a 1 GB file needs >2 min
+	// below ~67 Mb/s). Grant the base window plus 1 MiB/s of transfer
+	// budget, capped at 30 minutes — the handler imposes no file-size
+	// limit, so the deadline must scale with the payload instead.
+	deadline := uploadBaseTimeout + time.Duration(buf.Len()/(1<<20))*time.Second
+	if deadline > uploadMaxTimeout {
+		deadline = uploadMaxTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), deadline)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uploadURL, &buf)
 	if err != nil {
 		return redactTransportError("build upload request to", safeURL, err)
 	}
@@ -4519,10 +4530,20 @@ var gcForwardClient = &http.Client{Timeout: 20 * time.Second}
 // hang goroutines on a stalled upstream either.
 var slackAPIClient = &http.Client{Timeout: 30 * time.Second}
 
-// slackUploadClient bounds the pre-signed file-bytes POST, which
-// carries whole file payloads and deserves a longer leash than the
-// JSON calls.
-var slackUploadClient = &http.Client{Timeout: 120 * time.Second}
+// slackUploadClient carries the pre-signed file-bytes POST. It has NO
+// client-level timeout: slackPutFileBytes applies a per-request
+// size-aware deadline (uploadBaseTimeout + 1s per MiB, capped at
+// uploadMaxTimeout), because a fixed window rejected valid large or
+// slow uploads (codex r17). Every request through it is
+// context-bounded, so goroutines still cannot hang on a stalled
+// upstream.
+var slackUploadClient = &http.Client{}
+
+// uploadBaseTimeout is the floor every upload gets regardless of size.
+const uploadBaseTimeout = 120 * time.Second
+
+// uploadMaxTimeout caps the size-scaled upload deadline.
+const uploadMaxTimeout = 30 * time.Minute
 
 func postInbound(cfg config, msg externalInboundMessage) error {
 	body, _ := json.Marshal(map[string]any{
