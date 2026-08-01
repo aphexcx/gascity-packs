@@ -524,3 +524,24 @@ func TestRoomLaunchDispatchRollsBackAliasWhenFirstMessageFails(t *testing.T) {
 		t.Errorf("alias survived failed first message: bound to %q; want rolled back", sid)
 	}
 }
+
+// codex r15: DeleteIf is an atomic compare-and-delete — it removes
+// the mapping only while it still points at the given session.
+func TestHandleAliasRegistryDeleteIf(t *testing.T) {
+	reg := newTestHandleAliasRegistry(t)
+	if err := reg.Set("h", "s1"); err != nil {
+		t.Fatal(err)
+	}
+	if deleted, err := reg.DeleteIf("h", "s2"); err != nil || deleted {
+		t.Fatalf("DeleteIf wrong session = (%v, %v), want (false, nil)", deleted, err)
+	}
+	if sid, ok := reg.Get("h"); !ok || sid != "s1" {
+		t.Fatalf("mapping disturbed by non-matching DeleteIf: (%q, %v)", sid, ok)
+	}
+	if deleted, err := reg.DeleteIf("h", "s1"); err != nil || !deleted {
+		t.Fatalf("DeleteIf matching session = (%v, %v), want (true, nil)", deleted, err)
+	}
+	if _, ok := reg.Get("h"); ok {
+		t.Fatal("mapping survived matching DeleteIf")
+	}
+}

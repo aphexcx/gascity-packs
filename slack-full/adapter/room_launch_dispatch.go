@@ -142,13 +142,18 @@ func dispatchRoomLaunch(
 	aliasReserved := false
 	if aliasReg != nil && (created || boundHandle == handle) {
 		if _, claimed := aliasReg.Get(handle); !claimed {
+			// Reserved even when Set returns an error (codex r15): Set
+			// inserts into the in-memory map BEFORE persisting, so a
+			// persistence failure still leaves a live reservation that
+			// the rollback below must be able to undo — otherwise a
+			// parked redelivery would see the handle pre-claimed and
+			// commit without ever re-posting the remainder.
+			aliasReserved = true
 			if err := aliasReg.Set(handle, sessionID); err != nil {
 				log.Printf("launcher dispatch: aliasReg.Set handle=%q session=%s: %v",
 					handle, sessionID, err)
 				// Continue — alias bootstrap is best-effort. The user
 				// can re-register manually via /handle-alias if needed.
-			} else {
-				aliasReserved = true
 			}
 		}
 	}
@@ -171,10 +176,11 @@ func dispatchRoomLaunch(
 		// at OUR session, so a racing re-registration is never
 		// clobbered.
 		if aliasReserved {
-			if sid, ok := aliasReg.Get(handle); ok && sid == sessionID {
-				if _, err := aliasReg.Delete(handle); err != nil {
-					log.Printf("launcher dispatch: rollback aliasReg.Delete handle=%q: %v", handle, err)
-				}
+			// Compare-and-delete under one registry lock (codex r15):
+			// a racing re-registration installed between a separate
+			// Get and Delete would otherwise be removed too.
+			if _, err := aliasReg.DeleteIf(handle, sessionID); err != nil {
+				log.Printf("launcher dispatch: rollback aliasReg.DeleteIf handle=%q: %v", handle, err)
 			}
 		}
 		body := fmt.Sprintf(

@@ -4165,6 +4165,23 @@ func (r *handleAliasRegistry) Delete(handle string) (bool, error) {
 	return existed, nil
 }
 
+// DeleteIf removes handle only while it still maps to sessionID, under
+// one lock (codex r15): the launcher rollback's separate Get+Delete
+// left a window where a racing re-registration could be installed
+// between the check and the delete and then be unconditionally
+// removed, leaving that session unaddressable. Reports whether the
+// mapping was deleted.
+func (r *handleAliasRegistry) DeleteIf(handle, sessionID string) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	sid, ok := r.byHandle[handle]
+	if !ok || sid != sessionID {
+		return false, nil
+	}
+	delete(r.byHandle, handle)
+	return true, r.saveLocked()
+}
+
 func (r *handleAliasRegistry) load() error {
 	if r.diskPath == "" {
 		return nil

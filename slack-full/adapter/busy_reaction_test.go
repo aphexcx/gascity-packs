@@ -1102,3 +1102,55 @@ func TestClearBusyReactionMatchesPublisherSession(t *testing.T) {
 		t.Fatalf("owning session's reply: got (%s on %s), want remove on 1.0", got.op, got.timestamp)
 	}
 }
+
+// codex r16: stale ancestors are matched per handle. Alpha's orphaned
+// reaction riding in beta's entry must be cleared by ALPHA's reply
+// (and only alpha's), while beta's own mark stays for beta.
+func TestBusyReactionRegistry_StaleAncestorsMatchedPerHandle(t *testing.T) {
+	r := newBusyReactionRegistry()
+	// alpha targets the thread; beta re-targets it, displacing alpha's
+	// mark under the thread-root key; the failed-re-target path then
+	// restores alpha's mark as a stale ancestor on beta's entry.
+	dA, _ := r.markBoth("C1", "root.0", "1.0", "alpha")
+	close(dA)
+	dB, superseded := r.markBoth("C1", "root.0", "2.0", "beta")
+	close(dB)
+	if len(superseded) != 1 {
+		t.Fatalf("superseded = %v, want alpha's displaced mark", superseded)
+	}
+	r.restoreDisplaced("C1", superseded)
+
+	// Beta's reply clears ONLY beta's mark; alpha's ancestor re-parks.
+	taken := r.take("C1", "root.0", func(h string) bool { return h == "beta" })
+	got := map[string]bool{}
+	for _, tk := range taken {
+		got[tk.messageTS] = true
+	}
+	if !got["2.0"] || got["1.0"] || len(taken) != 1 {
+		t.Fatalf("beta's take = %v, want exactly [2.0]", taken)
+	}
+	// Alpha's reply then clears its re-parked mark.
+	taken = r.take("C1", "root.0", func(h string) bool { return h == "alpha" })
+	if len(taken) != 1 || taken[0].messageTS != "1.0" {
+		t.Fatalf("alpha's take = %v, want [1.0]", taken)
+	}
+}
+
+// codex r16: takeConversation partitions per mark too — a root reply
+// by alpha clears alpha's marks and unattributed ones while beta's
+// survive, including when they ride the same entry.
+func TestBusyReactionRegistry_TakeConversationPartitionsStale(t *testing.T) {
+	r := newBusyReactionRegistry()
+	dB, _ := r.markBoth("C1", "", "2.0", "beta")
+	close(dB)
+	// Alpha's orphan rides beta's entry as a stale ancestor.
+	r.restoreDisplaced("C1", []busyDisplaced{{threadKey: "2.0", mark: busyTaken{messageTS: "1.0", handle: "alpha"}}})
+
+	taken := r.takeConversation("C1", func(h string) bool { return h == "alpha" })
+	if len(taken) != 1 || taken[0].messageTS != "1.0" {
+		t.Fatalf("alpha's root reply took %v, want exactly [1.0]", taken)
+	}
+	if _, ok := r.pending("C1", "2.0"); !ok {
+		t.Fatal("beta's mark gone after alpha's root reply")
+	}
+}

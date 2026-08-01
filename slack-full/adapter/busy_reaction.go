@@ -449,6 +449,22 @@ func (r *busyReactionRegistry) restoreDisplaced(channel string, restore []busyDi
 // so a delivered root publish clears every busy affordance pending in
 // that conversation rather than leaving hourglasses stuck forever.
 // Expired entries are dropped, not returned.
+
+// splitByAllow partitions marks into those the publisher may clear
+// (unattributed, or allow reports a match) and those that must stay
+// parked for their own agents (codex r16). A nil allow clears
+// everything.
+func splitByAllow(marks []busyTaken, allow func(handle string) bool) (want, keep []busyTaken) {
+	for _, t := range marks {
+		if allow == nil || t.handle == "" || allow(t.handle) {
+			want = append(want, t)
+		} else {
+			keep = append(keep, t)
+		}
+	}
+	return want, keep
+}
+
 // allow gates consumption by the mark's target handle (codex r11):
 // a live mark whose handle the publisher does not match is left in
 // place — untouched, untombstoned — for its own agent's reply (or
@@ -466,16 +482,36 @@ func (r *busyReactionRegistry) takeConversation(channel string, allow func(handl
 		if k.channel != channel {
 			continue
 		}
-		expired := now.Sub(m.addedAt) > busyReactionTTL
-		if !expired && allow != nil && !allow(m.handle) {
+		if now.Sub(m.addedAt) > busyReactionTTL {
+			delete(r.entries, k)
+			r.tombstoneLocked(k, now)
+			continue
+		}
+		// Partition the entry's pool — its own mark plus stale
+		// ancestors — per mark (codex r16): overlapping re-targets can
+		// leave another agent's orphaned reaction riding in m.stale,
+		// and it must neither be cleared by this publisher nor block
+		// this publisher's own marks.
+		pool := append([]busyTaken{{messageTS: m.messageTS, handle: m.handle, addDone: m.addDone}}, m.stale...)
+		want, keep := splitByAllow(pool, allow)
+		if len(want) == 0 {
 			continue
 		}
 		delete(r.entries, k)
-		r.tombstoneLocked(k, now)
-		if expired {
-			continue
+		if len(keep) > 0 {
+			// Re-park the survivors under the key for their own
+			// agents' replies (or TTL); the thread is not consumed.
+			r.entries[k] = busyReactionMark{
+				messageTS: keep[0].messageTS,
+				handle:    keep[0].handle,
+				addedAt:   now,
+				addDone:   keep[0].addDone,
+				stale:     mergeStale(nil, keep[1:]),
+			}
+		} else {
+			r.tombstoneLocked(k, now)
 		}
-		for _, t := range append([]busyTaken{{messageTS: m.messageTS, handle: m.handle, addDone: m.addDone}}, m.stale...) {
+		for _, t := range want {
 			if !seen[t.messageTS] {
 				seen[t.messageTS] = true
 				taken = append(taken, t)
@@ -563,33 +599,53 @@ func (r *busyReactionRegistry) take(channel, threadKey string, allow func(handle
 		return nil
 	}
 	now := r.clock()
-	expired := now.Sub(m.addedAt) > busyReactionTTL
-	if !expired && allow != nil && !allow(m.handle) {
-		return nil
-	}
-	delete(r.entries, key)
-	r.tombstoneLocked(key, now)
 	seen := map[string]bool{}
 	var taken []busyTaken
-	collect := func(cm busyReactionMark, cmExpired bool) {
-		if cmExpired {
-			return
+	// consume partitions one entry's pool per mark (codex r16): marks
+	// the publisher owns (or unattributed ones) are collected; another
+	// agent's marks — the entry's own or stale ancestors from
+	// overlapping re-targets — are re-parked under the key untombstoned
+	// so their own replies (or TTL) still clear them. Reports whether
+	// anything was consumed.
+	consume := func(k busyReactionKey, cm busyReactionMark) bool {
+		if now.Sub(cm.addedAt) > busyReactionTTL {
+			delete(r.entries, k)
+			r.tombstoneLocked(k, now)
+			return false
 		}
-		for _, t := range append([]busyTaken{{messageTS: cm.messageTS, handle: cm.handle, addDone: cm.addDone}}, cm.stale...) {
+		pool := append([]busyTaken{{messageTS: cm.messageTS, handle: cm.handle, addDone: cm.addDone}}, cm.stale...)
+		want, keep := splitByAllow(pool, allow)
+		if len(want) == 0 {
+			return false
+		}
+		delete(r.entries, k)
+		if len(keep) > 0 {
+			r.entries[k] = busyReactionMark{
+				messageTS: keep[0].messageTS,
+				handle:    keep[0].handle,
+				addedAt:   now,
+				addDone:   keep[0].addDone,
+				stale:     mergeStale(nil, keep[1:]),
+			}
+		} else {
+			r.tombstoneLocked(k, now)
+		}
+		for _, t := range want {
 			if !seen[t.messageTS] {
 				seen[t.messageTS] = true
 				taken = append(taken, t)
 			}
 		}
+		return true
 	}
-	collect(m, expired)
+	if !consume(key, m) {
+		return taken
+	}
 	for k, sib := range r.entries {
 		if k.channel != channel || sib.messageTS != m.messageTS {
 			continue
 		}
-		delete(r.entries, k)
-		r.tombstoneLocked(k, now)
-		collect(sib, now.Sub(sib.addedAt) > busyReactionTTL)
+		consume(k, sib)
 	}
 	return taken
 }
