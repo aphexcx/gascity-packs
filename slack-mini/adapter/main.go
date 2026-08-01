@@ -381,12 +381,24 @@ func handleSlackEvents(cfg config) http.HandlerFunc {
 		// synchronous cost is one decode + one fsync'd file write,
 		// well inside Slack's 3s ack budget. Enrichment (users.info)
 		// and delivery stay async.
-		if inbound, spoolPath, ok := prepareInbound(cfg, env); ok {
+		inbound, spoolPath, spoolErr, ok := prepareInbound(cfg, env)
+		if !ok {
 			w.WriteHeader(http.StatusOK)
-			go finishInbound(cfg, inbound, spoolPath)
+			return
+		}
+		if spoolErr != nil {
+			// Spooling is CONFIGURED but failed (full/unwritable disk):
+			// acking now would let a crash lose the mention with no
+			// replayable entry — answer 5xx so Slack redelivers (codex
+			// round 3 P1; duplicates dedupe by ts). Explicitly disabled
+			// spooling (empty spoolDir) still acks and rides the
+			// in-memory retries.
+			log.Printf("inbound spool failed; NACKing for Slack retry: %v", spoolErr)
+			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
+		go finishInbound(cfg, inbound, spoolPath)
 	}
 }
 
@@ -395,7 +407,7 @@ func handleSlackEvents(cfg config) http.HandlerFunc {
 // handler calls the two halves itself so the spool write lands before
 // the Slack ack.
 func bridgeEvent(cfg config, env slackEventEnvelope) {
-	if inbound, spoolPath, ok := prepareInbound(cfg, env); ok {
+	if inbound, spoolPath, _, ok := prepareInbound(cfg, env); ok {
 		finishInbound(cfg, inbound, spoolPath)
 	}
 }
@@ -406,24 +418,24 @@ func bridgeEvent(cfg config, env slackEventEnvelope) {
 // empty body). The Actor's DisplayName is left as the raw user id here
 // — the users.info lookup can take seconds and must not delay the
 // Slack ack; finishInbound resolves it before the forward.
-func prepareInbound(cfg config, env slackEventEnvelope) (externalInboundMessage, string, bool) {
+func prepareInbound(cfg config, env slackEventEnvelope) (externalInboundMessage, string, error, bool) {
 	if env.Type != "event_callback" || len(env.Event) == 0 {
-		return externalInboundMessage{}, "", false
+		return externalInboundMessage{}, "", nil, false
 	}
 	var msg slackMessageEvent
 	if err := json.Unmarshal(env.Event, &msg); err != nil {
 		log.Printf("decode slack event: %v", err)
-		return externalInboundMessage{}, "", false
+		return externalInboundMessage{}, "", nil, false
 	}
 	if msg.Type != "app_mention" {
-		return externalInboundMessage{}, "", false
+		return externalInboundMessage{}, "", nil, false
 	}
 	if msg.BotID != "" || msg.Subtype != "" || msg.User == "" {
-		return externalInboundMessage{}, "", false
+		return externalInboundMessage{}, "", nil, false
 	}
 	text := stripLeadingMention(msg.Text)
 	if text == "" {
-		return externalInboundMessage{}, "", false
+		return externalInboundMessage{}, "", nil, false
 	}
 
 	// Log receipt before the first forward attempt so a message that later
@@ -450,14 +462,24 @@ func prepareInbound(cfg config, env slackEventEnvelope) (externalInboundMessage,
 		DedupKey:         "slack-" + msg.TS,
 		ReceivedAt:       time.Now().UTC(),
 	}
-	return inbound, spoolInbound(cfg.spoolDir, inbound), true
+	spoolPath, spoolErr := spoolInbound(cfg.spoolDir, inbound)
+	return inbound, spoolPath, spoolErr, true
 }
 
 // finishInbound runs the async half of the bridge: display-name
 // enrichment (bounded by userInfoTimeout) and the retried forward.
 // Each gc call is bounded by gcCallTimeout and the retry schedule
 // bounds the goroutine's total lifetime to ~2 minutes.
+// finishInboundSem bounds concurrent live deliveries (codex round 3):
+// each finishInbound can run users.info plus ~3 minutes of gc retries,
+// and an unbounded burst would exhaust sockets or hammer a recovering
+// gc. Waiters are accepted Slack events (rate-bounded upstream) parked
+// on a cheap channel; startup replay has its own 4-worker bound.
+var finishInboundSem = make(chan struct{}, 8)
+
 func finishInbound(cfg config, inbound externalInboundMessage, spoolPath string) {
+	finishInboundSem <- struct{}{}
+	defer func() { <-finishInboundSem }()
 	inbound.Actor.DisplayName = resolveUserDisplayName(context.Background(), userNames, cfg, inbound.Actor.ID)
 	deliverInbound(cfg, inbound, spoolPath)
 }
@@ -467,26 +489,23 @@ func finishInbound(cfg config, inbound externalInboundMessage, spoolPath string)
 // Returns the spool file path, or "" when spooling is disabled (no spool
 // dir) or the write fails — persistence is best-effort and never blocks
 // the bridge.
-func spoolInbound(spoolDir string, msg externalInboundMessage) string {
+func spoolInbound(spoolDir string, msg externalInboundMessage) (string, error) {
 	if spoolDir == "" {
-		return ""
+		return "", nil
 	}
 	if err := os.MkdirAll(spoolDir, 0o700); err != nil {
-		log.Printf("spool: mkdir %s: %v", spoolDir, err)
-		return ""
+		return "", fmt.Errorf("spool: mkdir %s: %w", spoolDir, err)
 	}
 	data, err := json.Marshal(msg)
 	if err != nil {
-		log.Printf("spool: marshal: %v", err)
-		return ""
+		return "", fmt.Errorf("spool: marshal: %w", err)
 	}
 	name := fmt.Sprintf("%d-%s.json", time.Now().UnixNano(), sanitizeSpoolName(msg.DedupKey))
 	path := filepath.Join(spoolDir, name)
 	if err := writeSpoolFileAtomic(path, data); err != nil {
-		log.Printf("spool: write %s: %v", path, err)
-		return ""
+		return "", fmt.Errorf("spool: write %s: %w", path, err)
 	}
-	return path
+	return path, nil
 }
 
 // writeSpoolFileAtomic writes data to path via a same-dir temp file +
@@ -526,7 +545,19 @@ func writeSpoolFileAtomic(path string, data []byte) error {
 		cleanup()
 		return fmt.Errorf("rename %q -> %q: %w", tmpName, path, err)
 	}
-	return nil
+	// Fsync the parent directory so the rename itself survives a host
+	// crash (codex round 3): the file contents were synced above, but
+	// the directory entry was not — and a spool entry that vanishes on
+	// reboot silently loses an acked Slack event.
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open dir %q for sync: %w", dir, err)
+	}
+	if err := d.Sync(); err != nil {
+		_ = d.Close()
+		return fmt.Errorf("sync dir %q: %w", dir, err)
+	}
+	return d.Close()
 }
 
 // spoolNameRE matches characters unsafe in a spool filename.
@@ -686,12 +717,26 @@ type cachedUserName struct {
 // userNameCache is an in-memory users.info result cache. Tier 1 keeps no
 // on-disk registries by design, so entries live for the process lifetime.
 type userNameCache struct {
-	mu      sync.Mutex
-	entries map[string]cachedUserName
+	mu       sync.Mutex
+	entries  map[string]cachedUserName
+	inflight map[string]*userNameProbe
+}
+
+// userNameProbe coalesces concurrent users.info lookups for one user
+// (codex round 3): a burst of mentions from an uncached user — or the
+// four replay workers — would otherwise each fire users.info, tripping
+// rate limits and letting a late failure overwrite a success. done is
+// closed after name is populated; waiters read it only after <-done.
+type userNameProbe struct {
+	done chan struct{}
+	name string
 }
 
 func newUserNameCache() *userNameCache {
-	return &userNameCache{entries: make(map[string]cachedUserName)}
+	return &userNameCache{
+		entries:  make(map[string]cachedUserName),
+		inflight: make(map[string]*userNameProbe),
+	}
 }
 
 func (c *userNameCache) get(userID string, now time.Time) (string, bool) {
@@ -742,13 +787,32 @@ func resolveUserDisplayName(ctx context.Context, cache *userNameCache, cfg confi
 	if name, ok := cache.get(userID, now); ok {
 		return name
 	}
+	// Coalesce concurrent misses onto one users.info call (codex round
+	// 3): later callers wait on the winner's probe (bounded by its
+	// userInfoTimeout-scoped request) and adopt its answer.
+	cache.mu.Lock()
+	if p, ok := cache.inflight[userID]; ok {
+		cache.mu.Unlock()
+		<-p.done
+		return p.name
+	}
+	probe := &userNameProbe{done: make(chan struct{})}
+	cache.inflight[userID] = probe
+	cache.mu.Unlock()
+
 	name := fetchUserDisplayName(ctx, cfg, userID)
 	if name == "" {
 		cache.put(userID, userID, now, userNameFailureTTL)
-		return userID
+		probe.name = userID
+	} else {
+		cache.put(userID, name, now, userNameCacheTTL)
+		probe.name = name
 	}
-	cache.put(userID, name, now, userNameCacheTTL)
-	return name
+	cache.mu.Lock()
+	delete(cache.inflight, userID)
+	cache.mu.Unlock()
+	close(probe.done)
+	return probe.name
 }
 
 // fetchUserDisplayName performs the users.info call, returning "" on any
@@ -1062,7 +1126,12 @@ func slackifyMarkdown(text string) string {
 	// `**` belongs to the bold span, not the URL — swallowing it into
 	// the protected span would leave the bold pass without its closer.
 	out = bareURLRE.ReplaceAllStringFunc(out, func(m string) string {
-		trimmed := strings.TrimRight(m, "*_~")
+		// Sentence punctuation first, THEN emphasis delimiters (codex
+		// round 3): in `**see https://example.com**.` the trailing
+		// period hides the `**` from a delimiter-only trim.
+		trimmed := strings.TrimRight(m, ".,;:!?")
+		trimmed = strings.TrimRight(trimmed, "*_~")
+		trimmed = strings.TrimRight(trimmed, ".,;:!?")
 		if trimmed == "" {
 			return m
 		}
@@ -1146,11 +1215,17 @@ func protectFencedBlocks(s string, protect func(string) string) string {
 			i++
 			continue
 		}
+		// GFM: the closing fence must be AT LEAST as long as the
+		// opener (codex round 3) — a ```` fence may contain ``` lines.
+		opener := 0
+		for opener < len(trimmed) && trimmed[opener] == '`' {
+			opener++
+		}
 		j := i + 1
 		closed := -1
 		for j < len(lines) {
 			body := strings.TrimSpace(lines[j])
-			if len(body) >= 3 && strings.Count(body, "`") == len(body) {
+			if len(body) >= opener && strings.Count(body, "`") == len(body) {
 				closed = j
 				break
 			}
@@ -1160,7 +1235,16 @@ func protectFencedBlocks(s string, protect func(string) string) string {
 			b.WriteString(protect(strings.Join(lines[i:], "")))
 			break
 		}
-		b.WriteString(protect(strings.Join(lines[i:closed+1], "")))
+		// Keep the block's trailing newline OUTSIDE the placeholder
+		// (codex round 3): swallowing it would glue the next line onto
+		// the placeholder and break line-anchored passes (headings).
+		block := strings.Join(lines[i:closed+1], "")
+		if strings.HasSuffix(block, "\n") {
+			b.WriteString(protect(block[:len(block)-1]))
+			b.WriteString("\n")
+		} else {
+			b.WriteString(protect(block))
+		}
 		i = closed + 1
 	}
 	return b.String()
@@ -1267,7 +1351,11 @@ func convertMarkdownLinks(s string, protect func(string) string) string {
 		dest := destB.String()
 		if depth == 0 && linkText != "" &&
 			(strings.HasPrefix(dest, "http://") || strings.HasPrefix(dest, "https://")) {
-			b.WriteString(protect("<" + dest + "|" + linkText + ">"))
+			// Slack mrkdwn control characters in the label would
+			// terminate the <url|label> form early (codex round 3):
+			// `[x > y](…)` must not leak a raw '>' into the link.
+			label := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(linkText)
+			b.WriteString(protect("<" + dest + "|" + label + ">"))
 			i = j + 1
 			continue
 		}

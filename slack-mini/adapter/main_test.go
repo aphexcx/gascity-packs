@@ -561,7 +561,7 @@ func TestDeliverInboundRetriesUntilSuccess(t *testing.T) {
 	spool := t.TempDir()
 	cfg := config{gcAPIBase: srv.URL, cityName: "c", spoolDir: spool}
 	msg := externalInboundMessage{ProviderMessageID: "1700000000.0001", DedupKey: "slack-1700000000.0001"}
-	path := spoolInbound(spool, msg)
+	path, _ := spoolInbound(spool, msg)
 	if path == "" {
 		t.Fatal("spoolInbound returned no path")
 	}
@@ -596,7 +596,7 @@ func TestDeliverInboundDeadLettersOnExhaustion(t *testing.T) {
 		DedupKey:          "slack-1700000000.0002",
 		Text:              "lost mention",
 	}
-	path := spoolInbound(spool, msg)
+	path, _ := spoolInbound(spool, msg)
 	if path == "" {
 		t.Fatal("spoolInbound returned no path")
 	}
@@ -645,7 +645,7 @@ func TestReplaySpoolRedelivers(t *testing.T) {
 		DedupKey:          "slack-1700000000.0003",
 		Text:              "orphaned by crash",
 	}
-	path := spoolInbound(spool, msg)
+	path, _ := spoolInbound(spool, msg)
 	if path == "" {
 		t.Fatal("spoolInbound returned no path")
 	}
