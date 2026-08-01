@@ -70,14 +70,66 @@ type eventDedupEntry struct {
 type eventDedupCache struct {
 	mu      sync.Mutex
 	entries map[string]*eventDedupEntry
-	ttl     time.Duration
+	// channelLegDone remembers event ids whose postInbound leg
+	// SUCCEEDED before a later leg (the alias dispatch) failed and
+	// forgot the entry (codex r12). The retaken redelivery must skip
+	// the channel leg — core does not consume DedupKey (see
+	// docs/phase5-ledger-readiness.md), so re-running postInbound
+	// duplicates the bound session's turn — and retry only the alias
+	// leg. Markers expire with the same TTL as committed entries and
+	// are cleared on commit.
+	channelLegDone map[string]time.Time
+	ttl            time.Duration
 	// now is the clock; nil means time.Now. Injectable so tests can
 	// drive TTL expiry without sleeping.
 	now func() time.Time
 }
 
 func newEventDedupCache(ttl time.Duration) *eventDedupCache {
-	return &eventDedupCache{entries: make(map[string]*eventDedupEntry), ttl: ttl}
+	return &eventDedupCache{
+		entries:        make(map[string]*eventDedupEntry),
+		channelLegDone: make(map[string]time.Time),
+		ttl:            ttl,
+	}
+}
+
+// markChannelLegDone records that id's postInbound leg succeeded, so
+// a retaken redelivery (after forget) skips it and retries only the
+// failed alias leg. Must be called BEFORE forget(id) wakes a parked
+// retry.
+func (c *eventDedupCache) markChannelLegDone(id string) {
+	if c == nil || id == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := c.clock()
+	for k, at := range c.channelLegDone {
+		if now.Sub(at) > c.ttl {
+			delete(c.channelLegDone, k)
+		}
+	}
+	c.channelLegDone[id] = now
+	if len(c.channelLegDone) > eventDedupMaxEntries {
+		for k := range c.channelLegDone {
+			delete(c.channelLegDone, k)
+			if len(c.channelLegDone) <= eventDedupMaxEntries {
+				break
+			}
+		}
+	}
+}
+
+// isChannelLegDone reports whether id's channel leg already reached
+// gc within the TTL.
+func (c *eventDedupCache) isChannelLegDone(id string) bool {
+	if c == nil || id == "" {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	at, ok := c.channelLegDone[id]
+	return ok && c.clock().Sub(at) <= c.ttl
 }
 
 func (c *eventDedupCache) clock() time.Time {
@@ -137,6 +189,7 @@ func (c *eventDedupCache) commit(id string) {
 		return
 	}
 	e.committedAt = c.clock()
+	delete(c.channelLegDone, id)
 	if !e.closed {
 		e.closed = true
 		close(e.done)

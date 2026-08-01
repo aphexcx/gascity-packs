@@ -481,3 +481,46 @@ func TestRoomLaunchDispatchSaturationDropsAtOuterSlot(t *testing.T) {
 		t.Errorf("/v0/sessions POSTs = %d, want 0 on saturation", got)
 	}
 }
+
+// codex r13: the alias is reserved before the first-message POST (so
+// a fast `@handle` follow-up routes to the launcher session instead
+// of falling to the channel-bound path), and rolled back when that
+// POST fails — a woken redelivery must re-enter the launcher path,
+// not the pre-claimed alias branch that would swallow the un-posted
+// remainder.
+func TestRoomLaunchDispatchRollsBackAliasWhenFirstMessageFails(t *testing.T) {
+	srv, hits := newGCStub(t)
+	_ = captureSlackPostEphemeral(t)
+	hits.messageStatus.Store(http.StatusInternalServerError)
+
+	cfg := config{
+		gcAPIBase:           srv.URL,
+		cityName:            "test-city",
+		provider:            "slack",
+		accountID:           "T1",
+		handlePrefix:        "@",
+		slackBotToken:       "xoxb-test",
+		dispatchConcurrency: 8,
+		dispatchSem:         defaultTestDispatchSem,
+	}
+	aliasReg := newTestHandleAliasRegistry(t)
+	threadReg := newTestThreadSessionRegistry(t)
+	roomReg := newTestRoomLaunchRegistry(t, "T1", "C1", "mission-control/launcher")
+
+	rawMsg, _ := json.Marshal(slackMessageEvent{
+		Type:    "message",
+		Channel: "C1",
+		User:    "U1",
+		TS:      "1700000000.000300",
+		Text:    "@@rollback-handle first message",
+	})
+	env := slackEventEnvelope{Type: "event_callback", Event: rawMsg, TeamID: "T1"}
+	processSlackEvent(cfg, aliasReg, threadReg, roomReg, nil, nil, env, func() {})
+
+	if got := atomic.LoadInt32(&hits.sessionMessages); got == 0 {
+		t.Fatal("first-message POST never attempted")
+	}
+	if sid, ok := aliasReg.Get("rollback-handle"); ok {
+		t.Errorf("alias survived failed first message: bound to %q; want rolled back", sid)
+	}
+}

@@ -118,6 +118,41 @@ func dispatchRoomLaunch(
 		return false
 	}
 
+	// Reserve the alias BEFORE the first-message round trip (codex
+	// r13): postSessionMessage can take seconds, and a user's
+	// `@<handle>` follow-up processed in that window used to miss the
+	// alias lookup and fall through to the channel-bound path — which
+	// the launcher session is not on — losing the follow-up. The
+	// reservation is rolled back below if the first post fails,
+	// BEFORE this function returns false and the caller releases the
+	// event's dedup claim, so a woken redelivery sees no alias and
+	// correctly re-enters the launcher path (the codex r7 concern
+	// about the pre-claimed branch swallowing the un-posted remainder).
+	//
+	// Gated on the handle being unclaimed rather than on `created`
+	// alone (codex r8): a retry after a failed first message
+	// re-acquires the existing thread session (created=false) and
+	// must still bind the handle it advertises in the acknowledgement
+	// below. But ONLY when the stored binding was created for this
+	// same handle (codex r9): a DIFFERENT `@@handle` converging on an
+	// existing thread session must not register its unclaimed handle
+	// globally onto that old session — that would route every later
+	// `@handle` post anywhere to the wrong session and permanently
+	// block the handle from launching its own.
+	aliasReserved := false
+	if aliasReg != nil && (created || boundHandle == handle) {
+		if _, claimed := aliasReg.Get(handle); !claimed {
+			if err := aliasReg.Set(handle, sessionID); err != nil {
+				log.Printf("launcher dispatch: aliasReg.Set handle=%q session=%s: %v",
+					handle, sessionID, err)
+				// Continue — alias bootstrap is best-effort. The user
+				// can re-register manually via /handle-alias if needed.
+			} else {
+				aliasReserved = true
+			}
+		}
+	}
+
 	// Post the remainder as the session's first/next message via the
 	// shared session-message helper. The receiving session sees the
 	// raw remainder so the user's first message reads naturally; we
@@ -128,6 +163,20 @@ func dispatchRoomLaunch(
 	if err := postSessionMessage(cfg, sessionID, remainder, "gc-slack-adapter-launcher"); err != nil {
 		log.Printf("launcher dispatch: post session message handle=%q session=%s: %v",
 			handle, sessionID, err)
+		// Roll the reservation back before the caller releases the
+		// dedup claim (codex r13): a woken redelivery must re-enter
+		// the launcher path (which re-posts the remainder), not the
+		// pre-claimed alias branch (which would commit without ever
+		// posting it — codex r7). Deleted only while it still points
+		// at OUR session, so a racing re-registration is never
+		// clobbered.
+		if aliasReserved {
+			if sid, ok := aliasReg.Get(handle); ok && sid == sessionID {
+				if _, err := aliasReg.Delete(handle); err != nil {
+					log.Printf("launcher dispatch: rollback aliasReg.Delete handle=%q: %v", handle, err)
+				}
+			}
+		}
 		body := fmt.Sprintf(
 			"launcher started session %s for @@%s but the first message could not be delivered: %s",
 			neutralizeMarkupBoundaries(sessionID),
@@ -139,36 +188,7 @@ func dispatchRoomLaunch(
 		}
 		// Transient: the session exists but never got the message — a
 		// redelivery re-acquires the same thread session and re-posts.
-		// The alias is deliberately NOT registered yet (below, after
-		// this succeeds): a registered alias would send the redelivery
-		// down handleDoubleHandleDispatch's pre-claimed branch, which
-		// commits without ever re-posting the remainder (codex r7).
 		return false
-	}
-
-	// Bootstrap alias only after the first message actually landed, so
-	// the next `@<handle> ...` post routes via the single-`@` alias
-	// dispatch path. Ordered after postSessionMessage (codex r7) — see
-	// the failure comment above. Gated on the handle being unclaimed
-	// rather than on `created` alone (codex r8): a retry after a
-	// failed first message re-acquires the existing thread session
-	// (created=false) and must still bind the handle it advertises in
-	// the acknowledgement below. But ONLY when the stored binding was
-	// created for this same handle (codex r9): a DIFFERENT `@@handle`
-	// converging on an existing thread session must not register its
-	// unclaimed handle globally onto that old session — that would
-	// route every later `@handle` post anywhere to the wrong session
-	// and permanently block the handle from launching its own.
-	if aliasReg != nil && (created || boundHandle == handle) {
-		if _, claimed := aliasReg.Get(handle); !claimed {
-			if err := aliasReg.Set(handle, sessionID); err != nil {
-				log.Printf("launcher dispatch: aliasReg.Set handle=%q session=%s: %v",
-					handle, sessionID, err)
-				// Continue — the message landed; alias bootstrap is
-				// best-effort. The user can re-register manually via
-				// /handle-alias if needed.
-			}
-		}
 	}
 
 	// Acknowledge to the user. Different wording for spawn vs. reuse so

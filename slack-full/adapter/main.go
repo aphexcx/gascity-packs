@@ -2921,7 +2921,15 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 		busyAddDone, busyDisplacedMarks = cfg.busyMarks.markBoth(msg.Channel, msg.ThreadTS, msg.TS, target)
 	}
 
-	if err := postInbound(cfg, inbound); err != nil {
+	// A retaken redelivery whose channel leg already reached gc must
+	// not re-run postInbound — core does not consume DedupKey, so the
+	// bound session would receive a duplicate turn (codex r12). Only
+	// the failed alias leg below is retried.
+	channelLegDone := cfg.eventDedup.isChannelLegDone(env.EventID)
+	if channelLegDone {
+		log.Printf("inbound: channel leg already delivered event=%s chan=%s ts=%s — retrying alias leg only",
+			env.EventID, msg.Channel, msg.TS)
+	} else if err := postInbound(cfg, inbound); err != nil {
 		log.Printf("inbound POST failed: %v", err)
 		// Nothing reached gc. Cancel the busy mark FIRST — no agent
 		// received the message, so no reply will ever come to clear
@@ -2942,9 +2950,10 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 		commitDedup = false
 		cfg.eventDedup.forget(env.EventID)
 		return
+	} else {
+		log.Printf("inbound: chan=%s user=%s ts=%s thread=%s target=%q files=%d text=%dch",
+			msg.Channel, msg.User, msg.TS, msg.ThreadTS, target, len(attachments), len(text))
 	}
-	log.Printf("inbound: chan=%s user=%s ts=%s thread=%s target=%q files=%d text=%dch",
-		msg.Channel, msg.User, msg.TS, msg.ThreadTS, target, len(attachments), len(text))
 
 	// Busy-reaction lifecycle, add side: fires once per inbound (the
 	// alias-dispatch fanout below targets the same Slack TS, so a
@@ -3057,6 +3066,11 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 						go removeBusyReaction(cfg, inbound.Conversation.ConversationID, tk)
 					}
 				}
+				// Remember the completed channel leg BEFORE forget
+				// wakes any parked retry (codex r12): the retaken
+				// delivery then skips postInbound and re-runs only
+				// this failed alias dispatch.
+				cfg.eventDedup.markChannelLegDone(env.EventID)
 				cfg.eventDedup.forget(env.EventID)
 				reactAliasDispatchFailure(cfg.slackBotToken,
 					inbound.Conversation.ConversationID, inbound.ProviderMessageID)

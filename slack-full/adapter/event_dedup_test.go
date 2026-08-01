@@ -370,3 +370,37 @@ func TestHandleSlackEventsInflightRetryDropsAfterSuccess(t *testing.T) {
 	postSignedEvent(t, cfg, envBody) // waits on the in-flight claim, then drops
 	awaitInboundHits(t, &hits, 1)
 }
+
+// codex r12: a completed channel leg survives forget so a retaken
+// redelivery skips postInbound and retries only the alias leg;
+// commit clears the marker.
+func TestEventDedupChannelLegMarker(t *testing.T) {
+	c := newEventDedupCache(eventDedupTTL)
+	if c.isChannelLegDone("ev1") {
+		t.Fatal("marker set before markChannelLegDone")
+	}
+	proceed, _ := c.begin("ev1")
+	if !proceed {
+		t.Fatal("begin ev1: want proceed")
+	}
+	c.markChannelLegDone("ev1")
+	c.forget("ev1")
+	if !c.isChannelLegDone("ev1") {
+		t.Fatal("marker lost across forget; retaken delivery would duplicate the channel leg")
+	}
+	// The retaken delivery succeeds end-to-end: commit clears the marker.
+	proceed, _ = c.begin("ev1")
+	if !proceed {
+		t.Fatal("re-begin ev1 after forget: want proceed")
+	}
+	c.commit("ev1")
+	if c.isChannelLegDone("ev1") {
+		t.Fatal("marker survived commit")
+	}
+	// nil-safety
+	var nilCache *eventDedupCache
+	nilCache.markChannelLegDone("x")
+	if nilCache.isChannelLegDone("x") {
+		t.Fatal("nil cache reported a marker")
+	}
+}

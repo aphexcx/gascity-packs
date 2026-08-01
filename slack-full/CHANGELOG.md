@@ -10,6 +10,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A retaken Slack redelivery whose channel leg already reached gc
+  skips `postInbound` and retries only the failed alias leg (codex
+  r12): core does not consume `dedup_key`, so the old
+  forget-the-whole-event recovery duplicated the bound session's
+  turn. The completed leg is remembered next to the event-dedup entry
+  (TTL-bounded, cleared on commit) before `forget` wakes the parked
+  retry.
+- The launcher alias is reserved BEFORE the first-message POST and
+  rolled back if that POST fails (codex r13): a user's `@handle`
+  follow-up processed during the multi-second first post used to miss
+  the alias lookup and fall to the channel-bound path — which the
+  launcher session is not on — losing the follow-up. The rollback
+  runs before the event's dedup claim is released, so a woken
+  redelivery re-enters the launcher path (re-posting the remainder)
+  instead of the pre-claimed alias branch.
 - Busy-reaction clears are now attributed to the publishing agent
   (codex r11): each mark records the parsed target handle, and a
   delivered reply consumes only marks whose handle resolves (via the
