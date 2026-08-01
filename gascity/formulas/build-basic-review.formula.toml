@@ -29,7 +29,7 @@ description_file = "../assets/workflows/build-basic-review/{target}.setup-build-
 id = "{target}.build-basic-review-loop"
 title = "Run build-basic starter review until approved"
 needs = ["{target}.setup-build-basic-review"]
-metadata = { "gc.run_target" = "gc.run-operator" }
+metadata = { "gc.run_target" = "gc.run-operator", "gc.build.review_gate_enabled" = "true" }
 description_file = "../assets/workflows/build-basic-review/{target}.build-basic-review-loop.md"
 
 [template.check]

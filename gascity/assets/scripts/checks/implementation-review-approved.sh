@@ -45,12 +45,23 @@ fi
 # CLOSED on an empty gate too: no recorded human approval means the loop
 # is not done, so a machine `done` verdict alone can never conclude it.
 # Autonomous/headless runs skip the gate entirely.
+#
+# Gate enforcement is OPT-IN via gc.build.review_gate_enabled=true on the
+# loop step (build-basic-review sets it): this check is shared by review
+# loops in other packs (bmad, gstack, compound-engineering, superpowers)
+# that run interactive builds but have no gate child writing
+# gc.build.review_gate — failing closed there would spin an
+# already-approved review to max_attempts.
+GATE_ENABLED="$(metadata_value "$ROOT_JSON" "gc.build.review_gate_enabled")"
+if [ -z "$GATE_ENABLED" ]; then
+  GATE_ENABLED="$(metadata_value "$PARENT_JSON" "gc.build.review_gate_enabled")"
+fi
 INTERACTION_MODE="$(metadata_value "$ROOT_JSON" "gc.var.interaction_mode")"
 if [ -z "$INTERACTION_MODE" ]; then
   INTERACTION_MODE="$(metadata_value "$PARENT_JSON" "gc.var.interaction_mode")"
 fi
 REVIEW_GATE="$(metadata_value "$PARENT_JSON" "gc.build.review_gate")"
-if [ "$INTERACTION_MODE" = "interactive" ]; then
+if [ "$GATE_ENABLED" = "true" ] && [ "$INTERACTION_MODE" = "interactive" ]; then
   case "$REVIEW_GATE" in
     approved)
       ;;
