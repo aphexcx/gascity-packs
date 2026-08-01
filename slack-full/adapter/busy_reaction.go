@@ -145,20 +145,6 @@ func newBusyReactionRegistry() *busyReactionRegistry {
 	}
 }
 
-// recentlyCleared reports whether a reply already consumed a busy
-// mark for (channel, messageTS) within busyClearedTTL. The caller
-// must then skip the whole mark+add lifecycle for that message — it
-// is a redelivery of an event whose reply already happened.
-func (r *busyReactionRegistry) recentlyCleared(channel, messageTS string) bool {
-	if r == nil {
-		return false
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	at, ok := r.cleared[busyAddKey{channel: channel, messageTS: messageTS}]
-	return ok && r.clock().Sub(at) <= busyClearedTTL
-}
-
 func (r *busyReactionRegistry) clock() time.Time {
 	if r.now != nil {
 		return r.now()
@@ -181,20 +167,38 @@ func (r *busyReactionRegistry) clock() time.Time {
 // the caller can fire reactions.remove for it, unless its add is
 // still in flight, in which case the removal is delegated to that
 // add's completer.
-func (r *busyReactionRegistry) mark(channel, threadKey, messageTS string) (displaced []string) {
+// admitted=false means the caller must skip the whole add lifecycle:
+// either a reply already consumed this message's mark within
+// busyClearedTTL (a Slack redelivery of a finished event — the
+// tombstone check and the insert are one locked operation, codex
+// round 2), or the message is already live in the registry (a
+// concurrent copy of the same event admitted it first — a second
+// reactions.add would leave a second in-flight add racing the single
+// removal).
+func (r *busyReactionRegistry) mark(channel, threadKey, messageTS string) (displaced []string, admitted bool) {
 	if r == nil || channel == "" || threadKey == "" || messageTS == "" {
-		return nil
+		return nil, false
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := r.clock()
 	r.sweepLocked(now)
+	if at, ok := r.cleared[busyAddKey{channel: channel, messageTS: messageTS}]; ok && now.Sub(at) <= busyClearedTTL {
+		return nil, false
+	}
 	keys := []string{threadKey}
 	sibling := map[string]string{threadKey: ""}
 	if messageTS != threadKey {
 		keys = append(keys, messageTS)
 		sibling[threadKey] = messageTS
 		sibling[messageTS] = threadKey
+	}
+	for _, k := range keys {
+		if cur, ok := r.entries[busyReactionKey{channel: channel, threadKey: k}]; ok && cur.messageTS == messageTS {
+			// Already live: coalesce with the first copy's mark and
+			// its single in-flight add.
+			return nil, false
+		}
 	}
 	for _, k := range keys {
 		key := busyReactionKey{channel: channel, threadKey: k}
@@ -211,7 +215,32 @@ func (r *busyReactionRegistry) mark(channel, threadKey, messageTS string) (displ
 	for len(r.entries) > busyReactionMaxEntries {
 		r.evictOldestLocked()
 	}
-	return displaced
+	return displaced, true
+}
+
+// cancelMark retires a mark whose inbound never reached gc: no reply
+// will ever come to clear it, and its reactions.add never launched
+// (the add fires only after delivery succeeds), so entries and the
+// in-flight add state are simply dropped. Entries are removed only
+// while they still point at messageTS — a newer re-target's mark is
+// never touched.
+func (r *busyReactionRegistry) cancelMark(channel, threadKey, messageTS string) {
+	if r == nil || channel == "" || messageTS == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	keys := []string{threadKey}
+	if messageTS != threadKey {
+		keys = append(keys, messageTS)
+	}
+	for _, k := range keys {
+		key := busyReactionKey{channel: channel, threadKey: k}
+		if m, ok := r.entries[key]; ok && m.messageTS == messageTS {
+			delete(r.entries, key)
+		}
+	}
+	delete(r.adds, busyAddKey{channel: channel, messageTS: messageTS})
 }
 
 // displaceLocked retires an overwritten mark: its sibling entry (if

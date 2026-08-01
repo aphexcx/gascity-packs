@@ -511,8 +511,8 @@ func TestBusyReactionRegistry_CapEvictsOldest(t *testing.T) {
 // without busyMarks).
 func TestBusyReactionRegistry_NilSafe(t *testing.T) {
 	var r *busyReactionRegistry
-	if displaced := r.mark("C1", "1.0", "1.0"); displaced != nil {
-		t.Error("mark on nil registry reported displaced marks")
+	if displaced, admitted := r.mark("C1", "1.0", "1.0"); displaced != nil || admitted {
+		t.Error("mark on nil registry reported displaced marks or admission")
 	}
 	if r.confirmAdd("C1", "1.0") {
 		t.Error("confirmAdd on nil registry reported a deferred removal")
@@ -582,9 +582,9 @@ func TestBusyReactionRegistry_RemarkDisplacesOldReaction(t *testing.T) {
 		r := newBusyReactionRegistry()
 		r.mark("C1", "root.1", "msg.1")
 		r.confirmAdd("C1", "msg.1")
-		displaced := r.mark("C1", "root.1", "msg.2")
-		if len(displaced) != 1 || displaced[0] != "msg.1" {
-			t.Fatalf("displaced = %v, want [msg.1]", displaced)
+		displaced, admitted := r.mark("C1", "root.1", "msg.2")
+		if len(displaced) != 1 || displaced[0] != "msg.1" || !admitted {
+			t.Fatalf("mark = (%v, %v), want ([msg.1], true)", displaced, admitted)
 		}
 		// The new mark is live for the eventual reply.
 		r.confirmAdd("C1", "msg.2")
@@ -595,9 +595,9 @@ func TestBusyReactionRegistry_RemarkDisplacesOldReaction(t *testing.T) {
 	t.Run("in-flight add delegates removal to completer", func(t *testing.T) {
 		r := newBusyReactionRegistry()
 		r.mark("C1", "root.1", "msg.1")
-		displaced := r.mark("C1", "root.1", "msg.2")
-		if len(displaced) != 0 {
-			t.Fatalf("displaced = %v, want [] (add still in flight)", displaced)
+		displaced, admitted := r.mark("C1", "root.1", "msg.2")
+		if len(displaced) != 0 || !admitted {
+			t.Fatalf("mark = (%v, %v), want ([], true) (add still in flight)", displaced, admitted)
 		}
 		if !r.confirmAdd("C1", "msg.1") {
 			t.Fatal("confirmAdd(msg.1) = false; want removeNow=true for the displaced in-flight add")

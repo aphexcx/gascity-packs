@@ -15,9 +15,16 @@
 //     log-watchers key on
 //   - replayed at startup when a previous run crashed mid-retry
 //
-// Redelivery can duplicate an event gc already accepted; the message
-// DedupKey ("slack-"+ts) makes that safe — gc's extmsg layer dedups
-// on it.
+// Delivery is AT-LEAST-ONCE, and that is a deliberate tradeoff
+// (codex round 2 P1, accepted): gc core does not yet consume the
+// message DedupKey ("slack-"+ts) — see
+// slack-full/docs/phase5-ledger-readiness.md — so a retry after an
+// ambiguous failure (the POST was accepted but its response was
+// lost) or a replay after a crash-before-retirement can duplicate
+// the agent turn. The alternative is silently losing acked Slack
+// messages, which this spool exists to prevent; once core honors
+// DedupKey idempotently, these duplicates disappear with no adapter
+// change.
 package main
 
 import (
@@ -200,51 +207,54 @@ func replaySpool(cfg config, aliasReg *handleAliasRegistry) {
 		}
 		return
 	}
-	type replayItem struct {
-		path string
-		msg  externalInboundMessage
-	}
-	var items []replayItem
+	var paths []string
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
 			continue
 		}
-		path := filepath.Join(cfg.inboundSpoolDir, e.Name())
-		data, err := os.ReadFile(path)
-		if err != nil {
-			log.Printf("spool replay: read %s: %v", path, err)
-			continue
-		}
-		var msg externalInboundMessage
-		if err := json.Unmarshal(data, &msg); err != nil {
-			log.Printf("spool replay: decode %s: %v (dead-letter=%s)", path, err, moveToDeadLetter(path))
-			continue
-		}
-		items = append(items, replayItem{path: path, msg: msg})
+		paths = append(paths, filepath.Join(cfg.inboundSpoolDir, e.Name()))
 	}
-	if len(items) == 0 {
+	if len(paths) == 0 {
 		return
 	}
 	// Bounded worker pool (codex round 2): a crash during a busy gc
 	// outage can leave thousands of live entries, and one goroutine per
 	// entry would POST them all at once into a gc that just came back —
-	// or exhaust sockets. Retry sleeps make per-entry latency long, so
-	// a few workers drain even a large backlog promptly without a
-	// thundering herd.
-	work := make(chan replayItem)
+	// or exhaust sockets. Only PATHS are collected up front; each
+	// worker reads and decodes its own entries, so payload memory is
+	// bounded by the worker count too (entries can approach the
+	// webhook size cap, and a big backlog decoded eagerly could hold
+	// gigabytes at startup).
+	work := make(chan string)
 	for range replaySpoolWorkers {
 		go func() {
-			for it := range work {
-				replayOne(cfg, aliasReg, it.path, it.msg)
+			for path := range work {
+				replayPath(cfg, aliasReg, path)
 			}
 		}()
 	}
 	go func() {
-		for _, it := range items {
-			work <- it
+		for _, p := range paths {
+			work <- p
 		}
 		close(work)
 	}()
+}
+
+// replayPath reads and decodes one spool entry, quarantining
+// undecodable files, then re-delivers it via replayOne.
+func replayPath(cfg config, aliasReg *handleAliasRegistry, path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Printf("spool replay: read %s: %v", path, err)
+		return
+	}
+	var msg externalInboundMessage
+	if err := json.Unmarshal(data, &msg); err != nil {
+		log.Printf("spool replay: decode %s: %v (dead-letter=%s)", path, err, moveToDeadLetter(path))
+		return
+	}
+	replayOne(cfg, aliasReg, path, msg)
 }
 
 // replaySpoolWorkers bounds concurrent startup replay deliveries.

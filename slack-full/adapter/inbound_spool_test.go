@@ -239,8 +239,16 @@ func TestReplaySpoolDeadLettersCorruptEntries(t *testing.T) {
 
 	replaySpool(config{gcAPIBase: "http://127.0.0.1:1", cityName: "test-city", inboundSpoolDir: spool}, nil)
 
-	if _, err := os.Stat(corrupt); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("corrupt entry should have moved to dead-letter: %v", err)
+	// Replay decodes in worker goroutines now; poll for the quarantine.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(corrupt); errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("corrupt entry should have moved to dead-letter")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if _, err := os.Stat(filepath.Join(spool, "dead", "1-corrupt.json")); err != nil {
 		t.Errorf("corrupt entry missing from dead-letter dir: %v", err)

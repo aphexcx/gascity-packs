@@ -132,6 +132,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `inbound POST failed` substring external log-watchers key on), and
   replayed at startup if a crash interrupted the retries. Duplicate
   redelivery is safe — gc dedups on the message's `dedup_key`.
+- Codex review round 3 on this branch: the leaf no-follow defense is
+  real again — os.Root.OpenFile resolves an in-root leaf symlink
+  itself even with O_NOFOLLOW, so openBeneath now Lstat-rejects a
+  symlinked leaf and fstat-compares the opened file against that
+  Lstat via os.SameFile (same pattern as the root check); the busy
+  mark is recorded BEFORE the forward and cancelled on delivery
+  failure, closing the fast-reply window where gc hands the message
+  to the agent while deliverInbound is still returning; redelivery
+  admission is one locked operation — mark() itself rejects a
+  recently-cleared message and coalesces a concurrent copy of the
+  same event, so exactly one add lifecycle runs per message; startup
+  replay collects only paths and lets the bounded workers read and
+  decode entries, so a huge backlog cannot hold every payload in
+  memory at once. One finding is an ACCEPTED TRADEOFF, not a code
+  fix: retries/replays are at-least-once and can duplicate a turn on
+  an ambiguous failure, because gc core does not yet consume the
+  extmsg dedup_key (docs/phase5-ledger-readiness.md); the alternative
+  is losing acked Slack messages. Documented in the spool package
+  comment; disappears when core honors dedup_key.
 - Codex review round 2 on this branch (1 P1 + 5 P2, all fixed):
   un-spooled retries (spooling disabled or the write failed) HOLD
   their dispatch slot across the retry sleeps again — the semaphore

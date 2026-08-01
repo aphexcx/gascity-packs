@@ -2839,8 +2839,28 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 	// alias dispatch below — has completed (or was never needed), so a
 	// crash in between replays the entry, alias dispatch included,
 	// instead of silently losing the targeted copy.
+	// Busy-reaction mark, recorded BEFORE the forward (codex round 2,
+	// mirroring the file-ingest branch's r4): gc can hand the inbound
+	// to the agent — and the agent can /publish a reply — before
+	// deliverInbound even returns, and a reply that finds no mark
+	// leaves the subsequently-added emoji stuck forever. mark() is one
+	// locked admission: it rejects a redelivery of a message whose
+	// reply already cleared (5-minute tombstone) and coalesces a
+	// concurrent copy of the same event, so only one add lifecycle
+	// ever runs per message. The reactions.add itself still fires only
+	// after the forward succeeds (an emoji on a message no agent
+	// received would be a lie); a failed forward cancels the mark.
+	busyAdmitted := false
+	var busyDisplaced []string
+	if target != "" && cfg.slackBotToken != "" && cfg.busyReaction != "" {
+		busyDisplaced, busyAdmitted = cfg.busyMarks.mark(msg.Channel, busyThreadKey(msg.ThreadTS, msg.TS), msg.TS)
+	}
+
 	spoolPath := spoolInbound(cfg.inboundSpoolDir, inbound)
 	if !deliverInbound(cfg, inbound, spoolPath, release) {
+		if busyAdmitted {
+			cfg.busyMarks.cancelMark(msg.Channel, busyThreadKey(msg.ThreadTS, msg.TS), msg.TS)
+		}
 		return
 	}
 
@@ -2872,13 +2892,8 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 	// are logged and don't block the dispatch path. BUSY_REACTION=
 	// (set-but-empty) disables this block entirely — no reaction, no
 	// mark.
-	// recentlyCleared gates the whole lifecycle (codex round 2): a
-	// Slack redelivery of an event whose reply already consumed the
-	// mark would re-add an hourglass gc's inbound dedup guarantees no
-	// second reply will ever clear.
-	if target != "" && cfg.slackBotToken != "" && cfg.busyReaction != "" &&
-		!cfg.busyMarks.recentlyCleared(msg.Channel, msg.TS) {
-		displaced := cfg.busyMarks.mark(msg.Channel, busyThreadKey(msg.ThreadTS, msg.TS), msg.TS)
+	if busyAdmitted {
+		displaced := busyDisplaced
 		for _, oldTS := range displaced {
 			go func(channel, ts, emoji string) {
 				resp, err := removeReactionFromSlack(cfg.slackBotToken, slackReactionsAddReq{

@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 )
 
 // openBeneath opens rel (a Clean, root-relative path containing no
@@ -67,9 +66,33 @@ func openBeneath(rootAbs, rel string) (*os.File, error) {
 	if !os.SameFile(lst, rst) {
 		return nil, fmt.Errorf("openBeneath: root %q changed identity between check and open", rootAbs)
 	}
-	f, err := root.OpenFile(rel, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	// Leaf no-follow (codex round 2): os.Root.OpenFile resolves an
+	// in-root leaf symlink ITSELF even with O_NOFOLLOW (the flag only
+	// stops kernel-side following; Root then follows the link within
+	// the sandbox), so a leaf swapped for a symlink in the race window
+	// would be silently read through. Restore the old walk's rejection
+	// with the same Lstat + open + SameFile identity pattern used for
+	// the root above — all via the pinned fd, so no path re-resolution
+	// races.
+	lleaf, err := root.Lstat(rel)
+	if err != nil {
+		return nil, fmt.Errorf("openBeneath: lstat %q beneath %q: %w", rel, rootAbs, err)
+	}
+	if lleaf.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("openBeneath: leaf %q beneath %q is a symlink", rel, rootAbs)
+	}
+	f, err := root.OpenFile(rel, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, fmt.Errorf("openBeneath: open %q beneath %q: %w", rel, rootAbs, err)
+	}
+	fst, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("openBeneath: stat opened leaf %q: %w", rel, err)
+	}
+	if !os.SameFile(lleaf, fst) {
+		_ = f.Close()
+		return nil, fmt.Errorf("openBeneath: leaf %q beneath %q changed identity between check and open", rel, rootAbs)
 	}
 	return f, nil
 }
