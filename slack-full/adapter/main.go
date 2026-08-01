@@ -2860,6 +2860,13 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 	if !deliverInbound(cfg, inbound, spoolPath, release) {
 		if busyAdmitted {
 			cfg.busyMarks.cancelMark(msg.Channel, busyThreadKey(msg.ThreadTS, msg.TS), msg.TS)
+			// Marks this admission displaced were already dropped from
+			// the registry at mark() time — their agents' replies can
+			// no longer find them — so their landed emojis must come
+			// off now or they stick forever (codex round 3).
+			for _, oldTS := range busyDisplaced {
+				go removeBusyEmoji(cfg, msg.Channel, oldTS, "displace-remove")
+			}
 		}
 		return
 	}
