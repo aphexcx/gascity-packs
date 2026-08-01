@@ -680,8 +680,16 @@ func TestReplaySpoolDeadLettersCorruptEntries(t *testing.T) {
 
 	replaySpool(config{gcAPIBase: "http://127.0.0.1:1", cityName: "c", spoolDir: spool})
 
-	if _, err := os.Stat(corrupt); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("corrupt entry should have moved to dead-letter: %v", err)
+	// Replay decodes in worker goroutines now; poll for the quarantine.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(corrupt); errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("corrupt entry should have moved to dead-letter")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if _, err := os.Stat(filepath.Join(spool, "dead", "1-corrupt.json")); err != nil {
 		t.Errorf("corrupt entry missing from dead-letter dir: %v", err)
@@ -732,6 +740,18 @@ func TestSlackifyMarkdown(t *testing.T) {
 		// codex P2: multi-backtick code spans protect their contents.
 		{"double backtick span protected", "x ``has `tick` and **raw**`` y", "x ``has `tick` and **raw**`` y"},
 		{"unbalanced backtick run passes through", "a `` b **bold**", "a `` b *bold*"},
+		// codex round 2: embedded ``` inside a code line is not a closer.
+		{"fence with embedded triple backticks", "```\nfmt.Println(\"```\")\n**raw**\n```\nafter **b**", "```\nfmt.Println(\"```\")\n**raw**\n```\nafter *b*"},
+		// codex round 2: escaped parens are URL data.
+		{"escaped paren in link destination", `[x](https://h/a\)b)`, "<https://h/a)b|x>"},
+		// codex round 2: heading hash glued to text is content.
+		{"heading ending in hash", "# C#\nbody", "*C#*\nbody"},
+		{"heading with spaced closer", "## Title ##\nbody", "*Title*\nbody"},
+		// codex round 2: intraword underscores stay literal.
+		{"intraword underscores untouched", "foo__bar__baz", "foo__bar__baz"},
+		{"boundary underscore bold still converts", "say __hi__ now", "say *hi* now"},
+		// codex round 2: trailing emphasis delimiters are not URL bytes.
+		{"bold around bare url", "**see https://example.com**", "*see https://example.com*"},
 	}
 	for _, tc := range cases {
 		if got := slackifyMarkdown(tc.in); got != tc.want {

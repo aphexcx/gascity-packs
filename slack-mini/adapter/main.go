@@ -608,28 +608,58 @@ func replaySpool(cfg config) {
 		}
 		return
 	}
+	var paths []string
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
 			continue
 		}
-		path := filepath.Join(cfg.spoolDir, e.Name())
-		data, err := os.ReadFile(path)
-		if err != nil {
-			log.Printf("spool replay: read %s: %v", path, err)
-			continue
-		}
-		var msg externalInboundMessage
-		if err := json.Unmarshal(data, &msg); err != nil {
-			log.Printf("spool replay: decode %s: %v (dead-letter=%s)", path, err, moveToDeadLetter(path))
-			continue
-		}
-		log.Printf("spool replay: re-delivering %s (chan=%s ts=%s)",
-			e.Name(), msg.Conversation.ConversationID, msg.ProviderMessageID)
-		// Entries are spooled before display-name enrichment; finish
-		// it here so a replayed mention carries the same name a live
-		// delivery would.
-		go finishInbound(cfg, msg, path)
+		paths = append(paths, filepath.Join(cfg.spoolDir, e.Name()))
 	}
+	if len(paths) == 0 {
+		return
+	}
+	// Bounded worker pool (codex round 2): one goroutine per entry
+	// would run users.info + several timed gc retries for every
+	// backlog entry at once — a large crash backlog could exhaust
+	// sockets or rate-limit Slack and the recovering gc. Workers read
+	// and decode their own entries so payload memory is bounded too.
+	work := make(chan string)
+	for range replaySpoolWorkers {
+		go func() {
+			for path := range work {
+				replayPath(cfg, path)
+			}
+		}()
+	}
+	go func() {
+		for _, p := range paths {
+			work <- p
+		}
+		close(work)
+	}()
+}
+
+// replaySpoolWorkers bounds concurrent startup replay deliveries.
+const replaySpoolWorkers = 4
+
+// replayPath reads and decodes one spool entry (quarantining
+// undecodable files) and re-delivers it. Entries are spooled before
+// display-name enrichment; finishInbound completes it so a replayed
+// mention carries the same name a live delivery would.
+func replayPath(cfg config, path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Printf("spool replay: read %s: %v", path, err)
+		return
+	}
+	var msg externalInboundMessage
+	if err := json.Unmarshal(data, &msg); err != nil {
+		log.Printf("spool replay: decode %s: %v (dead-letter=%s)", path, err, moveToDeadLetter(path))
+		return
+	}
+	log.Printf("spool replay: re-delivering %s (chan=%s ts=%s)",
+		filepath.Base(path), msg.Conversation.ConversationID, msg.ProviderMessageID)
+	finishInbound(cfg, msg, path)
 }
 
 // --- inbound: Slack user display-name resolution ---------------------------
@@ -994,12 +1024,13 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 // --- outbound: GitHub Markdown → Slack mrkdwn -------------------------------
 
 var (
-	fencedCodeRE = regexp.MustCompile("(?s)```.*?```")
-	boldStarsRE  = regexp.MustCompile(`\*\*(.+?)\*\*`)
-	boldUnderRE  = regexp.MustCompile(`__(.+?)__`)
-	strikeRE     = regexp.MustCompile(`~~(.+?)~~`)
-	headingRE    = regexp.MustCompile(`(?m)^#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$`)
-	bareURLRE    = regexp.MustCompile(`https?://[^\s<>|]+`)
+	boldStarsRE = regexp.MustCompile(`\*\*(.+?)\*\*`)
+	strikeRE    = regexp.MustCompile(`~~(.+?)~~`)
+	// Closing heading hashes count only when whitespace-separated
+	// (codex round 2): GFM keeps the final '#' of `# C#` as content,
+	// so the optional closer requires a preceding blank.
+	headingRE = regexp.MustCompile(`(?m)^#{1,6}[ \t]+(.+?)(?:[ \t]+#+)?[ \t]*$`)
+	bareURLRE = regexp.MustCompile(`https?://[^\s<>|]+`)
 )
 
 // slackifyMarkdown converts the GitHub-flavored Markdown constructs agents
@@ -1023,18 +1054,23 @@ func slackifyMarkdown(text string) string {
 		protected = append(protected, s)
 		return fmt.Sprintf("\x00%d\x00", len(protected)-1)
 	}
-	out := fencedCodeRE.ReplaceAllStringFunc(text, protect)
-	// An unterminated fence swallows the rest of the message: protect it
-	// whole rather than reformatting half a code block.
-	if idx := strings.Index(out, "```"); idx >= 0 {
-		out = out[:idx] + protect(out[idx:])
-	}
+	out := protectFencedBlocks(text, protect)
 	out = protectCodeSpans(out, protect)
 	out = convertMarkdownLinks(out, protect)
-	out = bareURLRE.ReplaceAllStringFunc(out, protect)
+	// Bare URLs are protected sans any trailing emphasis delimiters
+	// (codex round 2): in `**see https://example.com**` the closing
+	// `**` belongs to the bold span, not the URL — swallowing it into
+	// the protected span would leave the bold pass without its closer.
+	out = bareURLRE.ReplaceAllStringFunc(out, func(m string) string {
+		trimmed := strings.TrimRight(m, "*_~")
+		if trimmed == "" {
+			return m
+		}
+		return protect(trimmed) + m[len(trimmed):]
+	})
 	out = headingRE.ReplaceAllString(out, "*$1*")
 	out = boldStarsRE.ReplaceAllString(out, "*$1*")
-	out = boldUnderRE.ReplaceAllString(out, "*$1*")
+	out = convertUnderscoreBold(out)
 	out = strikeRE.ReplaceAllString(out, "~$1~")
 	for i := len(protected) - 1; i >= 0; i-- {
 		out = strings.Replace(out, fmt.Sprintf("\x00%d\x00", i), protected[i], 1)
@@ -1092,6 +1128,86 @@ func protectCodeSpans(s string, protect func(string) string) string {
 	return b.String()
 }
 
+// protectFencedBlocks protects GFM fenced code blocks line-orientedly
+// (codex round 2): a fence opens at a line beginning with ``` and
+// closes only at a LINE that is nothing but ``` and whitespace — an
+// embedded sequence inside a code line (fmt.Println("```")) is block
+// content, not a closer, which the old (?s)```.*?``` regex got wrong.
+// An unterminated fence swallows the rest of the message: it is
+// protected whole rather than reformatting half a code block.
+func protectFencedBlocks(s string, protect func(string) string) string {
+	lines := strings.SplitAfter(s, "\n")
+	var b strings.Builder
+	i := 0
+	for i < len(lines) {
+		trimmed := strings.TrimLeft(lines[i], " \t")
+		if !strings.HasPrefix(trimmed, "```") {
+			b.WriteString(lines[i])
+			i++
+			continue
+		}
+		j := i + 1
+		closed := -1
+		for j < len(lines) {
+			body := strings.TrimSpace(lines[j])
+			if len(body) >= 3 && strings.Count(body, "`") == len(body) {
+				closed = j
+				break
+			}
+			j++
+		}
+		if closed < 0 {
+			b.WriteString(protect(strings.Join(lines[i:], "")))
+			break
+		}
+		b.WriteString(protect(strings.Join(lines[i:closed+1], "")))
+		i = closed + 1
+	}
+	return b.String()
+}
+
+// convertUnderscoreBold rewrites __bold__ → *bold* while honoring
+// GFM's intraword rule (codex round 2): an underscore run flanked by
+// word characters (foo__bar__baz) cannot open or close emphasis and
+// stays literal — the regex it replaces rewrote technical
+// identifiers. Hand-scanned because RE2 has no lookarounds.
+func convertUnderscoreBold(s string) string {
+	isWord := func(c byte) bool {
+		return c == '_' || c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+	}
+	var b strings.Builder
+	i := 0
+	for i < len(s) {
+		if !strings.HasPrefix(s[i:], "__") || (i > 0 && isWord(s[i-1])) {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+		matched := false
+		j := i + 2
+		for {
+			k := strings.Index(s[j:], "__")
+			if k < 0 {
+				break
+			}
+			k += j
+			after := k + 2
+			if k > i+2 && (after >= len(s) || !isWord(s[after])) {
+				b.WriteString("*" + s[i+2:k] + "*")
+				i = after
+				matched = true
+				break
+			}
+			j = k + 1
+		}
+		if !matched {
+			b.WriteString(s[i : i+2])
+			i += 2
+		}
+	}
+	return b.String()
+}
+
 // convertMarkdownLinks rewrites [text](http…) into Slack's <url|text>
 // and protects the result. Hand-parsed rather than regex (codex P2):
 // the destination may contain balanced parentheses
@@ -1123,22 +1239,32 @@ func convertMarkdownLinks(s string, protect func(string) string) string {
 		}
 		j := textEnd + 2
 		depth := 1
+		var destB strings.Builder
 		for j < len(s) && depth > 0 {
-			switch s[j] {
-			case '(':
+			c := s[j]
+			switch {
+			case c == '\\' && j+1 < len(s) && (s[j+1] == '(' || s[j+1] == ')'):
+				// Backslash-escaped parenthesis is URL data (codex
+				// round 2): unescape it into the destination instead
+				// of counting it toward balance.
+				destB.WriteByte(s[j+1])
+				j += 2
+				continue
+			case c == '(':
 				depth++
-			case ')':
+			case c == ')':
 				depth--
-			case ' ', '\t', '\n':
+			case c == ' ' || c == '\t' || c == '\n':
 				depth = -1
 			}
 			if depth <= 0 {
 				break
 			}
+			destB.WriteByte(c)
 			j++
 		}
 		linkText := s[i+1 : textEnd]
-		dest := s[textEnd+2 : j]
+		dest := destB.String()
 		if depth == 0 && linkText != "" &&
 			(strings.HasPrefix(dest, "http://") || strings.HasPrefix(dest, "https://")) {
 			b.WriteString(protect("<" + dest + "|" + linkText + ">"))
