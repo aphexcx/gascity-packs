@@ -104,19 +104,24 @@ func sanitizeSpoolName(s string) string {
 // line deliberately contains "inbound POST failed" — external
 // log-watchers key on that exact substring.
 //
-// onFirstRetry, when non-nil, fires once before the first retry sleep.
-// processSlackEvent passes its dispatch-slot release: the retry
-// schedule sleeps ~2 minutes, and a gc outage would otherwise pin
-// every slot on sleeping goroutines and starve admission of fresh
-// events (which then get dropped un-spooled — strictly worse than
-// letting spooled stragglers retry outside the semaphore).
+// onFirstRetry, when non-nil, fires once before the first retry sleep
+// — but ONLY when the message is durably spooled. processSlackEvent
+// passes its dispatch-slot release: the retry schedule sleeps ~2
+// minutes, and a gc outage would otherwise pin every slot on sleeping
+// goroutines and starve admission of fresh events (which then get
+// dropped un-spooled — strictly worse than letting spooled stragglers
+// retry outside the semaphore). Without a spool entry (disabled, or
+// the write failed) the slot is deliberately HELD across the retries:
+// the semaphore is then the only bound on sleeping retry goroutines,
+// and releasing it would let a sustained outage grow one ~2-minute
+// goroutine per inbound with no cap (codex round 2 P1).
 func deliverInbound(cfg config, msg externalInboundMessage, spoolPath string, onFirstRetry func()) bool {
 	delays := snapshotInboundRetryDelays()
 	attempts := len(delays) + 1
 	var lastErr error
 	for i := range attempts {
 		if i > 0 {
-			if i == 1 && onFirstRetry != nil {
+			if i == 1 && onFirstRetry != nil && spoolPath != "" {
 				onFirstRetry()
 			}
 			time.Sleep(delays[i-1])
@@ -195,6 +200,11 @@ func replaySpool(cfg config, aliasReg *handleAliasRegistry) {
 		}
 		return
 	}
+	type replayItem struct {
+		path string
+		msg  externalInboundMessage
+	}
+	var items []replayItem
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
 			continue
@@ -210,27 +220,58 @@ func replaySpool(cfg config, aliasReg *handleAliasRegistry) {
 			log.Printf("spool replay: decode %s: %v (dead-letter=%s)", path, err, moveToDeadLetter(path))
 			continue
 		}
-		log.Printf("spool replay: re-delivering %s (chan=%s ts=%s target=%q)",
-			e.Name(), msg.Conversation.ConversationID, msg.ProviderMessageID, msg.ExplicitTarget)
-		go func(path string, msg externalInboundMessage) {
-			if !deliverInbound(cfg, msg, path, nil) {
-				return // dead-lettered by deliverInbound
-			}
-			if msg.ExplicitTarget != "" && aliasReg != nil {
-				if sessionID, ok := aliasReg.Get(msg.ExplicitTarget); ok {
-					if !dispatchToAliasedSession(cfg, sessionID, msg, msg.ExplicitTarget) {
-						reactAliasDispatchFailure(cfg.slackBotToken,
-							msg.Conversation.ConversationID, msg.ProviderMessageID)
-						log.Printf("spool replay: alias dispatch failed chan=%s ts=%s target=%q (dead-letter=%s)",
-							msg.Conversation.ConversationID, msg.ProviderMessageID,
-							msg.ExplicitTarget, moveToDeadLetter(path))
-						return
-					}
-				}
-				// Target no longer registered: nothing left to dispatch
-				// to — fall through and retire the entry.
-			}
-			removeSpoolEntry(path)
-		}(path, msg)
+		items = append(items, replayItem{path: path, msg: msg})
 	}
+	if len(items) == 0 {
+		return
+	}
+	// Bounded worker pool (codex round 2): a crash during a busy gc
+	// outage can leave thousands of live entries, and one goroutine per
+	// entry would POST them all at once into a gc that just came back —
+	// or exhaust sockets. Retry sleeps make per-entry latency long, so
+	// a few workers drain even a large backlog promptly without a
+	// thundering herd.
+	work := make(chan replayItem)
+	for range replaySpoolWorkers {
+		go func() {
+			for it := range work {
+				replayOne(cfg, aliasReg, it.path, it.msg)
+			}
+		}()
+	}
+	go func() {
+		for _, it := range items {
+			work <- it
+		}
+		close(work)
+	}()
+}
+
+// replaySpoolWorkers bounds concurrent startup replay deliveries.
+const replaySpoolWorkers = 4
+
+// replayOne re-delivers a single spooled entry: forward, then the
+// targeted alias dispatch when the handle still resolves, then
+// retirement. See replaySpool for the at-least-once semantics.
+func replayOne(cfg config, aliasReg *handleAliasRegistry, path string, msg externalInboundMessage) {
+	log.Printf("spool replay: re-delivering %s (chan=%s ts=%s target=%q)",
+		filepath.Base(path), msg.Conversation.ConversationID, msg.ProviderMessageID, msg.ExplicitTarget)
+	if !deliverInbound(cfg, msg, path, nil) {
+		return // dead-lettered by deliverInbound
+	}
+	if msg.ExplicitTarget != "" && aliasReg != nil {
+		if sessionID, ok := aliasReg.Get(msg.ExplicitTarget); ok {
+			if !dispatchToAliasedSession(cfg, sessionID, msg, msg.ExplicitTarget) {
+				reactAliasDispatchFailure(cfg.slackBotToken,
+					msg.Conversation.ConversationID, msg.ProviderMessageID)
+				log.Printf("spool replay: alias dispatch failed chan=%s ts=%s target=%q (dead-letter=%s)",
+					msg.Conversation.ConversationID, msg.ProviderMessageID,
+					msg.ExplicitTarget, moveToDeadLetter(path))
+				return
+			}
+		}
+		// Target no longer registered: nothing left to dispatch to —
+		// fall through and retire the entry.
+	}
+	removeSpoolEntry(path)
 }

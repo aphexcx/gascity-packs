@@ -132,6 +132,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `inbound POST failed` substring external log-watchers key on), and
   replayed at startup if a crash interrupted the retries. Duplicate
   redelivery is safe — gc dedups on the message's `dedup_key`.
+- Codex review round 2 on this branch (1 P1 + 5 P2, all fixed):
+  un-spooled retries (spooling disabled or the write failed) HOLD
+  their dispatch slot across the retry sleeps again — the semaphore
+  is the only bound on sleeping retry goroutines without a durable
+  entry, so the early release now applies only to spooled messages;
+  `INBOUND_SPOOL_DIR=` (set-but-empty) is honored as the documented
+  persistence opt-out instead of being replaced by the state-root
+  default; a threaded `/publish-file` reply clears the busy mark
+  exactly like a text publish; a failed alias dispatch removes the
+  busy emoji it added (takeExact — never touching a newer re-target's
+  mark); a Slack redelivery of an event whose reply already consumed
+  the mark no longer re-adds an hourglass nothing would ever clear
+  (5-minute cleared-message tombstones); and startup spool replay
+  runs through a bounded 4-worker pool instead of one goroutine per
+  entry.
 - Codex review round on this branch (8 findings, all fixed):
   - The app manifest now grants `im:read` — the DM membership gate's
     `conversations.info` probe requires it, and without it the gate

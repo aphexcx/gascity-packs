@@ -345,3 +345,49 @@ func TestReplaySpoolRetiresEntryWhenAliasGone(t *testing.T) {
 		t.Errorf("entry dead-lettered on missing alias; want plain retirement")
 	}
 }
+
+// codex round 2 P1: without a durable spool entry the dispatch slot
+// must be HELD across the retry sleeps — the semaphore is then the
+// only bound on sleeping retry goroutines.
+func TestDeliverInboundHoldsSlotWhenUnspooled(t *testing.T) {
+	compressRetries(t)
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) < 2 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cfg := config{gcAPIBase: srv.URL, cityName: "test-city"}
+	var hookFires int32
+	ok := deliverInbound(cfg, externalInboundMessage{DedupKey: "slack-x"}, "", func() {
+		atomic.AddInt32(&hookFires, 1)
+	})
+	if !ok {
+		t.Fatal("deliverInbound = false, want true")
+	}
+	if got := atomic.LoadInt32(&hookFires); got != 0 {
+		t.Errorf("onFirstRetry fired %d times with no spool entry, want 0 (slot must stay held)", got)
+	}
+}
+
+// codex round 2: INBOUND_SPOOL_DIR= (set-but-empty) is the documented
+// opt-out and must NOT be replaced by the state-root default.
+func TestInboundSpoolDirExplicitEmptyDisables(t *testing.T) {
+	env := baseSlackEnv()
+	env["INBOUND_SPOOL_DIR"] = ""
+	env["GC_SERVICE_STATE_ROOT"] = "/state/root"
+	cfg, err := loadConfigFromLookup(func(key string) (string, bool) {
+		v, ok := env[key]
+		return v, ok
+	})
+	if err != nil {
+		t.Fatalf("loadConfigFromLookup: %v", err)
+	}
+	if cfg.inboundSpoolDir != "" {
+		t.Errorf("inboundSpoolDir = %q with INBOUND_SPOOL_DIR= set-but-empty, want disabled", cfg.inboundSpoolDir)
+	}
+}

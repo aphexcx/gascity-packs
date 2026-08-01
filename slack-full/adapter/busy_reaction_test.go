@@ -616,3 +616,75 @@ func TestBusyReactionRegistry_AbandonAddLeavesTakeUsable(t *testing.T) {
 		t.Fatalf("take after abandonAdd = (%q, %v), want (1.0, true)", ts, ok)
 	}
 }
+
+// codex round 2: a Slack redelivery of an event whose reply already
+// consumed the busy mark must not re-add the emoji — gc dedups the
+// inbound, so no second reply would ever clear it.
+func TestBusyReaction_RedeliveryAfterClearAddsNothing(t *testing.T) {
+	slackStub, reactions := newReactionRecordingSlackStub(t)
+	withSlackAPIStub(t, slackStub)
+	capture := &inboundCapture{}
+	gcStub := httptest.NewServer(capture.handler())
+	t.Cleanup(gcStub.Close)
+
+	cfg := busyTestConfig(gcStub.URL)
+	env := targetedInboundEnvelope(t, "C1", "100.000010", "")
+	processSlackEvent(cfg, newTestHandleAliasRegistry(t), nil, nil, nil, nil, env, func() {})
+	if got := reactions.await(t, 2*time.Second); got.op != "add" {
+		t.Fatalf("first delivery: op = %q, want add", got.op)
+	}
+
+	// The agent's reply consumes the mark.
+	req := httptest.NewRequest(http.MethodPost, "/publish", strings.NewReader(publishBody("C1", "100.000010")))
+	rec := httptest.NewRecorder()
+	handlePublish(cfg, nil, nil, newPublishDedupCache(publishDedupTTL))(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("publish status = %d", rec.Code)
+	}
+	if got := reactions.await(t, 2*time.Second); got.op != "remove" {
+		t.Fatalf("reply: op = %q, want remove", got.op)
+	}
+
+	// Redelivery of the same event: no re-mark, no reactions.add.
+	processSlackEvent(cfg, newTestHandleAliasRegistry(t), nil, nil, nil, nil, env, func() {})
+	reactions.assertNoCall(t, 400*time.Millisecond)
+	if n := cfg.busyMarks.size(); n != 0 {
+		t.Errorf("registry has %d entries after redelivery, want 0", n)
+	}
+}
+
+// codex round 2: takeExact consumes only entries still pointing at
+// the exact message — the alias-failure cleanup must never strip a
+// newer re-target's affordance.
+func TestBusyReactionRegistry_TakeExact(t *testing.T) {
+	r := newBusyReactionRegistry()
+	r.mark("C1", "root.1", "msg.1")
+	r.confirmAdd("C1", "msg.1")
+	if !r.takeExact("C1", "root.1", "msg.1") {
+		t.Fatal("takeExact = false for a landed mark; want removeNow=true")
+	}
+	if _, ok := r.pending("C1", "root.1"); ok {
+		t.Fatal("entry survived takeExact")
+	}
+
+	// Newer re-target owns the keys: takeExact for the OLD message
+	// must not touch it.
+	r.mark("C1", "root.1", "msg.2")
+	r.confirmAdd("C1", "msg.2")
+	if r.takeExact("C1", "root.1", "msg.1") {
+		t.Fatal("takeExact consumed a newer re-target's mark")
+	}
+	if ts, ok := r.pending("C1", "root.1"); !ok || ts != "msg.2" {
+		t.Fatalf("newer mark = (%q, %v), want (msg.2, true)", ts, ok)
+	}
+
+	// In-flight add: removal defers to the completer.
+	r2 := newBusyReactionRegistry()
+	r2.mark("C1", "root.1", "msg.1")
+	if r2.takeExact("C1", "root.1", "msg.1") {
+		t.Fatal("takeExact = true during in-flight add; want deferred")
+	}
+	if !r2.confirmAdd("C1", "msg.1") {
+		t.Fatal("confirmAdd = false after deferred takeExact; want removeNow=true")
+	}
+}

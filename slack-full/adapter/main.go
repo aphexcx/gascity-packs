@@ -648,8 +648,11 @@ func loadConfigFromLookup(lookup func(string) (string, bool)) (config, error) {
 	// Default the inbound persist-and-retry spool into the
 	// controller-provided state root (proxy_process mode). Standalone
 	// runs without an explicit INBOUND_SPOOL_DIR get in-memory retries
-	// only (hq-xizo).
-	if cfg.inboundSpoolDir == "" {
+	// only (hq-xizo). Set-but-empty (INBOUND_SPOOL_DIR=) is the
+	// documented opt-out — message bodies must not be written to disk —
+	// so the state-root default applies only when the variable is
+	// ABSENT, mirroring BUSY_REACTION's lookup-presence handling.
+	if _, spoolSet := lookup("INBOUND_SPOOL_DIR"); !spoolSet && cfg.inboundSpoolDir == "" {
 		if stateRoot := getenv("GC_SERVICE_STATE_ROOT"); stateRoot != "" {
 			cfg.inboundSpoolDir = filepath.Join(stateRoot, "data", "inbound-spool")
 		}
@@ -1719,25 +1722,8 @@ func handlePublish(cfg config, reg *identityRegistry, userAliases *userAliasMap,
 		// removal failures are logged and never affect the receipt. The
 		// dedup-replay path above returns earlier without re-checking:
 		// the original delivery already consumed the mark.
-		if receipt.Delivered && cfg.busyReaction != "" && req.ReplyToMessageID != "" {
-			if markedTS, ok := cfg.busyMarks.take(req.Conversation.ConversationID, req.ReplyToMessageID); ok {
-				go func(channel, ts, emoji string) {
-					resp, err := removeReactionFromSlack(cfg.slackBotToken, slackReactionsAddReq{
-						Channel:   channel,
-						Name:      emoji,
-						Timestamp: ts,
-					})
-					if err != nil {
-						log.Printf("busy reaction remove failed: chan=%s ts=%s emoji=%s: %v", channel, ts, emoji, err)
-						return
-					}
-					// "no_reaction" is benign: the emoji already came off
-					// (human removed it, or the add never landed).
-					if !resp.OK && resp.Error != "no_reaction" {
-						log.Printf("busy reaction remove: chan=%s ts=%s emoji=%s: slack error=%s", channel, ts, emoji, resp.Error)
-					}
-				}(req.Conversation.ConversationID, markedTS, cfg.busyReaction)
-			}
+		if receipt.Delivered {
+			clearBusyMark(cfg, req.Conversation.ConversationID, req.ReplyToMessageID)
 		}
 		// Remember delivered receipts so a subsequent retry with the same
 		// idempotency key replays this receipt instead of re-posting. Put
@@ -1902,6 +1888,9 @@ func handlePublishFile(cfg config, reg *identityRegistry) http.HandlerFunc {
 
 		receipt.Delivered = true
 		receipt.FileID = urlResp.FileID
+		// A threaded file reply is the agent's answer too — clear the
+		// busy mark exactly like a text publish (codex round 2).
+		clearBusyMark(cfg, req.Conversation.ConversationID, req.ReplyToMessageID)
 		writeJSON(w, receipt)
 	}
 }
@@ -2218,6 +2207,42 @@ func handleReact(cfg config) http.HandlerFunc {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(receipt)
+	}
+}
+
+// clearBusyMark consumes the pending busy mark for a delivered reply
+// into (conversationID, threadKey) and removes the busy emoji from
+// the marked message. Shared by handlePublish and handlePublishFile —
+// either reply shape (text or file) is the agent's answer, so a
+// file-only reply must clear the hourglass exactly like a text one
+// (codex round 2). take() defers to an in-flight reactions.add (the
+// add's completer then owns the removal); an expired or absent mark
+// is a no-op.
+func clearBusyMark(cfg config, conversationID, threadKey string) {
+	if cfg.busyReaction == "" || conversationID == "" || threadKey == "" {
+		return
+	}
+	if markedTS, ok := cfg.busyMarks.take(conversationID, threadKey); ok {
+		go removeBusyEmoji(cfg, conversationID, markedTS, "remove")
+	}
+}
+
+// removeBusyEmoji fires one best-effort reactions.remove for the busy
+// emoji on (channel, ts). tag distinguishes the log lines per removal
+// path. "no_reaction" is benign: the emoji already came off (human
+// removed it, or the add never landed).
+func removeBusyEmoji(cfg config, channel, ts, tag string) {
+	resp, err := removeReactionFromSlack(cfg.slackBotToken, slackReactionsAddReq{
+		Channel:   channel,
+		Name:      cfg.busyReaction,
+		Timestamp: ts,
+	})
+	if err != nil {
+		log.Printf("busy reaction %s failed: chan=%s ts=%s emoji=%s: %v", tag, channel, ts, cfg.busyReaction, err)
+		return
+	}
+	if !resp.OK && resp.Error != "no_reaction" {
+		log.Printf("busy reaction %s: chan=%s ts=%s emoji=%s: slack error=%s", tag, channel, ts, cfg.busyReaction, resp.Error)
 	}
 }
 
@@ -2847,7 +2872,12 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 	// are logged and don't block the dispatch path. BUSY_REACTION=
 	// (set-but-empty) disables this block entirely — no reaction, no
 	// mark.
-	if target != "" && cfg.slackBotToken != "" && cfg.busyReaction != "" {
+	// recentlyCleared gates the whole lifecycle (codex round 2): a
+	// Slack redelivery of an event whose reply already consumed the
+	// mark would re-add an hourglass gc's inbound dedup guarantees no
+	// second reply will ever clear.
+	if target != "" && cfg.slackBotToken != "" && cfg.busyReaction != "" &&
+		!cfg.busyMarks.recentlyCleared(msg.Channel, msg.TS) {
 		displaced := cfg.busyMarks.mark(msg.Channel, busyThreadKey(msg.ThreadTS, msg.TS), msg.TS)
 		for _, oldTS := range displaced {
 			go func(channel, ts, emoji string) {
@@ -2940,6 +2970,15 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 				} else {
 					reactAliasDispatchFailure(cfg.slackBotToken,
 						inbound.Conversation.ConversationID, inbound.ProviderMessageID)
+					// The addressed session never got the message — no
+					// reply is coming to clear the busy mark, and TTL
+					// expiry only forgets it without removing the
+					// Slack-side emoji (codex round 2). takeExact spares
+					// a newer re-target's mark; the in-flight-add case
+					// defers to the add's completer.
+					if cfg.busyMarks.takeExact(msg.Channel, msg.ThreadTS, msg.TS) {
+						go removeBusyEmoji(cfg, msg.Channel, msg.TS, "alias-failure remove")
+					}
 					if spoolPath != "" {
 						log.Printf("alias dispatch failed chan=%s ts=%s target=%q (dead-letter=%s)",
 							inbound.Conversation.ConversationID, inbound.ProviderMessageID,

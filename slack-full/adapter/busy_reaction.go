@@ -119,16 +119,44 @@ type busyReactionRegistry struct {
 	mu      sync.Mutex
 	entries map[busyReactionKey]busyReactionMark
 	adds    map[busyAddKey]*busyAddState
+	// cleared records (channel, messageTS) pairs whose busy mark a
+	// reply recently consumed. A Slack redelivery of the same event
+	// (webhook 200 lost) would otherwise re-mark and re-add the emoji
+	// on a message gc deduped away — no second reply is coming, so
+	// the re-added hourglass would stick until TTL. Entries expire
+	// after busyClearedTTL and are swept opportunistically.
+	cleared map[busyAddKey]time.Time
 	// now is the clock; nil means time.Now. Injectable so tests can
 	// drive TTL expiry without sleeping.
 	now func() time.Time
 }
 
+// busyClearedTTL bounds how long a consumed message blocks re-marking.
+// Slack retries a lost webhook ack within minutes; five minutes
+// comfortably covers the redelivery window while keeping the map
+// small.
+const busyClearedTTL = 5 * time.Minute
+
 func newBusyReactionRegistry() *busyReactionRegistry {
 	return &busyReactionRegistry{
 		entries: make(map[busyReactionKey]busyReactionMark),
 		adds:    make(map[busyAddKey]*busyAddState),
+		cleared: make(map[busyAddKey]time.Time),
 	}
+}
+
+// recentlyCleared reports whether a reply already consumed a busy
+// mark for (channel, messageTS) within busyClearedTTL. The caller
+// must then skip the whole mark+add lifecycle for that message — it
+// is a redelivery of an event whose reply already happened.
+func (r *busyReactionRegistry) recentlyCleared(channel, messageTS string) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	at, ok := r.cleared[busyAddKey{channel: channel, messageTS: messageTS}]
+	return ok && r.clock().Sub(at) <= busyClearedTTL
 }
 
 func (r *busyReactionRegistry) clock() time.Time {
@@ -234,11 +262,49 @@ func (r *busyReactionRegistry) take(channel, threadKey string) (messageTS string
 	if r.clock().Sub(m.addedAt) > busyReactionTTL {
 		return "", false
 	}
+	r.cleared[busyAddKey{channel: channel, messageTS: m.messageTS}] = r.clock()
 	if st, ok := r.adds[busyAddKey{channel: channel, messageTS: m.messageTS}]; ok {
 		st.cleared = true
 		return "", false
 	}
 	return m.messageTS, true
+}
+
+// takeExact consumes the mark for messageTS under its possible keys
+// (thread root and own ts) ONLY while the entries still point at that
+// exact message — a newer re-target's mark is never touched. Backs
+// the alias-dispatch-failure cleanup: the addressed session never got
+// the message, no reply is coming, and TTL expiry would only forget
+// the mark without removing the Slack-side emoji. removeNow reports
+// whether the caller owes the reactions.remove (the add already
+// landed); when the add is still in flight the removal is delegated
+// to its completer exactly like take.
+func (r *busyReactionRegistry) takeExact(channel, threadTS, messageTS string) (removeNow bool) {
+	if r == nil || channel == "" || messageTS == "" {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	keys := []string{busyThreadKey(threadTS, messageTS)}
+	if threadTS != "" && threadTS != messageTS {
+		keys = append(keys, messageTS)
+	}
+	found := false
+	for _, k := range keys {
+		key := busyReactionKey{channel: channel, threadKey: k}
+		if m, ok := r.entries[key]; ok && m.messageTS == messageTS {
+			delete(r.entries, key)
+			found = true
+		}
+	}
+	if !found {
+		return false
+	}
+	if st, ok := r.adds[busyAddKey{channel: channel, messageTS: messageTS}]; ok {
+		st.cleared = true
+		return false
+	}
+	return true
 }
 
 // confirmAdd records that the asynchronous reactions.add for
@@ -314,6 +380,11 @@ func (r *busyReactionRegistry) sweepLocked(now time.Time) {
 	for k, st := range r.adds {
 		if now.Sub(st.startAt) > busyReactionTTL {
 			delete(r.adds, k)
+		}
+	}
+	for k, at := range r.cleared {
+		if now.Sub(at) > busyClearedTTL {
+			delete(r.cleared, k)
 		}
 	}
 }
