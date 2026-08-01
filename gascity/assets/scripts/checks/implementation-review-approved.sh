@@ -37,6 +37,34 @@ if [ -z "$SCOPE_REF" ]; then
   SCOPE_REF="$(metadata_value "$ROOT_JSON" "gc.step_ref")"
 fi
 
+# Interactive human gate (interaction_mode=interactive): the loop stage
+# records the explicit human verdict in workflow-root metadata. The gate
+# is authoritative over the machine verdict — a human "request changes"
+# after the apply lane emitted done must force another iteration, and an
+# unanswered gate must not pass. Autonomous/headless runs never set the
+# key, so an empty gate falls through to the verdict logic unchanged.
+REVIEW_GATE="$(metadata_value "$PARENT_JSON" "gc.build.review_gate")"
+case "$REVIEW_GATE" in
+  ""|approved)
+    ;;
+  waiting-human)
+    echo "Implementation review awaiting the human gate decision"
+    exit 1
+    ;;
+  revision_requested)
+    echo "Implementation review needs another iteration: human requested changes"
+    exit 1
+    ;;
+  rejected)
+    echo "Implementation review rejected by the human gate"
+    exit 1
+    ;;
+  *)
+    echo "Implementation review gate in unrecognized state: $REVIEW_GATE"
+    exit 1
+    ;;
+esac
+
 MATCHES="$(gc bd list --all --metadata-field "gc.root_bead_id=$PARENT_ROOT" --json --limit=0 2>/dev/null || printf '[]')"
 
 VERDICT="$(printf '%s\n' "$MATCHES" | jq -r --arg attempt "$ATTEMPT" '

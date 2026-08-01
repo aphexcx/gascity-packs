@@ -62,8 +62,15 @@ This is not a timeout-driven task.
 
 Record exactly one terminal workflow-root metadata value after explicit human
 feedback: `gc.build.plan_review_gate=approved`, `rejected`, or
-`revision_requested`. Use `approved` only after explicit human approval,
-`revision_requested` when the plan must be revised before decomposition, and
-`rejected` when the build must not proceed. On `revision_requested`, route the
-plan back for updates before closing this stage. Close fail only for explicit
+`revision_requested`. Use `approved` only after explicit human approval, and
+`rejected` when the build must not proceed. Close fail only for explicit
 rejection or abort, not for silence.
+
+`revision_requested` is NOT terminal — no downstream stage loops back to the
+plan, so the revision loop lives here. On `revision_requested`: revise the
+plan in place per the human's findings (record what changed and why in the
+plan-review notes), re-review it, reset
+`gc.build.plan_review_gate=waiting-human`, clear
+`gc.build.plan_review_gate_mail_sent` so the human is notified again, and
+repeat the gate wait. In `interactive` mode, close pass ONLY after
+`gc.build.plan_review_gate=approved` is recorded.

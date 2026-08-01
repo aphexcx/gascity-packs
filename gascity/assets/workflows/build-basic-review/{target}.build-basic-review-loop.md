@@ -58,9 +58,20 @@ Record exactly one terminal workflow-root metadata value after explicit human
 feedback: `gc.build.review_gate=approved`, `rejected`, or
 `revision_requested`. Use `approved` only after explicit human approval,
 `revision_requested` when required fixes remain, and `rejected` when the
-build must not proceed. On `revision_requested`, treat the human findings as
-required fixes and run another loop iteration instead of closing. Close fail
-only for explicit rejection or abort, not for silence.
+build must not proceed. Close fail only for explicit rejection or abort, not
+for silence.
+
+On `revision_requested`, before closing this bead:
+
+1. Persist the human findings: append them to the starter review summary at
+   `code_review.report_path` under a dated "Human review round" heading, so
+   the next iteration's lanes and apply step consume them as required fixes.
+2. Clear `gc.build.review_gate_mail_sent` on the workflow root so the next
+   gate round notifies the human again.
+3. Close this bead per its contract. The implementation review check reads
+   `gc.build.review_gate=revision_requested` and schedules the next loop
+   iteration — the gate metadata, not this bead staying open, is what drives
+   the iteration.
 
 Do not invoke provider-native subagents. Continue only through this Gas City
 graph loop.

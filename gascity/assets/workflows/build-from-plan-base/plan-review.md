@@ -48,12 +48,27 @@ This is not a timeout-driven task.
 
 Record exactly one terminal workflow-root metadata value after explicit human
 feedback: `gc.build.plan_review_gate=approved`, `rejected`, or
-`revision_requested`. Use `approved` only after explicit human approval,
-`revision_requested` when the plan must be revised before decomposition, and
+`revision_requested`. Use `approved` only after explicit human approval, and
 `rejected` when the continuation must not proceed. Close fail only for
 explicit rejection or abort, not for silence.
 
+`revision_requested` is NOT terminal for this stage — there is no downstream
+loopback (the sole successor, prepare-decompose, requires an approved plan),
+so the revision loop lives here. On `revision_requested`:
+
+1. Revise the plan artifact in place per the human's findings and record the
+   revision (what changed and why) in the plan-review artifact under a dated
+   "Human revision round" heading.
+2. Re-review the revised plan and update the verdict.
+3. Reset the gate for the next round: set
+   `gc.build.plan_review_gate=waiting-human` and clear
+   `gc.build.plan_review_gate_mail_sent` so the human is notified again.
+4. Repeat the gate wait until the human answers `approved` or `rejected`.
+
 Write the plan-review artifact to `{{plan_review_path}}` when supplied;
-otherwise write it under `{{artifact_root}}`. Close only after an approved or
-equivalent pass verdict is recorded, or after a blocked/changes-required verdict
-is recorded with a concrete reason.
+otherwise write it under `{{artifact_root}}`. In `interactive` mode, close
+pass ONLY after `gc.build.plan_review_gate=approved` is recorded — never with
+a changes-required artifact, which downstream would either stall on or
+mistake for an approved plan. In `autonomous`/`headless` mode, close after an
+approved or equivalent pass verdict is recorded, or after a
+blocked/changes-required verdict is recorded with a concrete reason.

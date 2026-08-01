@@ -59,3 +59,16 @@ feedback: `<gate key>=approved`, `rejected`, or `revision_requested`. Use
 artifact must be revised before the stage can pass, and `rejected` when the
 work must not proceed. Close fail only for explicit rejection or abort, not
 for silence.
+
+`revision_requested` must actually produce another round — recording it and
+closing pass would silently discard the human's findings. Two shapes, chosen
+by the stage:
+
+- Check-driven loop stages (the implementation review loop): persist the
+  findings where the next iteration reads them, clear `<gate key>_mail_sent`,
+  and close per contract — the stage's check reads
+  `<gate key>=revision_requested` and schedules the next iteration.
+- Single-stage gates with no downstream loopback (plan review): revise the
+  artifact in place, re-review, reset `<gate key>=waiting-human`, clear
+  `<gate key>_mail_sent`, and repeat the gate wait. Close pass only after
+  `<gate key>=approved`.
