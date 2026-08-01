@@ -373,35 +373,57 @@ func handleSlackEvents(cfg config) http.HandlerFunc {
 			return
 		}
 
-		// Ack immediately so Slack does not retry, then bridge.
+		// Spool the decoded inbound BEFORE the 200 ack (codex P1):
+		// Slack never redelivers after a 200, and the old order —
+		// ack, then an async users.info lookup (up to 5s), then
+		// spool — left a window where a SIGTERM or crash during an
+		// ordinary restart silently lost an acked mention. The
+		// synchronous cost is one decode + one fsync'd file write,
+		// well inside Slack's 3s ack budget. Enrichment (users.info)
+		// and delivery stay async.
+		if inbound, spoolPath, ok := prepareInbound(cfg, env); ok {
+			w.WriteHeader(http.StatusOK)
+			go finishInbound(cfg, inbound, spoolPath)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
-		go bridgeEvent(cfg, env)
 	}
 }
 
-// bridgeEvent decodes an app_mention and hands it to deliverInbound.
-// Non-app_mention events, bot/system messages, and empty bodies are
-// dropped — Tier 1 handles only direct human mentions. It runs in its own
-// goroutine; each gc call is bounded by gcCallTimeout and the retry
-// schedule bounds the goroutine's total lifetime to ~2 minutes.
+// bridgeEvent runs the full bridge synchronously: prepare (decode,
+// filter, spool) then finish (enrich, deliver). Test seam — the HTTP
+// handler calls the two halves itself so the spool write lands before
+// the Slack ack.
 func bridgeEvent(cfg config, env slackEventEnvelope) {
+	if inbound, spoolPath, ok := prepareInbound(cfg, env); ok {
+		finishInbound(cfg, inbound, spoolPath)
+	}
+}
+
+// prepareInbound decodes and filters an event and, for a deliverable
+// app_mention, builds the inbound message and durably spools it.
+// ok=false means "nothing to bridge" (non-mention, bot/system message,
+// empty body). The Actor's DisplayName is left as the raw user id here
+// — the users.info lookup can take seconds and must not delay the
+// Slack ack; finishInbound resolves it before the forward.
+func prepareInbound(cfg config, env slackEventEnvelope) (externalInboundMessage, string, bool) {
 	if env.Type != "event_callback" || len(env.Event) == 0 {
-		return
+		return externalInboundMessage{}, "", false
 	}
 	var msg slackMessageEvent
 	if err := json.Unmarshal(env.Event, &msg); err != nil {
 		log.Printf("decode slack event: %v", err)
-		return
+		return externalInboundMessage{}, "", false
 	}
 	if msg.Type != "app_mention" {
-		return
+		return externalInboundMessage{}, "", false
 	}
 	if msg.BotID != "" || msg.Subtype != "" || msg.User == "" {
-		return
+		return externalInboundMessage{}, "", false
 	}
 	text := stripLeadingMention(msg.Text)
 	if text == "" {
-		return
+		return externalInboundMessage{}, "", false
 	}
 
 	// Log receipt before the first forward attempt so a message that later
@@ -420,7 +442,7 @@ func bridgeEvent(cfg config, env slackEventEnvelope) {
 		},
 		Actor: externalActor{
 			ID:          msg.User,
-			DisplayName: resolveUserDisplayName(context.Background(), userNames, cfg, msg.User),
+			DisplayName: msg.User,
 		},
 		Text:             text,
 		ExplicitTarget:   cfg.inboundTarget,
@@ -428,7 +450,16 @@ func bridgeEvent(cfg config, env slackEventEnvelope) {
 		DedupKey:         "slack-" + msg.TS,
 		ReceivedAt:       time.Now().UTC(),
 	}
-	deliverInbound(cfg, inbound, spoolInbound(cfg.spoolDir, inbound))
+	return inbound, spoolInbound(cfg.spoolDir, inbound), true
+}
+
+// finishInbound runs the async half of the bridge: display-name
+// enrichment (bounded by userInfoTimeout) and the retried forward.
+// Each gc call is bounded by gcCallTimeout and the retry schedule
+// bounds the goroutine's total lifetime to ~2 minutes.
+func finishInbound(cfg config, inbound externalInboundMessage, spoolPath string) {
+	inbound.Actor.DisplayName = resolveUserDisplayName(context.Background(), userNames, cfg, inbound.Actor.ID)
+	deliverInbound(cfg, inbound, spoolPath)
 }
 
 // spoolInbound persists a decoded inbound event before the first forward
@@ -451,11 +482,51 @@ func spoolInbound(spoolDir string, msg externalInboundMessage) string {
 	}
 	name := fmt.Sprintf("%d-%s.json", time.Now().UnixNano(), sanitizeSpoolName(msg.DedupKey))
 	path := filepath.Join(spoolDir, name)
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	if err := writeSpoolFileAtomic(path, data); err != nil {
 		log.Printf("spool: write %s: %v", path, err)
 		return ""
 	}
 	return path
+}
+
+// writeSpoolFileAtomic writes data to path via a same-dir temp file +
+// fsync + rename (codex P2): a direct write to the replay-visible
+// .json path could be torn by a crash or short write AFTER Slack was
+// acked, and startup replay would then dead-letter the truncated
+// entry with no valid payload left to retry. The temp file is removed
+// on every error path.
+func writeSpoolFileAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, filepath.Base(path)+"-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp in %q: %w", dir, err)
+	}
+	tmpName := f.Name()
+	cleanup := func() { _ = os.Remove(tmpName) }
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		cleanup()
+		return fmt.Errorf("chmod %q: %w", tmpName, err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		cleanup()
+		return fmt.Errorf("write %q: %w", tmpName, err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		cleanup()
+		return fmt.Errorf("sync %q: %w", tmpName, err)
+	}
+	if err := f.Close(); err != nil {
+		cleanup()
+		return fmt.Errorf("close %q: %w", tmpName, err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		cleanup()
+		return fmt.Errorf("rename %q -> %q: %w", tmpName, path, err)
+	}
+	return nil
 }
 
 // spoolNameRE matches characters unsafe in a spool filename.
@@ -554,7 +625,10 @@ func replaySpool(cfg config) {
 		}
 		log.Printf("spool replay: re-delivering %s (chan=%s ts=%s)",
 			e.Name(), msg.Conversation.ConversationID, msg.ProviderMessageID)
-		go deliverInbound(cfg, msg, path)
+		// Entries are spooled before display-name enrichment; finish
+		// it here so a replayed mention carries the same name a live
+		// delivery would.
+		go finishInbound(cfg, msg, path)
 	}
 }
 
@@ -921,12 +995,11 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 
 var (
 	fencedCodeRE = regexp.MustCompile("(?s)```.*?```")
-	inlineCodeRE = regexp.MustCompile("`[^`\n]+`")
 	boldStarsRE  = regexp.MustCompile(`\*\*(.+?)\*\*`)
 	boldUnderRE  = regexp.MustCompile(`__(.+?)__`)
 	strikeRE     = regexp.MustCompile(`~~(.+?)~~`)
-	mdLinkRE     = regexp.MustCompile(`\[([^\]\n]+)\]\((https?://[^)\s]+)\)`)
 	headingRE    = regexp.MustCompile(`(?m)^#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$`)
+	bareURLRE    = regexp.MustCompile(`https?://[^\s<>|]+`)
 )
 
 // slackifyMarkdown converts the GitHub-flavored Markdown constructs agents
@@ -936,6 +1009,11 @@ var (
 // ~~strike~~ → ~strike~, [text](url) → <url|text>, and #-headings →
 // *bold lines* are rewritten. Single-asterisk/underscore emphasis is left
 // untouched so text already written as mrkdwn survives unchanged.
+//
+// Ordering matters (codex P2): links and bare URLs are converted and
+// protected BEFORE the emphasis passes, so a destination like
+// .../pkg/__init__.py or a URL with ** or ~~ in it can never be
+// rewritten into a broken href.
 func slackifyMarkdown(text string) string {
 	if text == "" {
 		return text
@@ -951,16 +1029,126 @@ func slackifyMarkdown(text string) string {
 	if idx := strings.Index(out, "```"); idx >= 0 {
 		out = out[:idx] + protect(out[idx:])
 	}
-	out = inlineCodeRE.ReplaceAllStringFunc(out, protect)
+	out = protectCodeSpans(out, protect)
+	out = convertMarkdownLinks(out, protect)
+	out = bareURLRE.ReplaceAllStringFunc(out, protect)
 	out = headingRE.ReplaceAllString(out, "*$1*")
 	out = boldStarsRE.ReplaceAllString(out, "*$1*")
 	out = boldUnderRE.ReplaceAllString(out, "*$1*")
 	out = strikeRE.ReplaceAllString(out, "~$1~")
-	out = mdLinkRE.ReplaceAllString(out, "<$2|$1>")
 	for i := len(protected) - 1; i >= 0; i-- {
 		out = strings.Replace(out, fmt.Sprintf("\x00%d\x00", i), protected[i], 1)
 	}
 	return out
+}
+
+// protectCodeSpans protects GFM inline code spans, including the
+// multi-backtick form (“span with ` inside“) the old single-backtick
+// regex missed (codex P2) — Go's RE2 has no backreferences, so equal
+// delimiter runs are matched by hand. A span opens with a run of N
+// backticks and closes at the next run of exactly N; runs of other
+// lengths are span content. Spans stay single-line, matching the prior
+// conservatism. An unclosed run passes through unprotected.
+func protectCodeSpans(s string, protect func(string) string) string {
+	var b strings.Builder
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		if c != '`' {
+			b.WriteByte(c)
+			i++
+			continue
+		}
+		j := i
+		for j < len(s) && s[j] == '`' {
+			j++
+		}
+		n := j - i
+		closed := -1
+		k := j
+		for k < len(s) && s[k] != '\n' {
+			if s[k] != '`' {
+				k++
+				continue
+			}
+			m := k
+			for m < len(s) && s[m] == '`' {
+				m++
+			}
+			if m-k == n {
+				closed = m
+				break
+			}
+			k = m
+		}
+		if closed >= 0 && closed > j {
+			b.WriteString(protect(s[i:closed]))
+			i = closed
+			continue
+		}
+		b.WriteString(s[i:j])
+		i = j
+	}
+	return b.String()
+}
+
+// convertMarkdownLinks rewrites [text](http…) into Slack's <url|text>
+// and protects the result. Hand-parsed rather than regex (codex P2):
+// the destination may contain balanced parentheses
+// ([docs](https://host/Function_(mathematics))), which a
+// stop-at-first-')' pattern truncated into a malformed link. The
+// destination ends at the ')' that balances the opener; whitespace or
+// a newline inside aborts the candidate and the text passes through
+// untouched.
+func convertMarkdownLinks(s string, protect func(string) string) string {
+	var b strings.Builder
+	i := 0
+	for i < len(s) {
+		if s[i] != '[' {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+		rel := strings.IndexAny(s[i+1:], "[]\n")
+		if rel < 0 || s[i+1+rel] != ']' {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+		textEnd := i + 1 + rel
+		if textEnd+1 >= len(s) || s[textEnd+1] != '(' {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+		j := textEnd + 2
+		depth := 1
+		for j < len(s) && depth > 0 {
+			switch s[j] {
+			case '(':
+				depth++
+			case ')':
+				depth--
+			case ' ', '\t', '\n':
+				depth = -1
+			}
+			if depth <= 0 {
+				break
+			}
+			j++
+		}
+		linkText := s[i+1 : textEnd]
+		dest := s[textEnd+2 : j]
+		if depth == 0 && linkText != "" &&
+			(strings.HasPrefix(dest, "http://") || strings.HasPrefix(dest, "https://")) {
+			b.WriteString(protect("<" + dest + "|" + linkText + ">"))
+			i = j + 1
+			continue
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
 }
 
 // postToSlack posts a message via chat.postMessage using the bot token.

@@ -721,6 +721,17 @@ func TestSlackifyMarkdown(t *testing.T) {
 		{"handle prefix example", "**mayor:** build is green", "*mayor:* build is green"},
 		{"empty", "", ""},
 		{"plain multiplication untouched", "2 * 3 * 4 = 24", "2 * 3 * 4 = 24"},
+		// codex P2: link destinations must survive the emphasis passes.
+		{"underscores in link destination", "[init](https://host/pkg/__init__.py)", "<https://host/pkg/__init__.py|init>"},
+		{"stars in link destination", "[x](https://host/a**b**c)", "<https://host/a**b**c|x>"},
+		{"underscores in bare url", "see https://host/pkg/__init__.py now", "see https://host/pkg/__init__.py now"},
+		{"tildes in bare url", "https://host/~~archive~~/x", "https://host/~~archive~~/x"},
+		// codex P2: balanced parentheses in link destinations.
+		{"parens in link destination", "[docs](https://host/Function_(mathematics))", "<https://host/Function_(mathematics)|docs>"},
+		{"nested parens with trailing text", "[d](https://h/a_(b_(c))) end", "<https://h/a_(b_(c))|d> end"},
+		// codex P2: multi-backtick code spans protect their contents.
+		{"double backtick span protected", "x ``has `tick` and **raw**`` y", "x ``has `tick` and **raw**`` y"},
+		{"unbalanced backtick run passes through", "a `` b **bold**", "a `` b *bold*"},
 	}
 	for _, tc := range cases {
 		if got := slackifyMarkdown(tc.in); got != tc.want {
@@ -879,5 +890,57 @@ func TestRegisterAdapterSendsReplyInstructions(t *testing.T) {
 	}
 	if strings.Contains(strings.ToLower(got.ReplyInstructions), "prefix") {
 		t.Errorf("reply_instructions must not mandate a handle prefix (hq-dy6): %q", got.ReplyInstructions)
+	}
+}
+
+// codex P1: the decoded mention must be durably spooled BEFORE the
+// handler writes the 200 ack — Slack never redelivers after a 200, so
+// an ack-then-async-spool order loses the message to a crash in the
+// enrichment window. The gc stub never answers successfully, so the
+// entry present right after the handler returns proves the write was
+// synchronous with the request, not the delivery goroutine.
+func TestHandleSlackEventsSpoolsBeforeAck(t *testing.T) {
+	spool := t.TempDir()
+	cfg := config{
+		signingSecret: "s3cr3t",
+		gcAPIBase:     "http://127.0.0.1:1", // refused: delivery cannot win the race
+		cityName:      "test-city",
+		provider:      "slack",
+		workspaceID:   "T1",
+		inboundTarget: "mayor",
+		spoolDir:      spool,
+	}
+	raw, _ := json.Marshal(slackMessageEvent{
+		Type: "app_mention", Channel: "C1", User: "U1", TS: "1.0",
+		Text: "<@BOT> hello",
+	})
+	env, _ := json.Marshal(slackEventEnvelope{Type: "event_callback", Event: raw})
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	req := httptest.NewRequest(http.MethodPost, "/slack/events", strings.NewReader(string(env)))
+	req.Header.Set("X-Slack-Request-Timestamp", ts)
+	req.Header.Set("X-Slack-Signature", signSlack(cfg.signingSecret, ts, env))
+	rec := httptest.NewRecorder()
+	handleSlackEvents(cfg)(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	entries, err := os.ReadDir(spool)
+	if err != nil {
+		t.Fatalf("read spool: %v", err)
+	}
+	var jsons, tmps int
+	for _, e := range entries {
+		switch {
+		case strings.HasSuffix(e.Name(), ".json"):
+			jsons++
+		case strings.Contains(e.Name(), ".tmp"):
+			tmps++
+		}
+	}
+	if jsons != 1 {
+		t.Errorf("spool entries at ack time = %d, want 1 (spool must precede the 200)", jsons)
+	}
+	if tmps != 0 {
+		t.Errorf("atomic spool write left %d tmp files behind", tmps)
 	}
 }

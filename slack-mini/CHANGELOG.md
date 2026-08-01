@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Codex review round on this branch (1 P1 + 4 P2, all fixed): the
+  decoded mention is spooled synchronously BEFORE the events endpoint
+  200-acks Slack (the old ack → async users.info → spool order lost
+  acked mentions to a crash in the enrichment window; enrichment and
+  delivery stay async, and startup replay now finishes enrichment
+  too); spool entries are written atomically (same-dir temp file +
+  fsync + rename) so a torn write can no longer dead-letter an acked
+  message with no valid payload left; Markdown link destinations and
+  bare URLs are converted/protected BEFORE the emphasis passes (a
+  destination like `.../pkg/__init__.py` was being rewritten into a
+  broken href); `[text](url)` parsing handles balanced parentheses in
+  the destination (`.../Function_(mathematics)`); and multi-backtick
+  GFM code spans (``…`` with a backtick inside) pass through
+  verbatim like single-backtick spans.
+
 ### Added
 
 - Inbound mentions resolve the sender's display name via `users.info`
