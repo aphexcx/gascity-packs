@@ -50,10 +50,10 @@ description = """
 Confirm we're in a git repo, resolve the branch, and prepare workspace.
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
     echo "Not in a git repository — cannot ship."
-    bd close "$ROOT_ID" --reason "not a git checkout"
+    gc bd close "$ROOT_ID" --reason "not a git checkout"
     exit 1
 }
 cd "$REPO_ROOT"
@@ -64,7 +64,7 @@ if [ -z "$BRANCH" ]; then
 fi
 if [ -z "$BRANCH" ] || [ "$BRANCH" = "HEAD" ]; then
     echo "On detached HEAD or no branch — cannot ship."
-    bd close "$ROOT_ID" --reason "no branch resolved"
+    gc bd close "$ROOT_ID" --reason "no branch resolved"
     exit 1
 fi
 
@@ -72,14 +72,14 @@ fi
 DEFAULT=$(git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p' || echo "main")
 if [ "$BRANCH" = "$DEFAULT" ] || [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
     echo "Cannot ship from default branch ($BRANCH). Create a feature branch first."
-    bd close "$ROOT_ID" --reason "on default branch"
+    gc bd close "$ROOT_ID" --reason "on default branch"
     exit 1
 fi
 
 mkdir -p .gc/pr-pipeline/ship
 SAFE=$(echo "$BRANCH" | tr '/' '_')
 REPORT_PATH=".gc/pr-pipeline/ship/${SAFE}.md"
-bd update "$ROOT_ID" --notes "branch: $BRANCH
+gc bd update "$ROOT_ID" --notes "branch: $BRANCH
 report_path: $REPORT_PATH
 status: in_progress"
 ```
@@ -144,8 +144,8 @@ echo "[ship] Stage 1 reverted — simplify broke the build"
 Record stage outcome:
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
-bd update "$ROOT_ID" --notes "simplify: <complete | reverted | skipped>
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
+gc bd update "$ROOT_ID" --notes "simplify: <complete | reverted | skipped>
 simplify_commits: <sha1>,<sha2>,..."
 ```
 
@@ -173,7 +173,7 @@ The loop:
 1. Prepare the diff context for this iteration:
 
    ```bash
-   ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+   ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
    git diff origin/main..HEAD > "/tmp/pr-ship-${BRANCH//\\//-}-iter${ITER_N}.patch"
    ```
 
@@ -230,7 +230,7 @@ Record per-iteration state:
 
 ```bash
 ITER_N=<1|2|3>
-bd update "$ROOT_ID" --notes "review_iter_$ITER_N: blockers=<n>, majors=<n>, minors=<n>
+gc bd update "$ROOT_ID" --notes "review_iter_$ITER_N: blockers=<n>, majors=<n>, minors=<n>
 review_panel_$ITER_N: <reviewers run>; dropped=<n high-severity flags refuted in synthesis>
 review_fix_commits_$ITER_N: <sha>,<sha>,..."
 ```
@@ -238,7 +238,7 @@ review_fix_commits_$ITER_N: <sha>,<sha>,..."
 After convergence (or 3-iter cap):
 
 ```bash
-bd update "$ROOT_ID" --notes "review_status: <converged | not_converged>
+gc bd update "$ROOT_ID" --notes "review_status: <converged | not_converged>
 review_final: blockers=<n>, majors=<n>, minors=<n>"
 ```
 
@@ -255,7 +255,7 @@ Read-only mechanical checks. The exact gate set depends on the repo's
 stack; run what's available.
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
 GATES_PASSED=""
 GATES_FAILED=""
 ```
@@ -312,7 +312,7 @@ fi
 Record outcomes:
 
 ```bash
-bd update "$ROOT_ID" --notes "gates_passed:$GATES_PASSED
+gc bd update "$ROOT_ID" --notes "gates_passed:$GATES_PASSED
 gates_failed:$GATES_FAILED"
 ```
 
@@ -333,8 +333,8 @@ Combine all stages into a single report and STOP. This formula does NOT
 push, does NOT open a PR. The caller decides next steps.
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
-NOTES=$(bd show "$ROOT_ID" --json | jq -r '.[0].notes')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
+NOTES=$(gc bd show "$ROOT_ID" --json | jq -r '.[0].notes')
 ```
 
 Write the report to `$REPORT_PATH`:
@@ -391,7 +391,7 @@ Decide verdict mechanically:
 ```bash
 VERDICT="<READY | BLOCKED>"
 BLOCKERS="<one-line summary of what blocks, or 'none'>"
-bd update "$ROOT_ID" --notes "readiness: $VERDICT
+gc bd update "$ROOT_ID" --notes "readiness: $VERDICT
 blockers: $BLOCKERS
 status: complete"
 echo "[ship] Pipeline complete for branch $BRANCH"

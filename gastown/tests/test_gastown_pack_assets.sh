@@ -169,6 +169,8 @@ test_review_leg_contract_forbids_synthetic_mutation() {
         fail "review-leg formula must forbid executing reviewed checklist items"
     grep -F 'Formula-specific non-implementation assignments may explicitly tell you' "$prompt" >/dev/null ||
         fail "polecat prompt must allow formula-specific review/control close steps"
+    ! grep -F '`gc bd close`, `gc bd close`' "$prompt" >/dev/null ||
+        fail "polecat prompt must not duplicate its close prohibition"
     grep -F 'Default implementation formula: `mol-polecat-work`' "$prompt" >/dev/null ||
         fail "polecat prompt must describe mol-polecat-work as the default implementation formula"
     ! grep -F '**You MUST NOT close beads. EVER. No exceptions.**' "$prompt" >/dev/null ||

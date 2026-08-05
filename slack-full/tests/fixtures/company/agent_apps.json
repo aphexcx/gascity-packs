@@ -1,0 +1,15 @@
+{
+  "agent_apps": [
+    {
+      "api_app_id": "A0AAAAAA1",
+      "signing_secret": "0123456789abcdef0123456789abcdef",
+      "team_id": "T0AAAAAAA"
+    },
+    {
+      "api_app_id": "A0AAAAAA2",
+      "signing_secret": "fedcba9876543210fedcba9876543210",
+      "team_id": "T0AAAAAAA"
+    }
+  ],
+  "schema_version": 1
+}

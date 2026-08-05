@@ -331,9 +331,11 @@ git merge-base --is-ancestor origin/$BRANCH origin/main
 ```
 
 If the work is already on main:
-- **Close the bead** (work is done, don't re-dispatch):
+- **Close the bead** (work is done, don't re-dispatch). Use `--force`: the bead
+  is still assigned to the crashed polecat, so this is a cross-actor close and
+  bd's close-authority guard (gastownhall/beads#3734) would otherwise refuse it:
 ```bash
-gc bd close <bead>
+gc bd close <bead> --force
 gc mail send mayor/ -s "ORPHAN_CLOSED: <bead> already merged" \
   -m "Branch $BRANCH already on main. Closed instead of resetting."
 ```
@@ -464,16 +466,28 @@ There are no hardcoded thresholds. Consider the nature of the work, the
 time elapsed, and whether the agent shows any signs of activity. This is
 judgment work — exactly why an LLM does it, not Go code.
 
-**Step 3: For stuck polecats, file a warrant:**
+**Step 3: For stuck polecats, file a warrant (deduped).**
 
 Do NOT kill the agent directly. File a warrant bead and let the dog pool
-handle the shutdown dance (multi-stage interrogation with due process):
+handle the shutdown dance (multi-stage interrogation with due process).
+
+First check for an existing open warrant against the same target — a second
+warrant spawns a second shutdown dance racing the first (duplicate kills,
+wasted dog cycles). Skip filing if one is already open or in progress:
 
 ```bash
-gc bd create --type=task \
-  --title="Stuck: <agent>" \
-  --metadata '{"target":"<session-name>","reason":"No progress on <bead> for <duration>","requester":"witness","gc.routed_to":"{{binding_prefix}}dog"}' \
-  --label=warrant
+TARGET_SESSION="<session-name>"
+EXISTING_WARRANT=$(gc bd list --label=warrant --json --limit=0 \
+  | jq -r --arg t "$TARGET_SESSION" \
+      '[.[] | select((.status == "open" or .status == "in_progress") and (.metadata.target == $t))] | length')
+if [ "${EXISTING_WARRANT:-0}" -gt 0 ]; then
+  echo "Skipping warrant for $TARGET_SESSION — an open warrant already exists."
+else
+  gc bd create --type=task \
+    --title="Stuck: <session-name>" \
+    --metadata '{"target":"<session-name>","reason":"No progress on <bead> for <duration>","requester":"witness","gc.routed_to":"{{binding_prefix}}dog"}' \
+    --label=warrant
+fi
 ```
 
 The dog pool picks up the warrant and runs `mol-shutdown-dance`, which
@@ -515,7 +529,7 @@ Reuse an already-queued wisp instead of pouring a duplicate. A prior cycle
 may have poured a next wisp without burning, or a restart may have raced —
 keep one open patrol wisp and burn any surplus, so wisps never accumulate.
 Wisp roots are `issue_type=molecule` (never `--type=wisp`, which is not a
-valid bd type and matches nothing).
+valid gc bd type and matches nothing).
 ```bash
 OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=0 --json | jq -r '.[].id')
 NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')

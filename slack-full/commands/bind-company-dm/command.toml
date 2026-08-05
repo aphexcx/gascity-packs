@@ -1,0 +1,2 @@
+description = "Record the singleton per-agent DM binding (agent -> session)"
+run = "../bind-company-dm.sh"

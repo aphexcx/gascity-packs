@@ -1,7 +1,7 @@
 
 Recover context from bead metadata, not from a side-channel context file:
 
-1. Read this step bead and the workflow root bead through `bd show --json`.
+1. Read this step bead and the workflow root bead through `gc bd show --json`.
 2. Read `gc.github.implementation_plan_path` and `gc.github.requirements_path` from the
    workflow root or completed implementation-plan/requirements steps.
 3. Validate that `implementation-plan.md` exists. The plan may be `draft` or

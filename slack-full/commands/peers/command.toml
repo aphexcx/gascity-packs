@@ -1,0 +1,2 @@
+description = "Report company rooms, members, wake policy, bindings, and membership warnings"
+run = "../peers.sh"

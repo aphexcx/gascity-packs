@@ -1,10 +1,10 @@
 #!/bin/sh
 set -eu
 
-if ! command -v bd >/dev/null 2>&1; then
-  echo "bd CLI not found"
-  echo "Install or expose the bd binary so the discord pack can manage fix-workflow beads."
+if ! command -v gc >/dev/null 2>&1 || ! gc bd version >/dev/null 2>&1; then
+  echo "gc bd unavailable"
+  echo "Install or expose gc with a working bd backend so the discord pack can manage fix-workflow beads."
   exit 2
 fi
 
-echo "bd CLI available"
+echo "gc bd available"

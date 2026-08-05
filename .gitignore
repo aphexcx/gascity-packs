@@ -1,5 +1,5 @@
 
-# Beads / Dolt files (added by bd init)
+# Beads / Dolt files (added by gc bd init)
 .dolt/
 *.db
 .beads-credential-key
@@ -10,7 +10,7 @@
 !.beads/config.yaml
 !.beads/metadata.json
 
-# bd export artifact auto-staged by pre-commit hook (export.git-add: true in
+# gc bd export artifact auto-staged by pre-commit hook (export.git-add: true in
 # /home/ds/gascity-packs/.beads/config.yaml). Keep it out of repo history —
 # beads issues canonical store is the Dolt DB, not this file.
 /issues.jsonl

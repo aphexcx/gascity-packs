@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "dgroup": {
+    "group_fields": [
+      "T0AAAAAAA",
+      "C0AAAAAAA",
+      "1700000000.000100",
+      "U0AAAAAA1",
+      "ollie-main"
+    ],
+    "expected_lock_name": "dgroup-d696883e507b41cd.lock"
+  },
+  "dgroup_fallback": {
+    "fallback_fields": [
+      "unavailable",
+      "T0AAAAAAA",
+      "C0AAAAAAA",
+      "1700000000.000100",
+      "U0AAAAAA2",
+      "U0AAAAAA1"
+    ],
+    "expected_lock_name": "dgroup-58e6d4f4fb30235f.lock"
+  },
+  "dgser": {
+    "root_fields": [
+      "T0AAAAAAA",
+      "C0AAAAAAA",
+      "1700000000.000100"
+    ],
+    "expected_lock_name": "dgser-5e1ab4a744f4a5e1.lock"
+  }
+}

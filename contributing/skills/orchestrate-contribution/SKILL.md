@@ -75,7 +75,7 @@ When a dispatched step finishes, the worker has recorded its outcome in the
    complete`, the artifact path, and the one recommended next action:
 
    ```bash
-   NOTES=$(bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""')
+   NOTES=$(gc bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""')
    # find-work → report_path:, recommended:, tier counts
    # plan-implementation → plan_path:, plan_status: (or status: blocked + gate:)
    # fine-tune → report_path:, readiness: (ready | blocked), blockers:

@@ -53,18 +53,18 @@ title = "Fetch PR metadata and diff"
 description = """
 Resolve the PR identifier, fetch its data, and prepare the workspace.
 
-**Claim the root bead BEFORE any review work begins.** `bd update --claim`
+**Claim the root bead BEFORE any review work begins.** `gc bd update --claim`
 atomically sets assignee to your session and transitions status to
 `in_progress` (idempotent if already claimed by you). Without the claim,
 the bead stays `OPEN/assignee=none/started=no` while review work is in
 flight, and monitoring reads false stalls.
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
-bd update "$ROOT_ID" --claim
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
+gc bd update "$ROOT_ID" --claim
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
     echo "Not in a git repository — cannot review PR."
-    bd close "$ROOT_ID" --reason "not a git checkout"
+    gc bd close "$ROOT_ID" --reason "not a git checkout"
     exit 1
 }
 cd "$REPO_ROOT"
@@ -97,7 +97,7 @@ Prepare the report path:
 ```bash
 mkdir -p .gc/pr-pipeline/reviews
 REPORT_PATH=".gc/pr-pipeline/reviews/pr-<N>.md"
-bd update "$ROOT_ID" --notes "pr: <N>
+gc bd update "$ROOT_ID" --notes "pr: <N>
 repo: <repo>
 report_path: $REPORT_PATH
 status: in_progress"
@@ -308,10 +308,10 @@ Write the report to `$REPORT_PATH` using this structure:
 Compute the verdict mechanically from finding counts:
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
 # After writing the report, set verdict in bead notes
 VERDICT="<block | request_changes | approve>"
-bd update "$ROOT_ID" --notes "verdict: $VERDICT
+gc bd update "$ROOT_ID" --notes "verdict: $VERDICT
 status: complete"
 echo "[pr-review] Review complete for PR <N>"
 echo "[pr-review]   Verdict: $VERDICT"

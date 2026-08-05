@@ -1,0 +1,53 @@
+# board-watcher — cross-city coordination-board change nudger.
+#
+# One shared implementation both cities run. A snapshot-diff loop polls the
+# coordination board, debounces per-file changes, filters the city's OWN
+# writes via the own-writes hash ledger, and nudges the LOCAL mayor over
+# `gc mail send --notify` when the PEER city adds/updates/removes a board
+# doc. No Slack, no funnel, no cross-city mail — the watcher keeps board
+# changes flowing when those are down, and the poll loop makes catch-up
+# after laptop sleep or downtime automatic.
+#
+# The one per-city config knob is the listing backend (BOARD_WATCHER_MODE):
+# "local-path" scans a board directory on local disk (citadel, or any city
+# running an rsync-pull mirror); "remote-poll" lists the peer's board dir
+# over ssh (boomtown — no local board copy).
+#
+# Pack-shipped binary:
+#
+#   - Watcher (./watcher/gc-board-watcher, built from watcher/*.go). The
+#     [[service]] block below has gc supervise it as a proxy_process: it
+#     binds a Unix domain socket at $GC_SERVICE_SOCKET serving /healthz.
+#     No public listener — the watcher only ever dials out (ssh to the
+#     peer in remote-poll mode, `gc mail send` locally).
+#
+# Pack-shipped command:
+#
+#   - board-record-write (commands/board-record-write.sh): the write-side
+#     hook of the own-write filter. Run it after every own write to the
+#     board; it appends the content hash to the own-writes ledger the
+#     watcher checks before nudging. The ledger format + location is a
+#     documented interop contract (README.md "Own-write ledger",
+#     schema/own_writes.schema.json) so a city may ship its own write
+#     hook (e.g. boomtown's board-post helper: scp + hash-record).
+#
+# Configuration (BOARD_WATCHER_CITY, BOARD_WATCHER_MODE,
+# BOARD_WATCHER_BOARD_PATH, BOARD_WATCHER_SSH_TARGET, poll/debounce
+# windows, mail recipient) is inherited from the service environment at
+# start. See README.md "Configure".
+
+[pack]
+name = "board-watcher"
+version = "0.1.0"
+schema = 2
+
+[[service]]
+name = "board-watcher"
+kind = "proxy_process"
+
+[service.publication]
+visibility = "private"
+
+[service.process]
+command = ["./watcher/gc-board-watcher"]
+health_path = "/healthz"

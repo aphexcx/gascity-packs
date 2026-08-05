@@ -1,0 +1,26 @@
+{
+  "type": "event_callback",
+  "team_id": "T0AAAAAAA",
+  "api_app_id": "A0AAAAAA1",
+  "event_id": "Ev0DMSELF01",
+  "event": {
+    "type": "message",
+    "channel": "D0AAAAAAA",
+    "channel_type": "im",
+    "user": "U0AAAAAA1",
+    "bot_id": "B0AAAAAA1",
+    "app_id": "A0AAAAAA1",
+    "ts": "1700000000.000800",
+    "text": "on it — checking the deploy now.",
+    "bot_profile": {
+      "app_id": "A0AAAAAA1"
+    },
+    "metadata": {
+      "event_type": "gc_dm_reply",
+      "event_payload": {
+        "v": 1,
+        "nonce": "gcs-selfecho00000000001"
+      }
+    }
+  }
+}

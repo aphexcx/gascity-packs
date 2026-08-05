@@ -11,7 +11,7 @@ loop-close handler picks up the root bead close and surfaces the halt to
 the originating Slack thread via the PL.
 
 The molecule root bead IS the control bead — run state is recorded in its
-notes and metadata. Crash-safe: `bd mol current` resumes at the right step.
+notes and metadata. Crash-safe: `gc bd mol current` resumes at the right step.
 
 ## Contract
 
@@ -90,12 +90,12 @@ and scoped to this macro formula.
 
 **1. Find the root bead and confirm we're in a git repo:**
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
     echo "Not in a git repository — cannot plan."
-    bd update "$ROOT_ID" --set-metadata "gc.halt_chain=true" \\
+    gc bd update "$ROOT_ID" --set-metadata "gc.halt_chain=true" \\
                          --set-metadata "summary_for_human=Cannot plan issue #{{issue_number}}: not in a git checkout. No PR opened."
-    bd close "$ROOT_ID" --reason "not a git checkout"
+    gc bd close "$ROOT_ID" --reason "not a git checkout"
     exit 1
 }
 cd "$REPO_ROOT"
@@ -121,7 +121,7 @@ Follow mol-pr-start's six step bodies in order (copy-with-prune from
 
      If either gate triggers:
      ```bash
-     bd update "$ROOT_ID" \\
+     gc bd update "$ROOT_ID" \\
        --set-metadata "gc.halt_chain=true" \\
        --set-metadata "summary_for_human=Issue #{{issue_number}} blocked by <gate>: <detail>. Recommended pivot: <one-line suggestion based on which gate fired>."
      ```
@@ -168,7 +168,7 @@ Implementation rules:
 
 **5. Write evidence on close:**
 ```bash
-bd update "$ROOT_ID" \\
+gc bd update "$ROOT_ID" \\
   --set-metadata "evidence.artifact_path=.gc/pr-pipeline/plans/issue-{{issue_number}}.md" \\
   --set-metadata "evidence.reviewer_verdict=pass" \\
   --set-metadata "evidence.reviewer_agent=<this polecat session>" \\
@@ -193,9 +193,9 @@ flag is present; otherwise close cleanly and proceed.
 
 **1. Find the root bead and read pr-start state:**
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
-HALT=$(bd show "$ROOT_ID" --json | jq -r '.[0].metadata."gc.halt_chain" // "false"')
-VERDICT=$(bd show "$ROOT_ID" --json | jq -r '.[0].metadata."evidence.reviewer_verdict" // ""')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
+HALT=$(gc bd show "$ROOT_ID" --json | jq -r '.[0].metadata."gc.halt_chain" // "false"')
+VERDICT=$(gc bd show "$ROOT_ID" --json | jq -r '.[0].metadata."evidence.reviewer_verdict" // ""')
 ```
 
 **2. Decide:**
@@ -206,15 +206,15 @@ VERDICT=$(bd show "$ROOT_ID" --json | jq -r '.[0].metadata."evidence.reviewer_ve
     itself** (pr-start's internal gates already write specific halt
     summaries). Only write a fallback if the field is still empty:
     ```bash
-    EXISTING=$(bd show "$ROOT_ID" --json | jq -r '.[0].metadata.summary_for_human // ""')
+    EXISTING=$(gc bd show "$ROOT_ID" --json | jq -r '.[0].metadata.summary_for_human // ""')
     if [ -z "$EXISTING" ]; then
-        bd update "$ROOT_ID" --set-metadata \\
+        gc bd update "$ROOT_ID" --set-metadata \\
           "summary_for_human=Halt at gate-after-pr-start for issue #{{issue_number}}: <one-line synthesis of why>. No PR opened."
     fi
     ```
   - Close THIS step with status=closed:
     ```bash
-    bd close "$ROOT_ID" --reason "halt_chain set after pr-start"
+    gc bd close "$ROOT_ID" --reason "halt_chain set after pr-start"
     ```
   - Do NOT proceed. The downstream ship/open-pr steps will not run
     because the chain is halted. The loop-close handler picks up the
@@ -241,15 +241,15 @@ Copy-with-prune from
 
 **1. Find the root bead and resolve the branch:**
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
 REPO_ROOT=$(git rev-parse --show-toplevel)
 cd "$REPO_ROOT"
 BRANCH=$(git branch --show-current)
 DEFAULT=$(git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p' || echo "main")
 if [ "$BRANCH" = "$DEFAULT" ] || [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
-    bd update "$ROOT_ID" --set-metadata "gc.halt_chain=true" \\
+    gc bd update "$ROOT_ID" --set-metadata "gc.halt_chain=true" \\
       --set-metadata "summary_for_human=Cannot ship from default branch ($BRANCH). pr-start did not create a feature branch — chain stopped."
-    bd close "$ROOT_ID" --reason "on default branch"
+    gc bd close "$ROOT_ID" --reason "on default branch"
     exit 0
 fi
 mkdir -p .gc/pr-pipeline/ship
@@ -297,7 +297,7 @@ points to the ship report (`.gc/pr-pipeline/ship/...`) before reading
 it in gate-after-ship.
 
 ```bash
-bd update "$ROOT_ID" \\
+gc bd update "$ROOT_ID" \\
   --set-metadata "evidence.artifact_path=$REPORT_PATH" \\
   --set-metadata "evidence.reviewer_verdict=<pass|blocked>" \\
   --set-metadata "evidence.reviewer_agent=<this polecat session>" \\
@@ -324,9 +324,9 @@ otherwise close cleanly and proceed to open-pr.
 
 **1. Find the root bead and read ship state:**
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
-VERDICT=$(bd show "$ROOT_ID" --json | jq -r '.[0].metadata."evidence.reviewer_verdict" // ""')
-REPORT_PATH=$(bd show "$ROOT_ID" --json | jq -r '.[0].metadata."evidence.artifact_path" // ""')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
+VERDICT=$(gc bd show "$ROOT_ID" --json | jq -r '.[0].metadata."evidence.reviewer_verdict" // ""')
+REPORT_PATH=$(gc bd show "$ROOT_ID" --json | jq -r '.[0].metadata."evidence.artifact_path" // ""')
 ```
 
 **2. Decide:**
@@ -335,16 +335,16 @@ REPORT_PATH=$(bd show "$ROOT_ID" --json | jq -r '.[0].metadata."evidence.artifac
   - Read the blockers section of the ship report at `$REPORT_PATH`.
   - Write `summary_for_human` synthesizing the blockers:
     ```bash
-    bd update "$ROOT_ID" --set-metadata \\
+    gc bd update "$ROOT_ID" --set-metadata \\
       "summary_for_human=Ship gate halted on issue #{{issue_number}}: <one-line blocker summary>. Full readiness report at $REPORT_PATH. Branch left ready for human review — no PR opened."
     ```
   - Set halt_chain:
     ```bash
-    bd update "$ROOT_ID" --set-metadata "gc.halt_chain=true"
+    gc bd update "$ROOT_ID" --set-metadata "gc.halt_chain=true"
     ```
   - Close THIS step:
     ```bash
-    bd close "$ROOT_ID" --reason "ship verdict != pass"
+    gc bd close "$ROOT_ID" --reason "ship verdict != pass"
     ```
   - Do NOT proceed to open-pr.
 
@@ -381,7 +381,7 @@ through to `open-pr`, whose top-of-step check soft-halts at branch-ready
 
 **1. Find the root bead and resolve identifiers:**
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
 AUTO_PUSH="{{auto_push}}"
 ISSUE_NUM={{issue_number}}
 REPO_ROOT=$(git rev-parse --show-toplevel)
@@ -409,11 +409,11 @@ Helper:
 halt_gate() {
     local gate="$1"
     local detail="$2"
-    bd update "$ROOT_ID" \\
+    gc bd update "$ROOT_ID" \\
       --set-metadata "gc.halt_chain=true" \\
       --set-metadata "gc.escalate_to=mayor" \\
       --set-metadata "summary_for_human=Auto-push eligibility halt for issue #${ISSUE_NUM}: ${gate}: ${detail}. Branch ${BRANCH} ready at $(git rev-parse HEAD) for human review. Escalating to mayor for routing decision."
-    bd close "$ROOT_ID" --reason "auto-push gate halt: ${gate}"
+    gc bd close "$ROOT_ID" --reason "auto-push gate halt: ${gate}"
     exit 0
 }
 ```
@@ -421,12 +421,12 @@ halt_gate() {
   a. **kill-switch** (checked first so the gate fails fast when disarmed):
   ```bash
   if [ ! -e "${HOME}/.gc/auto-push-armed.flag" ]; then
-      bd update "$ROOT_ID" \\
+      gc bd update "$ROOT_ID" \\
         --set-metadata "evidence.review_required=true" \\
         --set-metadata "gc.halt_chain=true" \\
         --set-metadata "gc.escalate_to=mayor" \\
         --set-metadata "summary_for_human=Auto-push kill-switch ${HOME}/.gc/auto-push-armed.flag is absent. Halting at branch-ready for issue #${ISSUE_NUM}. Mayor must arm the flag before any auto-push proceeds."
-      bd close "$ROOT_ID" --reason "auto-push gate halt: kill-switch absent"
+      gc bd close "$ROOT_ID" --reason "auto-push gate halt: kill-switch absent"
       exit 0
   fi
   ```
@@ -527,7 +527,7 @@ halt_gate() {
   `metadata.polecat_confidence` written by an earlier step; default
   "medium" treated as gate-fail):
   ```bash
-  CONFIDENCE=$(bd show "$ROOT_ID" --json | jq -r '.[0].metadata.polecat_confidence // "medium"')
+  CONFIDENCE=$(gc bd show "$ROOT_ID" --json | jq -r '.[0].metadata.polecat_confidence // "medium"')
   if [ "$CONFIDENCE" != "high" ]; then
       halt_gate "polecat-confidence" "polecat_confidence=${CONFIDENCE}, required: high"
   fi
@@ -537,7 +537,7 @@ halt_gate() {
 
 ```bash
 BYPASS_TOKEN="auto_push_validated:${ROOT_ID}"
-bd update "$ROOT_ID" \\
+gc bd update "$ROOT_ID" \\
   --set-metadata "evidence.gate_passed=true" \\
   --set-metadata "evidence.auto_push_bypass_token=${BYPASS_TOKEN}" \\
   --set-metadata "evidence.gate_diff_loc=${DIFF_LOC}" \\
@@ -571,12 +571,12 @@ upstream.
 
 **1. Find the root bead and resolve identifiers:**
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
 BRANCH=$(git branch --show-current)
 ISSUE_NUM={{issue_number}}
 SKIP_OPEN_PR="{{skip_open_pr}}"
-GATE_PASSED=$(bd show "$ROOT_ID" --json | jq -r '.[0].metadata."evidence.gate_passed" // ""')
-BYPASS_TOKEN=$(bd show "$ROOT_ID" --json | jq -r '.[0].metadata."evidence.auto_push_bypass_token" // ""')
+GATE_PASSED=$(gc bd show "$ROOT_ID" --json | jq -r '.[0].metadata."evidence.gate_passed" // ""')
+BYPASS_TOKEN=$(gc bd show "$ROOT_ID" --json | jq -r '.[0].metadata."evidence.auto_push_bypass_token" // ""')
 ```
 
 **2. Honor skip_open_pr=true (early-exit before any write):**
@@ -584,13 +584,13 @@ BYPASS_TOKEN=$(bd show "$ROOT_ID" --json | jq -r '.[0].metadata."evidence.auto_p
 If `SKIP_OPEN_PR == "true"`:
 ```bash
 COMMIT_SHA=$(git rev-parse HEAD)
-bd update "$ROOT_ID" \\
+gc bd update "$ROOT_ID" \\
   --set-metadata "evidence.artifact_path=git:$COMMIT_SHA" \\
   --set-metadata "evidence.reviewer_verdict=pass" \\
   --set-metadata "evidence.reviewer_agent=<this polecat session>" \\
   --set-metadata "evidence.branch=$BRANCH" \\
   --set-metadata "summary_for_human=Branch $BRANCH ready at $COMMIT_SHA for issue #$ISSUE_NUM. skip_open_pr=true — no push, no PR. Run: git push <fork-remote> $BRANCH when ready."
-bd close "$ROOT_ID" --reason "skip_open_pr=true; branch ready for human-driven open"
+gc bd close "$ROOT_ID" --reason "skip_open_pr=true; branch ready for human-driven open"
 exit 0
 ```
 
@@ -616,13 +616,13 @@ same shape as the `skip_open_pr=true` exit, distinguishable by
 ```bash
 if [ "$GATE_PASSED" != "true" ]; then
     COMMIT_SHA=$(git rev-parse HEAD)
-    bd update "$ROOT_ID" \\
+    gc bd update "$ROOT_ID" \\
       --set-metadata "evidence.artifact_path=git:$COMMIT_SHA" \\
       --set-metadata "evidence.reviewer_verdict=pass" \\
       --set-metadata "evidence.reviewer_agent=<this polecat session>" \\
       --set-metadata "evidence.branch=$BRANCH" \\
       --set-metadata "summary_for_human=Branch $BRANCH ready at $COMMIT_SHA for issue #$ISSUE_NUM. auto_push not armed (default-deny) — no push, no PR. To proceed: re-sling with --var auto_push=true so the eligibility gate runs, or push manually with: git push <fork-remote> $BRANCH."
-    bd close "$ROOT_ID" --reason "auto_push=false; branch ready, halted at open-pr soft gate"
+    gc bd close "$ROOT_ID" --reason "auto_push=false; branch ready, halted at open-pr soft gate"
     exit 0
 fi
 ```
@@ -676,9 +676,9 @@ our fork":
 
 If you cannot complete this recovery automatically, halt:
 ```bash
-bd update "$ROOT_ID" --set-metadata "gc.halt_chain=true" \\
+gc bd update "$ROOT_ID" --set-metadata "gc.halt_chain=true" \\
   --set-metadata "summary_for_human=Push to fork failed with 403 for branch $BRANCH (maintainerCanModify gap). Implementation is local at $(git rev-parse HEAD); manual supersede-via-our-fork recovery needed before PR can be opened."
-bd close "$ROOT_ID" --reason "push 403; manual recovery required"
+gc bd close "$ROOT_ID" --reason "push 403; manual recovery required"
 exit 0
 ```
 
@@ -715,9 +715,9 @@ if [ "$PR_EXIT" -eq 0 ] && [ -z "$(echo "$PR_URL" | grep -E 'https://[^ ]+/pull/
 fi
 
 if [ "$PR_EXIT" -ne 0 ] || [ -z "$PR_URL" ]; then
-    bd update "$ROOT_ID" --set-metadata "gc.halt_chain=true" \\
+    gc bd update "$ROOT_ID" --set-metadata "gc.halt_chain=true" \\
       --set-metadata "summary_for_human=Branch $BRANCH pushed to fork but gh pr create failed or no PR URL captured. Investigate before retrying."
-    bd close "$ROOT_ID" --reason "gh pr create failed or url empty"
+    gc bd close "$ROOT_ID" --reason "gh pr create failed or url empty"
     exit 0
 fi
 
@@ -738,7 +738,7 @@ fi
 
 **8. Write evidence and summary_for_human:**
 ```bash
-bd update "$ROOT_ID" \\
+gc bd update "$ROOT_ID" \\
   --set-metadata "evidence.artifact_path=github-pr:gastownhall/gascity/$PR_NUM" \\
   --set-metadata "evidence.reviewer_verdict=pass" \\
   --set-metadata "evidence.reviewer_agent=<this polecat session>" \\
@@ -748,7 +748,7 @@ bd update "$ROOT_ID" \\
 
 **9. Close the molecule:**
 ```bash
-bd close "$ROOT_ID" --reason "PR #$PR_NUM opened"
+gc bd close "$ROOT_ID" --reason "PR #$PR_NUM opened"
 ```
 
 **Exit criteria:** PR opened upstream (or halt set with summary_for_human

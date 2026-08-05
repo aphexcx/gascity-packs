@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "team_id": "T0AAAAAAA",
+      "channel_id": "C0AAAAAAA",
+      "ts": "1700000000.000100",
+      "expected_filename": "dg-T0AAAAAAA-C0AAAAAAA-1700000000.000100-5e1ab4a744f4.json"
+    },
+    {
+      "team_id": "T0AAAAAAA",
+      "channel_id": "C/EVIL..X",
+      "ts": "1700000000.000200",
+      "expected_filename": "dg-T0AAAAAAA-hb95f4525220eac1d-1700000000.000200-12f2f67d2e00.json"
+    },
+    {
+      "team_id": "T0AAAAAAA",
+      "channel_id": "C0AAAAAAA",
+      "ts": ".hidden",
+      "expected_filename": "dg-T0AAAAAAA-C0AAAAAAA-h1692419006a88aab-7c70dc6899c8.json"
+    },
+    {
+      "team_id": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+      "channel_id": "C0AAAAAAA",
+      "ts": "1700000000.000300",
+      "expected_filename": "dg-hf5038885a52f64c2-C0AAAAAAA-1700000000.000300-73e32622a8e4.json"
+    },
+    {
+      "team_id": "T0AAAAAAA",
+      "channel_id": "..",
+      "ts": "1700000000.000400",
+      "expected_filename": "dg-T0AAAAAAA-h5ec1f7e700f37c3d-1700000000.000400-39803de46e35.json"
+    }
+  ]
+}

@@ -21,15 +21,13 @@ Prerequisites: Gas City installed and a city running (`gc init`, `gc start`),
 and your project added as a rig (`gc rig add .` inside the repo). See the
 [repository README](../README.md) for the from-scratch path.
 
-1. Import the pack twice — once at city scope for formulas and the mayor
-   skill, once per rig for the worker role agents. From the city directory:
+1. Import formulas, claim command, and rig roles. From city directory:
 
    ```sh
    gc import add --name gc https://github.com/gastownhall/gascity-packs.git//gascity
    ```
 
-   Then add the rig-scoped roles import in `city.toml` and run
-   `gc import install`:
+   Then add rig-scoped roles in `city.toml` and run `gc import install`:
 
    ```toml
    [[rigs]]
@@ -39,8 +37,12 @@ and your project added as a rig (`gc rig add .` inside the repo). See the
    source = "https://github.com/gastownhall/gascity-packs.git//gascity/roles"
    ```
 
-   (Contributors hacking on the pack itself can point either `source` at a
-   local clone, for example `../gascity-packs/gascity`.)
+   Both imports are required. The rig-scoped roles pack supplies agents but,
+   by design, rig imports do not register city commands; importing roles alone
+   renders prompts that reference `gc gc claim` without installing that
+   command. Keep the top-level Gas City pack imported at city scope.
+
+   (Contributors hacking on packs can point this source at a local clone.)
 
 2. Create a bead describing what you want built, and sling the starter
    factory at it:
@@ -138,16 +140,13 @@ the core-injected reserved convoy target; they do not declare `issue`,
 default. Use `same-session` only when preserving one shared worktree and
 conversation is explicitly desired and core shared drain support is available.
 
-The pack ships providerless rig role agents under `gascity/roles`. Standalone use
-requires both imports: the top-level `gc` import for formulas and the mayor
-skill, plus a `gascity/roles` import on each target rig that should run work. A city
-that imports only the formulas can read the mayor skill, but default formula
-steps will not have rig-local `gc.*` role agents to route to.
+The pack ships its city-scoped claim command alongside formulas, plus
+providerless rig role agents under `gascity/roles`. Standalone use requires
+the top-level `gc` import for formulas, mayor skill, and `gc gc claim`, and
+`gascity/roles` on each target rig for `gc.*` role agents.
 
-Import the roles pack for each target rig so work runs in the target
-repository. By default the agents inherit the city/workspace provider; advanced
-users can patch individual roles to a specific provider without overriding
-formulas:
+Import roles for each target rig. By default agents inherit city/workspace
+provider; advanced users can patch individual roles without overriding formulas:
 
 ```toml
 [[rigs]]
@@ -161,9 +160,8 @@ agent = "gc.implementation-worker"
 provider = "your-provider"
 ```
 
-Launch the formulas from the target rig context, or pass your normal
-`--rig <target-rig>` selection so `gc.run-operator` resolves to the rig-local
-role from `gascity/roles`.
+Launch formulas from target rig context, or pass normal `--rig <target-rig>`
+selection so `gc.run-operator` resolves to rig-local role.
 
 Default formula routes use these qualified targets: `gc.run-operator`,
 `gc.requirements-planner`, `gc.design-author`, `gc.task-decomposer`,

@@ -1,0 +1,2 @@
+description = "Show company-room delegation groups, synthesis snapshots, parked receipts, and stale posting intents"
+run = "../company-status.sh"

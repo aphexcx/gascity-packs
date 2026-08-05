@@ -14,7 +14,7 @@ human caller reviews the report and decides which issue to dispatch via
 etc.
 
 The molecule root bead IS the control bead — run state is recorded in its
-notes via `bd update <root-id> --notes "<key>: <value>"`.
+notes via `gc bd update <root-id> --notes "<key>: <value>"`.
 
 ## Contract
 
@@ -52,10 +52,10 @@ title = "Establish working state and verify repo"
 description = """
 **1. Find the root bead and confirm we're in the upstream gascity tree:**
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
     echo "Not in a git repository — cannot triage."
-    bd close "$ROOT_ID" --reason "not a git checkout"
+    gc bd close "$ROOT_ID" --reason "not a git checkout"
     exit 1
 }
 cd "$REPO_ROOT"
@@ -63,10 +63,10 @@ REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
 
 if [ "$REPO" != "gastownhall/gascity" ]; then
     echo "Triage formula is gastownhall/gascity-specific. Got: $REPO"
-    bd update "$ROOT_ID" --notes "status: blocked
+    gc bd update "$ROOT_ID" --notes "status: blocked
 gate: wrong_repo
 detail: $REPO"
-    bd close "$ROOT_ID" --reason "wrong repo for triage"
+    gc bd close "$ROOT_ID" --reason "wrong repo for triage"
     exit 0
 fi
 ```
@@ -74,9 +74,9 @@ fi
 **2. Verify gh auth:**
 ```bash
 gh auth status >/dev/null 2>&1 || {
-    bd update "$ROOT_ID" --notes "status: blocked
+    gc bd update "$ROOT_ID" --notes "status: blocked
 gate: gh_not_authed"
-    bd close "$ROOT_ID" --reason "gh not authenticated"
+    gc bd close "$ROOT_ID" --reason "gh not authenticated"
     exit 1
 }
 ```
@@ -103,7 +103,7 @@ fi
 mkdir -p "$TRIAGE_DIR"
 TRIAGE_PATH="$TRIAGE_DIR/$TS.md"
 
-bd update "$ROOT_ID" --notes "category: $CATEGORY
+gc bd update "$ROOT_ID" --notes "category: $CATEGORY
 limit: $LIMIT
 repo: $REPO
 triage_path: $TRIAGE_PATH
@@ -121,10 +121,10 @@ description = """
 Three lists feed the classification:
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
-TS=$(grep -A1 'triage_path:' <(bd show "$ROOT_ID") | head -1 | sed 's|.*triage/||;s|\\.md$||')
-LIMIT=$(bd show "$ROOT_ID" --json | jq -r '.notes // "" | capture("limit: (?<v>\\\\d+)").v // "10"')
-CATEGORY=$(bd show "$ROOT_ID" --json | jq -r '.notes // "" | capture("category: (?<v>\\\\S+)").v // "all"')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
+TS=$(grep -A1 'triage_path:' <(gc bd show "$ROOT_ID") | head -1 | sed 's|.*triage/||;s|\\.md$||')
+LIMIT=$(gc bd show "$ROOT_ID" --json | jq -r '.notes // "" | capture("limit: (?<v>\\\\d+)").v // "10"')
+CATEGORY=$(gc bd show "$ROOT_ID" --json | jq -r '.notes // "" | capture("category: (?<v>\\\\S+)").v // "all"')
 ```
 
 **1. Open issues (filtered by category):**
@@ -160,7 +160,7 @@ Record counts:
 ISSUE_COUNT=$(jq 'length' /tmp/triage-issues.json)
 OUR_PR_COUNT=$(jq 'length' /tmp/triage-our-prs.json)
 ALL_PR_COUNT=$(jq 'length' /tmp/triage-all-prs.json)
-bd update "$ROOT_ID" --notes "issue_count: $ISSUE_COUNT
+gc bd update "$ROOT_ID" --notes "issue_count: $ISSUE_COUNT
 our_pr_count: $OUR_PR_COUNT
 all_pr_count: $ALL_PR_COUNT"
 ```
@@ -235,8 +235,8 @@ description = """
 Produce the markdown report at the path recorded in step 1.
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
-TRIAGE_PATH=$(bd show "$ROOT_ID" --json | jq -r '.notes // ""' | grep -m1 '^triage_path:' | sed 's/^triage_path: //')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
+TRIAGE_PATH=$(gc bd show "$ROOT_ID" --json | jq -r '.notes // ""' | grep -m1 '^triage_path:' | sed 's/^triage_path: //')
 ```
 
 Report structure:
@@ -307,7 +307,7 @@ TIER3=$(jq '[.[] | select(.tier==3)] | length' /tmp/triage-classified.json)
 TIER4=$(jq '[.[] | select(.tier==4)] | length' /tmp/triage-classified.json)
 RECOMMENDED=$(jq -r '[.[] | select(.tier <= 2)] | sort_by(.tier, -.priority_score) | .[0].number // "none"' /tmp/triage-classified.json)
 
-bd update "$ROOT_ID" --notes "triage_path: $TRIAGE_PATH
+gc bd update "$ROOT_ID" --notes "triage_path: $TRIAGE_PATH
 tier1: $TIER1
 tier2: $TIER2
 tier3: $TIER3
@@ -328,8 +328,8 @@ Display the report path and recommended pick on stdout for the maintenance
 PL to relay back to Slack:
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
-NOTES=$(bd show "$ROOT_ID" --json | jq -r '.notes // ""')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
+NOTES=$(gc bd show "$ROOT_ID" --json | jq -r '.notes // ""')
 TRIAGE_PATH=$(echo "$NOTES" | grep -m1 '^triage_path:' | sed 's/^triage_path: //')
 TIER1=$(echo "$NOTES" | grep -m1 '^tier1:' | sed 's/^tier1: //')
 TIER2=$(echo "$NOTES" | grep -m1 '^tier2:' | sed 's/^tier2: //')
@@ -345,8 +345,8 @@ cat <<EOF
 [pr-triage] Next: human reviews report, picks an issue, dispatches mol-pr-start.
 EOF
 
-bd update "$ROOT_ID" --notes "status: complete"
-bd close "$ROOT_ID" --reason "triage report written: $TRIAGE_PATH"
+gc bd update "$ROOT_ID" --notes "status: complete"
+gc bd close "$ROOT_ID" --reason "triage report written: $TRIAGE_PATH"
 ```
 
 **Exit criteria:** Report path printed, root bead closed with status:complete.

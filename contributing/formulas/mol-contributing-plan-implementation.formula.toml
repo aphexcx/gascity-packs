@@ -15,7 +15,7 @@ BLOCKING early-exit: when a gate the skill defines fires, the orchestration
 records the reason and closes the bead instead of producing a plan.
 
 The molecule root bead IS the control bead — run state is recorded in its
-notes via `bd update <root-id> --notes "<key>: <value>"`.
+notes via `gc bd update <root-id> --notes "<key>: <value>"`.
 
 ## Contract
 
@@ -49,16 +49,16 @@ Resolve the root bead, confirm we are in a git repo, read the issue, and
 record initial state. Pure mechanism — the planning judgment is the skill's.
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
     echo "Not in a git repository — cannot plan."
-    bd close "$ROOT_ID" --reason "not a git checkout"
+    gc bd close "$ROOT_ID" --reason "not a git checkout"
     exit 1
 }
 cd "$REPO_ROOT"
 REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
 gh issue view {{issue}} --repo "$REPO" --json title,body,labels,comments,state
-bd update "$ROOT_ID" --notes "issue: {{issue}}
+gc bd update "$ROOT_ID" --notes "issue: {{issue}}
 repo: $REPO
 repo_root: $REPO_ROOT
 status: in_progress"
@@ -83,19 +83,19 @@ The formula owns only the early-exit mechanic. If a gate fires, record the
 reason and close the bead — do not proceed to planning:
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
-bd update "$ROOT_ID" --notes "status: blocked
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
+gc bd update "$ROOT_ID" --notes "status: blocked
 gate: <competing_pr | architectural_refactor>
 detail: <one-line: which PR / which refactor and why>"
 echo "[contributing-plan-implementation] BLOCKED — <gate>: <detail>"
-bd close "$ROOT_ID" --reason "<gate> for issue #{{issue}}"
+gc bd close "$ROOT_ID" --reason "<gate> for issue #{{issue}}"
 exit 0
 ```
 
 If neither gate fires, record clearance and proceed:
 
 ```bash
-bd update "$ROOT_ID" --notes "gates: cleared"
+gc bd update "$ROOT_ID" --notes "gates: cleared"
 ```
 
 **Exit criteria:** Both gates cleared (or the formula exited via a gate). Root-bead notes record gates: cleared.
@@ -116,11 +116,11 @@ checklist. Do not restate any of that here; run it from the skill.
 Write the skill's structured plan output to the plan path:
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
 mkdir -p .gc/contributing/plans
 PLAN_PATH=".gc/contributing/plans/issue-{{issue}}.md"
 # (write the plan-implementation skill's plan into $PLAN_PATH)
-bd update "$ROOT_ID" --notes "plan_path: $PLAN_PATH
+gc bd update "$ROOT_ID" --notes "plan_path: $PLAN_PATH
 plan_status: finalized
 status: complete"
 cat <<EOF

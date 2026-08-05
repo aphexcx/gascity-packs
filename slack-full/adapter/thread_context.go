@@ -297,7 +297,11 @@ func fetchThreadReplies(ctx context.Context, token, channel, threadTS string, li
 // "" when no messages survive filtering — caller MUST treat that as
 // no-op so empty/short threads, current-message-only callbacks, and
 // replays with no new peer activity carry no preamble overhead.
-func formatThreadContextPreamble(replies []slackThreadMessage, currentTS, sinceTS string) string {
+//
+// resolveName maps a Slack user id to a display name for the author
+// line (hq-uxln9); nil renders the raw id (pre-fix behavior, and what
+// the table tests exercise).
+func formatThreadContextPreamble(replies []slackThreadMessage, currentTS, sinceTS string, resolveName func(string) string) string {
 	var prior []slackThreadMessage
 	for _, m := range replies {
 		if m.TS == "" {
@@ -328,6 +332,9 @@ func formatThreadContextPreamble(replies []slackThreadMessage, currentTS, sinceT
 	b.WriteString("):\n")
 	for _, m := range prior {
 		author := m.User
+		if author != "" && resolveName != nil {
+			author = resolveName(author)
+		}
 		if author == "" {
 			author = "?"
 		}

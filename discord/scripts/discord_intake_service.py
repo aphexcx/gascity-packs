@@ -361,6 +361,17 @@ def rig_from_target(target: str) -> str:
     return rig.strip()
 
 
+def gc_bd_command(city_root: str, *args: str, rig: str = "") -> list[str]:
+    command = [os.environ.get("GC_BIN", "gc")]
+    if city_root not in {"", "."}:
+        command.extend(["--city", city_root])
+    if rig:
+        command.extend(["--rig", rig])
+    command.append("bd")
+    command.extend(args)
+    return command
+
+
 def rig_workdir(rig: str) -> str:
     """Resolve a rig's working directory from .beads/routes.jsonl."""
     root = common.city_root() or "."
@@ -424,10 +435,13 @@ def load_bead_snapshot(bead_id: str, rig: str = "") -> dict[str, Any]:
     normalized_bead_id = str(bead_id).strip()
     if not normalized_bead_id:
         return {}
-    bd_bin = os.environ.get("BD_BIN", "bd")
-    bd_cwd = rig_workdir(rig) or (common.city_root() or ".")
+    city_root = common.city_root() or "."
+    bd_cwd = rig_workdir(rig) or city_root
     try:
-        result = run_subprocess([bd_bin, "show", normalized_bead_id, "--json"], bd_cwd)
+        result = run_subprocess(
+            gc_bd_command(city_root, "show", normalized_bead_id, "--json", rig=rig),
+            bd_cwd,
+        )
     except (DispatchSubprocessTimeout, FileNotFoundError):
         return {}
     if result.returncode != 0:
@@ -499,15 +513,22 @@ def create_fix_bead(request: dict[str, Any], target: str) -> dict[str, Any]:
     if not rig:
         return {"status": "dispatch_failed", "reason": "invalid_dispatch_target"}
     city_root = common.city_root() or "."
-    bd_bin = os.environ.get("BD_BIN", "bd")
     bd_cwd = rig_workdir(rig)
     if not bd_cwd:
         return {"status": "dispatch_failed", "reason": "rig_workdir_missing"}
-    create_command = [bd_bin, "create", "--json", build_fix_bead_title(request), "-t", "task"]
+    create_command = gc_bd_command(
+        city_root,
+        "create",
+        "--json",
+        build_fix_bead_title(request),
+        "-t",
+        "task",
+        rig=rig,
+    )
     try:
         create_result = run_subprocess(create_command, bd_cwd)
     except FileNotFoundError:
-        return {"status": "dispatch_failed", "reason": "bead_create_failed", "dispatch_stderr": "bd not available"}
+        return {"status": "dispatch_failed", "reason": "bead_create_failed", "dispatch_stderr": "gc not available"}
     except DispatchSubprocessTimeout as exc:
         return {
             "status": "dispatch_failed",
@@ -535,7 +556,7 @@ def create_fix_bead(request: dict[str, Any], target: str) -> dict[str, Any]:
     request["status"] = "bead_created"
     common.save_request(request)
 
-    update_command = [bd_bin, "update", bead_id, "--notes", build_fix_bead_notes(request)]
+    update_command = gc_bd_command(city_root, "update", bead_id, "--notes", build_fix_bead_notes(request), rig=rig)
     metadata = {
         "discord_request_id": str(request.get("request_id", "")),
         "discord_guild_id": str(request.get("guild_id", "")),
@@ -554,7 +575,7 @@ def create_fix_bead(request: dict[str, Any], target: str) -> dict[str, Any]:
             "status": "dispatch_failed",
             "reason": "bead_update_failed",
             "bead_id": bead_id,
-            "dispatch_stderr": "bd not available",
+            "dispatch_stderr": "gc not available",
         }
     except DispatchSubprocessTimeout as exc:
         return {
@@ -594,7 +615,6 @@ def close_failed_bead(bead_id: str, reason: str, rig: str = "") -> bool:
     bead_id = bead_id.strip()
     if not bead_id:
         return True
-    bd_bin = os.environ.get("BD_BIN", "bd")
     city_root = common.city_root() or "."
     if rig:
         bd_cwd = rig_workdir(rig)
@@ -605,11 +625,18 @@ def close_failed_bead(bead_id: str, reason: str, rig: str = "") -> bool:
     try:
         # Prefer closing a failed bead even if we could not persist the close_reason metadata.
         run_subprocess(
-            [bd_bin, "update", bead_id, "--set-metadata", f"close_reason=discord:{reason or 'dispatch_failed'}"],
+            gc_bd_command(
+                city_root,
+                "update",
+                bead_id,
+                "--set-metadata",
+                f"close_reason=discord:{reason or 'dispatch_failed'}",
+                rig=rig,
+            ),
             bd_cwd,
         )
-        run_subprocess([bd_bin, "ready", bead_id], bd_cwd)
-        result = run_subprocess([bd_bin, "close", bead_id], bd_cwd)
+        run_subprocess(gc_bd_command(city_root, "ready", bead_id, rig=rig), bd_cwd)
+        result = run_subprocess(gc_bd_command(city_root, "close", bead_id, rig=rig), bd_cwd)
     except (DispatchSubprocessTimeout, FileNotFoundError):
         return False
     return result.returncode == 0

@@ -21,15 +21,18 @@
     "scopes": {
       "bot": [
         "channels:history",
+        "channels:read",
         "chat:write",
         "chat:write.customize",
         "commands",
         "files:read",
         "files:write",
         "groups:history",
+        "groups:read",
         "im:history",
         "mpim:history",
-        "reactions:write"
+        "reactions:write",
+        "users:read"
       ]
     }
   },

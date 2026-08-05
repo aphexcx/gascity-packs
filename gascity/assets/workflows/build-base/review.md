@@ -14,13 +14,13 @@ and its reason must be recorded in the review artifact.
 
 Write the review report to the resolved review report path and record that path
 on the workflow root bead as `gc.build.review_report_path` before closing. Use
-`bd update "<workflow-root-id>" --set-metadata "gc.build.review_report_path=<absolute path>"`.
-Do not use `bd update --metadata 'key=value'`; `--metadata` only accepts a JSON
+`gc bd update "<workflow-root-id>" --set-metadata "gc.build.review_report_path=<absolute path>"`.
+Do not use `gc bd update --metadata 'key=value'`; `--metadata` only accepts a JSON
 object.
 Before closing this step, set the claimed step outcome with
-`bd update "<claimed-step-id>" --set-metadata "gc.outcome=pass"`, then close
-with `bd close "<claimed-step-id>" --reason "<concise reason>"`. Do not pass
-`--metadata` or `--set-metadata` to `bd close`.
+`gc bd update "<claimed-step-id>" --set-metadata "gc.outcome=pass"`, then close
+with `gc bd close "<claimed-step-id>" --reason "<concise reason>"`. Do not pass
+`--metadata` or `--set-metadata` to `gc bd close`.
 
 Close this step only when the implementation is clean enough to finalize or when unresolved findings are recorded.
 

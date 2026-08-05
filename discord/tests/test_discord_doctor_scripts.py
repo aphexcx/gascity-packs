@@ -3,6 +3,7 @@ from __future__ import annotations
 import pathlib
 import subprocess
 import tempfile
+import tomllib
 import unittest
 
 import os
@@ -15,6 +16,7 @@ class DiscordDoctorScriptTests(unittest.TestCase):
         self._old_environ = os.environ.copy()
         os.environ["GC_CITY_ROOT"] = self.tempdir.name
         self.script = pathlib.Path(__file__).resolve().parents[1] / "doctor" / "check-legacy-pack-conflict.sh"
+        self.bd_doctor = pathlib.Path(__file__).resolve().parents[1] / "doctor" / "bd" / "doctor.toml"
 
     def tearDown(self) -> None:
         os.environ.clear()
@@ -35,6 +37,13 @@ class DiscordDoctorScriptTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 2)
         self.assertIn("legacy discord-intake state detected", result.stdout)
+
+    def test_bd_doctor_describes_the_store_aware_gc_wrapper(self) -> None:
+        with self.bd_doctor.open("rb") as handle:
+            doctor = tomllib.load(handle)
+
+        self.assertIn("gc bd", doctor["description"])
+        self.assertNotIn("bd CLI", doctor["description"])
 
 
 if __name__ == "__main__":

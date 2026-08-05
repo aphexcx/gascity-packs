@@ -16,7 +16,7 @@ B1-B36 checklist — live in the `review` skill, which is the single source of
 truth. The steps below say *apply the skill*; they do not restate it.
 
 The molecule root bead IS the control bead — run state is recorded in its
-notes via `bd update <root-id> --notes "<key>: <value>"`.
+notes via `gc bd update <root-id> --notes "<key>: <value>"`.
 
 ## Contract
 
@@ -58,10 +58,10 @@ Confirm we are in a git repo and resolve where the report lands. Pure
 mechanism — the audit is the skill's job.
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
     echo "Not in a git repository — cannot run the codebase check."
-    bd close "$ROOT_ID" --reason "not a git checkout"
+    gc bd close "$ROOT_ID" --reason "not a git checkout"
     exit 1
 }
 cd "$REPO_ROOT"
@@ -73,7 +73,7 @@ if [ -z "$KEY" ]; then
 fi
 mkdir -p .gc/contributing/reviews
 REPORT_PATH=".gc/contributing/reviews/${KEY}.md"
-bd update "$ROOT_ID" --notes "base: ${BASE:-<skill-resolved upstream main>}
+gc bd update "$ROOT_ID" --notes "base: ${BASE:-<skill-resolved upstream main>}
 key: $KEY
 report_path: $REPORT_PATH
 status: in_progress"
@@ -100,9 +100,9 @@ regression or an unwaived B-rule blocker is `block`/`request_changes`; an
 all-green or minors-only result is `approve`. Record it:
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
 VERDICT="<block | request_changes | approve>"
-bd update "$ROOT_ID" --notes "verdict: $VERDICT
+gc bd update "$ROOT_ID" --notes "verdict: $VERDICT
 status: report_written"
 ```
 
@@ -118,8 +118,8 @@ Display the report path and verdict on stdout for the caller, then close the
 root bead. No fixes are applied here.
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
-NOTES=$(bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
+NOTES=$(gc bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""')
 REPORT_PATH=$(echo "$NOTES" | grep -m1 '^report_path:' | sed 's/^report_path: //')
 VERDICT=$(echo "$NOTES" | grep -m1 '^verdict:' | sed 's/^verdict: //')
 cat <<EOF
@@ -127,8 +127,8 @@ cat <<EOF
 [contributing-review]   Verdict: $VERDICT
 [contributing-review]   Path: $REPORT_PATH
 EOF
-bd update "$ROOT_ID" --notes "status: complete"
-bd close "$ROOT_ID" --reason "contributor codebase review written: $REPORT_PATH"
+gc bd update "$ROOT_ID" --notes "status: complete"
+gc bd close "$ROOT_ID" --reason "contributor codebase review written: $REPORT_PATH"
 ```
 
 **Exit criteria:** Report path + verdict printed, root bead closed with status:complete.

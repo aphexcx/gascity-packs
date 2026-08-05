@@ -8,8 +8,8 @@ path, then `cd "$WORKTREE"` before reading or editing source files. If
 
 Do not infer the source anchor from dependency ids such as the
 `prepare-worktree` step. Read the claimed step bead's `gc.root_bead_id`, read
-that do-work root with `bd show <root-bead-id> --json`, then read the root
-metadata `gc.input_convoy_id`. Read that input convoy with `bd show
+that do-work root with `gc bd show <root-bead-id> --json`, then read the root
+metadata `gc.input_convoy_id`. Read that input convoy with `gc bd show
 <input-convoy-id> --json`; if the JSON output is a one-element list, unwrap the
 first element before reading metadata. If the input convoy has
 `gc.synthetic_kind=drain-unit-convoy`, use its `gc.drain_member_id` as the

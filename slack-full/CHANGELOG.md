@@ -30,14 +30,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the pack stays bot-token-only (the app must never act as a human
   user); the limitation is documented in the verb help instead.
 
-### Fixed
-
-- `slack_intake_common._maybe_load_adapter_env` now strips the shell
-  `export ` prefix when parsing the adapter env file. The live file is
-  written shell-style (`export SLACK_BOT_TOKEN=...`, sourced by the
-  adapter's run.sh), so every key previously parsed as `export KEY` and
-  the loader silently loaded nothing — unnoticed until `gc slack read`
-  became the first pack command to need `SLACK_BOT_TOKEN` in-process.
+- `gc slack upload` accepts `--conversation-id` (plus `--kind
+  dm|room|thread`, default `room`), the file-side twin of
+  `publish-to-channel` (ci-ta49 / gp-8z7): an explicit channel id
+  skips the extmsg-binding lookup and posts the file straight to the
+  adapter's `/publish-file` (files-upload-v2), so sessions with no
+  binding — mayor, chief-of-staff — can attach files to any channel
+  they were addressed from. Implies `--via adapter` (gc's
+  outbound-file endpoint requires a binding; combining with `--via
+  gc` errors), rejects `--thread-current` (its latest-inbound lookup
+  is binding-oriented; pass `--thread-ts` explicitly), and mirrors
+  publish-to-channel's receipt gate — exit 1 when the adapter
+  returns `delivered=false`. The default binding paths are
+  unchanged, including their exit-0-on-undelivered contract (now
+  pinned by a regression test).
 
 - Busy-reaction lifecycle (hq-xizo, ported from
   `feat/hq-xizo-slack-full-hardening`): a targeted inbound gets a busy
@@ -84,10 +90,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parsed from the message (`@handle:` prefix, User Group mention, or
   sticky thread handle) — plain messages that reach a session solely
   through a channel binding carry no parsed target and get no busy
-  reaction, by design. (hw-94w5k finding #3)
+  reaction, by design. (hw-94w5k finding #3) gp-4vq widens the gate to
+  @-mentions of the adapter's own bot user — see Fixed below.
 
 ### Fixed
 
+- `slack_intake_common._maybe_load_adapter_env` now strips the shell
+  `export ` prefix when parsing the adapter env file. The live file is
+  written shell-style (`export SLACK_BOT_TOKEN=...`, sourced by the
+  adapter's run.sh), so every key previously parsed as `export KEY` and
+  the loader silently loaded nothing — unnoticed until `gc slack read`
+  became the first pack command to need `SLACK_BOT_TOKEN` in-process.
+- The busy reaction now fires when a human @-mentions the adapter's
+  bot user (gp-4vq): live traffic showed the affordance never fired in
+  practice because nobody addresses agents with the `@handle:` prefix
+  syntax — real messages tag the bot with Slack's native `<@U…>`
+  mention, which parsed as no-target. A mention of the adapter's OWN
+  bot user id (read from the event envelope's `authorizations` block,
+  is_bot-gated; the `app_mention` event type is the fallback signal
+  when a delivery omits it) anywhere in the text now makes the inbound
+  busy-eligible. Routing is deliberately untouched: no `ExplicitTarget`
+  is fabricated (a synthetic target would read as "addressed to someone
+  else" to the channel-bound session and mute it) and no alias dispatch
+  fires. Slack delivers a bot mention twice — `message` + `app_mention`
+  events with distinct event_ids for one ts (hw-vzd5y edge case 2, now
+  with production evidence) — and both deliveries mark the same ts:
+  the registry's same-message merge keeps a single mark, the second
+  `reactions.add` is Slack's benign `already_reacted`, and the reply
+  removes the reaction exactly once. The inbound log line gains
+  `bot_mention=%t` for live verification. Binding-routed generic
+  messages (no tag at all) still get no busy reaction — gc-side
+  routing feedback for those is the tier-2 follow-up spec'd in
+  hw-94w5k notes.
+- Inbound messages now resolve Slack user ids to display names
+  (hq-uxln9, ported from slack-mini's hq-fh9 fix): the sender line in
+  gc's injected reminder shows a human name instead of a raw id like
+  `U0AN32RPBFT`, inline `<@U…>` mentions in forwarded body text are
+  rewritten to `@display-name`, and thread-context preamble author
+  lines resolve the same way. Backed by a users.info lookup with an
+  in-memory TTL cache (1h success / 5m negative); any lookup failure
+  falls back to the raw id (mention tokens are left verbatim, or use
+  their `<@U…|label>` label when present). Requires the `users:read`
+  scope — without it, behavior is unchanged. The alias-dispatch
+  (`@handle:`) system-reminder's sender line renders the same way —
+  `by user Afik Cohen (U0…)` instead of the bare id. The
+  operator-curated `slack-user-aliases.json` map is consulted first
+  (inverse lookup, id → handle): a curated identity renders as its gc
+  handle with no Slack call at all, so locked-down workspaces missing
+  `users:read` still get names for the identities the operator cares
+  about.
 - Slack Events API redeliveries are now deduplicated on `event_id`
   with a 10-minute seen-set: Slack retries any delivery it considers
   unacknowledged and each retry re-forwarded the same message into the

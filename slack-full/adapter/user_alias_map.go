@@ -157,6 +157,31 @@ func (m *userAliasMap) rewrite(text string) string {
 	})
 }
 
+// handleForUserID is the inbound inverse of the outbound rewrite: given a
+// raw Slack user id, return the curated gc handle whose mention token
+// targets it. Lets inbound rendering (hq-uxln9) show the operator's name
+// for an identity without any Slack API call — locked-down workspaces
+// missing users:read still get names for the identities the operator
+// curated. When several handles map to the same id the lexicographically
+// smallest wins, keeping the answer deterministic across reloads. The map
+// is tiny (operator-curated), so a linear scan beats maintaining a second
+// index under the same lock.
+func (m *userAliasMap) handleForUserID(id string) (string, bool) {
+	if m == nil || id == "" {
+		return "", false
+	}
+	mention := "<@" + id + ">"
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	best := ""
+	for h, target := range m.byHandle {
+		if target == mention && (best == "" || h < best) {
+			best = h
+		}
+	}
+	return best, best != ""
+}
+
 // Len returns the number of bindings currently loaded. Used by the
 // startup / SIGHUP log lines so operators can confirm a reload picked up
 // an edit.

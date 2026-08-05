@@ -14,7 +14,7 @@ the `map-blast-radius` skill, which is the single source of truth. The steps
 below say *apply the skill*; they do not restate it.
 
 The molecule root bead IS the control bead — run state is recorded in its
-notes via `bd update <root-id> --notes "<key>: <value>"`.
+notes via `gc bd update <root-id> --notes "<key>: <value>"`.
 
 ## Contract
 
@@ -52,10 +52,10 @@ the decomposition into analyzable targets is the skill's job; here we only
 establish where the report lands.
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
     echo "Not in a git repository — cannot map blast radius."
-    bd close "$ROOT_ID" --reason "not a git checkout"
+    gc bd close "$ROOT_ID" --reason "not a git checkout"
     exit 1
 }
 cd "$REPO_ROOT"
@@ -65,7 +65,7 @@ if [ -z "$KEY" ]; then
 fi
 mkdir -p .gc/contributing/blast-radius
 REPORT_PATH=".gc/contributing/blast-radius/${KEY}.md"
-bd update "$ROOT_ID" --notes "scope: {{scope}}
+gc bd update "$ROOT_ID" --notes "scope: {{scope}}
 key: $KEY
 report_path: $REPORT_PATH
 status: in_progress"
@@ -90,9 +90,9 @@ step recorded (`report_path:` in the root-bead notes) — do not assume
 After writing the report, finalize:
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
-REPORT_PATH=$(bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""' | grep -m1 '^report_path:' | sed 's/^report_path: //')
-bd update "$ROOT_ID" --notes "status: complete"
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
+REPORT_PATH=$(gc bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""' | grep -m1 '^report_path:' | sed 's/^report_path: //')
+gc bd update "$ROOT_ID" --notes "status: complete"
 echo "[contributing-map-blast-radius] Complete for: {{scope}}"
 echo "[contributing-map-blast-radius]   Path: $REPORT_PATH"
 ```

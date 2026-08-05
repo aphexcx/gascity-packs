@@ -5,7 +5,7 @@ verification policy, validate context path {{context_path}} when set, implement
 the item, write an item summary, and close only the source anchor on success.
 
 Do not infer the source anchor from dependency ids. Read the reserved convoy and
-source anchor metadata directly; when `bd show --json` returns a one-element
+source anchor metadata directly; when `gc bd show --json` returns a one-element
 list, unwrap the first element before reading metadata. `gc.work_dir` is the
 launcher rig root, not the implementation location. Use the authoritative
 worktree recorded on the source anchor, run `cd "$WORKTREE"`, and verify

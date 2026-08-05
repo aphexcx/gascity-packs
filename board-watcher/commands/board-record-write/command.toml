@@ -1,0 +1,2 @@
+description = "Record an own coordination-board write in the board-watcher hash ledger"
+run = "../board-record-write.sh"

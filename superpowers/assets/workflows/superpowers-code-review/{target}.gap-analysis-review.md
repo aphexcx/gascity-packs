@@ -71,16 +71,16 @@ Close with `gc.outcome=pass`, `code_review.gap_verdict=approve|iterate`,
 `code_review.output_path=<gap-analysis report path>`.
 
 Use the exact claimed bead id when updating metadata. Do not pass freeform notes
-or additional positional arguments to `bd update`; unquoted words can resolve to
+or additional positional arguments to `gc bd update`; unquoted words can resolve to
 unrelated beads. Use this command shape:
 
 ```bash
-bd update "$CLAIMED_BEAD_ID" \
+gc bd update "$CLAIMED_BEAD_ID" \
   --set-metadata 'gc.outcome=pass' \
   --set-metadata 'code_review.gap_verdict=approve' \
   --set-metadata 'code_review.gap_report_path=<gap-analysis report path>' \
   --set-metadata 'code_review.output_path=<gap-analysis report path>'
-bd close "$CLAIMED_BEAD_ID" --reason 'Gap-analysis review approved with no required findings.'
+gc bd close "$CLAIMED_BEAD_ID" --reason 'Gap-analysis review approved with no required findings.'
 ```
 
 Do not set `code_review.verdict` or `code_review.report_path`; the

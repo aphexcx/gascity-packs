@@ -13,7 +13,7 @@ live in the `find-work` skill, which is the single source of truth. The
 steps below say *apply the skill*; they do not restate it.
 
 The molecule root bead IS the control bead — run state is recorded in its
-notes via `bd update <root-id> --notes "<key>: <value>"`.
+notes via `gc bd update <root-id> --notes "<key>: <value>"`.
 
 ## Contract
 
@@ -53,25 +53,25 @@ verify gh auth, and record the run vars + output path. This is pure
 mechanism — no triage judgment happens here.
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
     echo "Not in a git repository — cannot triage."
-    bd close "$ROOT_ID" --reason "not a git checkout"
+    gc bd close "$ROOT_ID" --reason "not a git checkout"
     exit 1
 }
 cd "$REPO_ROOT"
 REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
 if [ "$REPO" != "gastownhall/gascity" ]; then
-    bd update "$ROOT_ID" --notes "status: blocked
+    gc bd update "$ROOT_ID" --notes "status: blocked
 gate: wrong_repo
 detail: $REPO"
-    bd close "$ROOT_ID" --reason "wrong repo for contributor triage"
+    gc bd close "$ROOT_ID" --reason "wrong repo for contributor triage"
     exit 0
 fi
 gh auth status >/dev/null 2>&1 || {
-    bd update "$ROOT_ID" --notes "status: blocked
+    gc bd update "$ROOT_ID" --notes "status: blocked
 gate: gh_not_authed"
-    bd close "$ROOT_ID" --reason "gh not authenticated"
+    gc bd close "$ROOT_ID" --reason "gh not authenticated"
     exit 1
 }
 ```
@@ -95,11 +95,11 @@ mkdir -p "$REPORT_DIR"
 # Resume-safe: reuse the report path already recorded in the root-bead notes;
 # only mint a fresh timestamp on the first run, so re-running setup after an
 # interruption does not orphan a partial report under a new path.
-REPORT_PATH=$(bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""' | grep -m1 '^report_path:' | sed 's/^report_path: //')
+REPORT_PATH=$(gc bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""' | grep -m1 '^report_path:' | sed 's/^report_path: //')
 if [ -z "$REPORT_PATH" ]; then
     REPORT_PATH="$REPORT_DIR/$(date +%Y%m%d-%H%M%S).md"
 fi
-bd update "$ROOT_ID" --notes "category: $CATEGORY
+gc bd update "$ROOT_ID" --notes "category: $CATEGORY
 limit: $LIMIT
 repo: $REPO
 report_path: $REPORT_PATH
@@ -132,9 +132,9 @@ recommended next pick in the root-bead notes so the caller can act without
 re-reading the file:
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
-REPORT_PATH=$(bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""' | grep -m1 '^report_path:' | sed 's/^report_path: //')
-bd update "$ROOT_ID" --notes "tier1: <n>
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
+REPORT_PATH=$(gc bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""' | grep -m1 '^report_path:' | sed 's/^report_path: //')
+gc bd update "$ROOT_ID" --notes "tier1: <n>
 tier2: <n>
 tier3: <n>
 tier4: <n>
@@ -155,8 +155,8 @@ close the root bead. No further work happens — the caller reviews the
 report and decides which issue to dispatch via `mol-contributing-plan-implementation`.
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
-NOTES=$(bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
+NOTES=$(gc bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""')
 REPORT_PATH=$(echo "$NOTES" | grep -m1 '^report_path:' | sed 's/^report_path: //')
 RECOMMENDED=$(echo "$NOTES" | grep -m1 '^recommended:' | sed 's/^recommended: //')
 cat <<EOF
@@ -165,8 +165,8 @@ cat <<EOF
 [contributing-find-work]   Recommended next pick: #$RECOMMENDED
 [contributing-find-work] Next: review the report, then dispatch mol-contributing-plan-implementation --var issue=<N>.
 EOF
-bd update "$ROOT_ID" --notes "status: complete"
-bd close "$ROOT_ID" --reason "contributor triage report written: $REPORT_PATH"
+gc bd update "$ROOT_ID" --notes "status: complete"
+gc bd close "$ROOT_ID" --reason "contributor triage report written: $REPORT_PATH"
 ```
 
 **Exit criteria:** Report path printed, root bead closed with status:complete.

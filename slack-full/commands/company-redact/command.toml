@@ -1,0 +1,2 @@
+description = "Redact the raw stored body of one company-room receipt, leaving the receipt and its digest intact"
+run = "../company-redact.sh"

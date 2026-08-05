@@ -342,10 +342,10 @@ func dispatchRigFixFromViewSubmission(
 }
 
 // runRigDispatch performs the two subprocess legs of a rig-target
-// dispatch: `bd create` inside the rig workdir to mint a task bead,
+// dispatch: `gc bd create` inside the rig workdir to mint a task bead,
 // then `gc sling <target> <bead_id> [--on <fix_formula>] [--var k=v]…`
 // from the city root to invoke dispatch. Failures at the gc-sling leg
-// trigger a best-effort `bd close <bead_id> -r dispatch_failed` so the
+// trigger a best-effort `gc bd close <bead_id> -r dispatch_failed` so the
 // orphan task does not show up as queued work.
 //
 // Empty fixFormula deliberately omits the --on flag (cby.18.3 design
@@ -357,38 +357,38 @@ func dispatchRigFixFromViewSubmission(
 // intake (gc-cby.18.4) to pipe captured summary/context_markdown to
 // the dispatched formula.
 func runRigDispatch(workdir, cityPath, target, fixFormula, title, rigName string, vars map[string]string) {
-	beadID, err := runBdCreate(workdir, title)
+	beadID, err := runBdCreate(workdir, cityPath, rigName, title)
 	if err != nil {
-		log.Printf("rig dispatch: bd create in %s rig=%q: %v", workdir, rigName, err)
+		log.Printf("rig dispatch: gc bd create in %s rig=%q: %v", workdir, rigName, err)
 		return
 	}
 	if err := runGcSling(cityPath, target, beadID, fixFormula, vars); err != nil {
 		log.Printf("rig dispatch: gc sling target=%q bead=%s rig=%q: %v",
 			target, beadID, rigName, err)
-		closeOrphanBead(workdir, beadID)
+		closeOrphanBead(workdir, cityPath, rigName, beadID)
 		return
 	}
 	log.Printf("rig dispatch: bead=%s -> sling=%s formula=%q rig=%q OK",
 		beadID, target, fixFormula, rigName)
 }
 
-// runBdCreate invokes `bd create --json <title> -t task` inside the
+// runBdCreate invokes `gc bd create --json <title> -t task` inside the
 // rig workdir and returns the parsed bead id from stdout.
-func runBdCreate(workdir, title string) (string, error) {
-	cmd := dispatchExecCommand("bd", "create", "--json", title, "-t", "task")
+func runBdCreate(workdir, cityPath, rigName, title string) (string, error) {
+	cmd := dispatchExecCommand("gc", "--city", cityPath, "--rig", rigName, "bd", "create", "--json", title, "-t", "task")
 	cmd.Dir = workdir
 	out, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("bd create exec in %q: %w", workdir, err)
+		return "", fmt.Errorf("gc bd create exec in %q: %w", workdir, err)
 	}
 	var rec struct {
 		ID string `json:"id"`
 	}
 	if err := json.Unmarshal(out, &rec); err != nil {
-		return "", fmt.Errorf("decode bd create output (%q): %w", string(out), err)
+		return "", fmt.Errorf("decode gc bd create output (%q): %w", string(out), err)
 	}
 	if rec.ID == "" {
-		return "", fmt.Errorf("bd create returned empty id (output %q)", string(out))
+		return "", fmt.Errorf("gc bd create returned empty id (output %q)", string(out))
 	}
 	return rec.ID, nil
 }
@@ -427,11 +427,11 @@ func runGcSling(cityPath, target, beadID, fixFormula string, vars map[string]str
 // after `gc sling` failed. Errors are logged and swallowed — the bead
 // is already orphaned at this point and a closure failure is at most a
 // queued-work display nit, not a correctness issue.
-func closeOrphanBead(workdir, beadID string) {
-	cmd := dispatchExecCommand("bd", "close", beadID, "-r", "dispatch_failed")
+func closeOrphanBead(workdir, cityPath, rigName, beadID string) {
+	cmd := dispatchExecCommand("gc", "--city", cityPath, "--rig", rigName, "bd", "close", beadID, "-r", "dispatch_failed")
 	cmd.Dir = workdir
 	if out, err := cmd.CombinedOutput(); err != nil {
-		log.Printf("rig dispatch: bd close %s in %q: %v (output=%q)",
+		log.Printf("rig dispatch: gc bd close %s in %q: %v (output=%q)",
 			beadID, workdir, err, string(out))
 		return
 	}

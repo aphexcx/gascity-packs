@@ -1,0 +1,19 @@
+{
+  "id": "in-T0GOLDEN0-C0GOLDEN0-1700000000.000123-743aa4097b7e",
+  "generation": 1,
+  "schema_version": 1,
+  "origin": {
+    "team_id": "T0GOLDEN0",
+    "channel_id": "C0GOLDEN0",
+    "ts": "1700000000.000123"
+  },
+  "event_id": "Ev0GOLDEN0",
+  "api_app_id": "A0GOLDEN0",
+  "retry_num": 0,
+  "received_at": "2026-07-19T00:00:00Z",
+  "updated_at": "2026-07-19T00:00:00Z",
+  "status": "received",
+  "body_ref": "in-T0GOLDEN0-C0GOLDEN0-1700000000.000123-743aa4097b7e",
+  "event_digest": "ba4bdcea92aa469a254c07ebae38e5ad6fb2b4c5a8aca11a74a3743c6b5c84fd",
+  "thread_root_ts": "1700000000.000123"
+}

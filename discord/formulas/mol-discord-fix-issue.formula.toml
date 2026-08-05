@@ -68,13 +68,13 @@ message when work begins.
 **1. Prime the session:**
 ```bash
 gc prime
-bd prime
+gc bd prime
 ```
 
 **2. Inspect the bead and source context:**
 ```bash
-bd show {{issue}}
-bd show {{issue}} --json | jq '.metadata'
+gc bd show {{issue}}
+gc bd show {{issue}} --json | jq '.metadata'
 ```
 
 Read the bead notes carefully. They contain:
@@ -84,7 +84,7 @@ Read the bead notes carefully. They contain:
 
 **3. Post the "work started" Discord message exactly once:**
 ```bash
-STARTED=$(bd show {{issue}} --json | jq -r '.metadata.discord_fix_started_message_id // empty')
+STARTED=$(gc bd show {{issue}} --json | jq -r '.metadata.discord_fix_started_message_id // empty')
 if [ -z "$STARTED" ]; then
   REQUESTER=$(python3 - <<'PY'
 import base64
@@ -109,7 +109,7 @@ EOF
   MESSAGE_JSON=$(gc discord post-message --request-id {{discord_request_id}} --body-file "$BODY")
   MESSAGE_ID=$(printf '%s' "$MESSAGE_JSON" | jq -r '.id // empty')
   if [ -n "$MESSAGE_ID" ]; then
-    bd update {{issue}} --set-metadata discord_fix_started_message_id="$MESSAGE_ID"
+    gc bd update {{issue}} --set-metadata discord_fix_started_message_id="$MESSAGE_ID"
   fi
   rm -f "$BODY"
 fi
@@ -132,7 +132,7 @@ git fetch --prune origin
 
 **2. Reuse or create the bead-scoped worktree:**
 ```bash
-WORKTREE=$(bd show {{issue}} --json | jq -r '.metadata.work_dir // empty')
+WORKTREE=$(gc bd show {{issue}} --json | jq -r '.metadata.work_dir // empty')
 if [ -n "$WORKTREE" ] && [ -d "$WORKTREE" ]; then
   cd "$WORKTREE"
 else
@@ -141,19 +141,19 @@ else
   WORKTREE_PATH="$WORKTREE_ROOT/{{issue}}"
   git worktree add "$WORKTREE_PATH" --detach origin/$(git remote show origin | sed -n '/HEAD branch/s/.*: //p')
   cd "$WORKTREE_PATH"
-  bd update {{issue}} --set-metadata work_dir="$WORKTREE_PATH"
+  gc bd update {{issue}} --set-metadata work_dir="$WORKTREE_PATH"
 fi
 ```
 
 **3. Reuse or create the branch:**
 ```bash
-BRANCH=$(bd show {{issue}} --json | jq -r '.metadata.branch // empty')
+BRANCH=$(gc bd show {{issue}} --json | jq -r '.metadata.branch // empty')
 if [ -n "$BRANCH" ]; then
   git checkout "$BRANCH" 2>/dev/null || git checkout -b "$BRANCH"
 else
   BRANCH="fix-discord-{{issue}}"
   git checkout -b "$BRANCH"
-  bd update {{issue}} --set-metadata branch="$BRANCH"
+  gc bd update {{issue}} --set-metadata branch="$BRANCH"
 fi
 ```
 
@@ -179,7 +179,7 @@ Take a read-first pass so you understand the problem before changing code.
 
 **2. Record the working theory in bead notes:**
 ```bash
-CURRENT_NOTES=$(bd show {{issue}} --json | jq -r '.notes // empty')
+CURRENT_NOTES=$(gc bd show {{issue}} --json | jq -r '.notes // empty')
 NOTES_FILE=$(mktemp)
 cat >"$NOTES_FILE" <<EOF
 $CURRENT_NOTES
@@ -195,7 +195,7 @@ $CURRENT_NOTES
 ### Test plan
 - <the failing test you will write first>
 EOF
-bd update {{issue}} --notes "$(cat "$NOTES_FILE")"
+gc bd update {{issue}} --notes "$(cat "$NOTES_FILE")"
 rm -f "$NOTES_FILE"
 ```
 
@@ -248,8 +248,8 @@ same thread can be used again later.
 
 **1. Capture the branch and validation summary:**
 ```bash
-BRANCH=$(bd show {{issue}} --json | jq -r '.metadata.branch // empty')
-WORKTREE=$(bd show {{issue}} --json | jq -r '.metadata.work_dir // empty')
+BRANCH=$(gc bd show {{issue}} --json | jq -r '.metadata.branch // empty')
+WORKTREE=$(gc bd show {{issue}} --json | jq -r '.metadata.work_dir // empty')
 ```
 
 **2. Attempt the completion message:**
@@ -283,7 +283,7 @@ gc_discord_fix_cleanup() {
 }
 trap gc_discord_fix_cleanup EXIT
 if command -v gt >/dev/null 2>&1; then
-  if ! bd ready {{issue}}; then
+  if ! gc bd ready {{issue}}; then
     echo "error: failed to ready bead {{issue}} before gt done" >&2
     RELEASE_WORKFLOW=0
     exit 1
@@ -311,18 +311,18 @@ else
       RELEASE_WORKFLOW=0
       exit 1
     fi
-    if ! bd update {{issue}} --unset-metadata work_dir; then
+    if ! gc bd update {{issue}} --unset-metadata work_dir; then
       echo "error: failed to clear work_dir metadata for {{issue}}" >&2
       RELEASE_WORKFLOW=0
       exit 1
     fi
   fi
-  if ! bd ready {{issue}}; then
+  if ! gc bd ready {{issue}}; then
     echo "error: failed to ready bead {{issue}}" >&2
     RELEASE_WORKFLOW=0
     exit 1
   fi
-  if ! bd close {{issue}}; then
+  if ! gc bd close {{issue}}; then
     echo "error: failed to close bead {{issue}}" >&2
     RELEASE_WORKFLOW=0
     exit 1

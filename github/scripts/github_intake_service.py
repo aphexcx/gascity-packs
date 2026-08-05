@@ -122,6 +122,17 @@ def rig_from_target(target: str) -> str:
     return rig.strip()
 
 
+def gc_bd_command(city_root: str, *args: str, rig: str = "") -> list[str]:
+    command = [os.environ.get("GC_BIN", "gc")]
+    if city_root not in {"", "."}:
+        command.extend(["--city", city_root])
+    if rig:
+        command.extend(["--rig", rig])
+    command.append("bd")
+    command.extend(args)
+    return command
+
+
 def rig_workdir(rig: str) -> str:
     """Resolve a rig's working directory from .beads/routes.jsonl."""
     root = common.city_root() or "."
@@ -292,13 +303,20 @@ def create_fix_bead(request: dict[str, Any], target: str) -> dict[str, Any]:
     if not rig:
         return {"status": "dispatch_failed", "reason": "invalid_dispatch_target"}
     city_root = common.city_root() or "."
-    bd_bin = os.environ.get("BD_BIN", "bd")
     bd_cwd = rig_workdir(rig) or city_root
-    create_command = [bd_bin, "create", "--json", build_fix_bead_title(request), "-t", "task"]
+    create_command = gc_bd_command(
+        city_root,
+        "create",
+        "--json",
+        build_fix_bead_title(request),
+        "-t",
+        "task",
+        rig=rig,
+    )
     try:
         create_result = run_subprocess(create_command, bd_cwd)
     except FileNotFoundError:
-        return {"status": "dispatch_failed", "reason": "bead_create_failed", "dispatch_stderr": "bd not available"}
+        return {"status": "dispatch_failed", "reason": "bead_create_failed", "dispatch_stderr": "gc not available"}
     if create_result.returncode != 0:
         return {
             "status": "dispatch_failed",
@@ -327,7 +345,7 @@ def create_fix_bead(request: dict[str, Any], target: str) -> dict[str, Any]:
         "github_default_branch": str(request.get("repository_default_branch", "") or "main"),
         "github_comment_author": str(request.get("comment_author", "")),
     }
-    update_command = [bd_bin, "update", bead_id, "--notes", build_fix_bead_notes(request)]
+    update_command = gc_bd_command(city_root, "update", bead_id, "--notes", build_fix_bead_notes(request), rig=rig)
     for key, value in metadata.items():
         if value:
             update_command.extend(["--set-metadata", f"{key}={value}"])
@@ -338,7 +356,7 @@ def create_fix_bead(request: dict[str, Any], target: str) -> dict[str, Any]:
             "status": "dispatch_failed",
             "reason": "bead_update_failed",
             "bead_id": bead_id,
-            "dispatch_stderr": "bd not available",
+            "dispatch_stderr": "gc not available",
         }
     if update_result.returncode != 0:
         return {
@@ -369,17 +387,23 @@ def close_failed_bead(bead_id: str, reason: str, rig: str = "") -> bool:
     bead_id = bead_id.strip()
     if not bead_id:
         return True
-    bd_bin = os.environ.get("BD_BIN", "bd")
     city_root = common.city_root() or "."
     bd_cwd = (rig_workdir(rig) or city_root) if rig else city_root
     try:
         set_reason = run_subprocess(
-            [bd_bin, "update", bead_id, "--set-metadata", f"close_reason=github:{reason or 'dispatch_failed'}"],
+            gc_bd_command(
+                city_root,
+                "update",
+                bead_id,
+                "--set-metadata",
+                f"close_reason=github:{reason or 'dispatch_failed'}",
+                rig=rig,
+            ),
             bd_cwd,
         )
         if set_reason.returncode != 0:
             return False
-        result = run_subprocess([bd_bin, "close", bead_id], bd_cwd)
+        result = run_subprocess(gc_bd_command(city_root, "close", bead_id, rig=rig), bd_cwd)
     except FileNotFoundError:
         return False
     return result.returncode == 0
@@ -809,10 +833,9 @@ def addressed_source_metadata(request: dict[str, Any]) -> dict[str, str]:
 
 def addressed_sources_by_key(source_key: str) -> list[dict[str, Any]]:
     city_root = common.city_root() or "."
-    bd_bin = os.environ.get("BD_BIN", "bd")
     result = run_subprocess(
-        [
-            bd_bin,
+        gc_bd_command(
+            city_root,
             "list",
             "--json",
             "--all",
@@ -820,11 +843,11 @@ def addressed_sources_by_key(source_key: str) -> list[dict[str, Any]]:
             f"external.source_key={source_key}",
             "--limit",
             "0",
-        ],
+        ),
         city_root,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"bd list failed: {trim_output(result.stderr or result.stdout)}")
+        raise RuntimeError(f"gc bd list failed: {trim_output(result.stderr or result.stdout)}")
     payload = extract_json_value(result.stdout)
     if not isinstance(payload, list):
         return []
@@ -852,10 +875,9 @@ def create_addressed_source(request: dict[str, Any]) -> dict[str, Any]:
         }
 
     city_root = common.city_root() or "."
-    bd_bin = os.environ.get("BD_BIN", "bd")
     metadata = addressed_source_metadata(request)
-    command = [
-        bd_bin,
+    command = gc_bd_command(
+        city_root,
         "create",
         "--json",
         addressed_source_title(request),
@@ -869,7 +891,7 @@ def create_addressed_source(request: dict[str, Any]) -> dict[str, Any]:
         source_key,
         "--metadata",
         json.dumps(metadata, sort_keys=True),
-    ]
+    )
     try:
         result = run_subprocess(command, city_root)
     except FileNotFoundError:
@@ -1563,10 +1585,10 @@ def process_event_rules(event: str, delivery_id: str, payload: dict[str, Any], a
 
 
 def list_addressed_router_sources(limit: int) -> list[dict[str, Any]]:
-    bd_bin = os.environ.get("BD_BIN", "bd")
+    city_root = common.city_root() or "."
     result = run_subprocess(
-        [
-            bd_bin,
+        gc_bd_command(
+            city_root,
             "list",
             "--json",
             "--status",
@@ -1575,11 +1597,11 @@ def list_addressed_router_sources(limit: int) -> list[dict[str, Any]]:
             "external.kind=addressed-message",
             "--limit",
             str(limit),
-        ],
-        common.city_root() or ".",
+        ),
+        city_root,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"bd list failed: {trim_output(result.stderr or result.stdout)}")
+        raise RuntimeError(f"gc bd list failed: {trim_output(result.stderr or result.stdout)}")
     payload = extract_json_value(result.stdout)
     if not isinstance(payload, list):
         return []
@@ -1587,19 +1609,19 @@ def list_addressed_router_sources(limit: int) -> list[dict[str, Any]]:
 
 
 def update_bead_metadata(bead: str, values: dict[str, str]) -> subprocess.CompletedProcess[str]:
-    bd_bin = os.environ.get("BD_BIN", "bd")
-    command = [bd_bin, "update", bead]
+    city_root = common.city_root() or "."
+    command = gc_bd_command(city_root, "update", bead)
     for key, value in values.items():
         if value:
             command.extend(["--set-metadata", f"{key}={value}"])
-    return run_subprocess(command, common.city_root() or ".")
+    return run_subprocess(command, city_root)
 
 
 def close_addressed_source(source_id: str) -> subprocess.CompletedProcess[str]:
-    bd_bin = os.environ.get("BD_BIN", "bd")
+    city_root = common.city_root() or "."
     return run_subprocess(
-        [bd_bin, "close", source_id, "--reason", "github addressed message dispatched"],
-        common.city_root() or ".",
+        gc_bd_command(city_root, "close", source_id, "--reason", "github addressed message dispatched"),
+        city_root,
     )
 
 
@@ -1700,12 +1722,13 @@ def create_addressed_rig_launch_bead(
     if not rig:
         return {"status": "failed", "reason": "missing_rig"}
     gc_bin = os.environ.get("GC_BIN", "gc")
+    city_root = common.city_root() or "."
     launch_metadata = addressed_rig_launch_metadata(source_id, metadata, target, formula)
-    command = [
-        gc_bin,
-        "--rig",
-        rig,
-        "bd",
+    command = [gc_bin]
+    if city_root not in {"", "."}:
+        command.extend(["--city", city_root])
+    command.extend([
+        "--rig", rig, "bd",
         "create",
         str(source.get("title") or addressed_source_title(metadata)),
         "--type",
@@ -1717,9 +1740,9 @@ def create_addressed_rig_launch_bead(
         "--metadata",
         json.dumps(launch_metadata, sort_keys=True),
         "--json",
-    ]
+    ])
     try:
-        result = run_subprocess(command, common.city_root() or ".")
+        result = run_subprocess(command, city_root)
     except FileNotFoundError:
         return {"status": "failed", "reason": "gc_not_available"}
     if result.returncode != 0:

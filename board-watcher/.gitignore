@@ -1,0 +1,11 @@
+# Built watcher binary — produced by `go build -o gc-board-watcher .` in
+# watcher/ and read in place by the [[service]] proxy_process command.
+# A bare `go build ./...` drops the default-named binary instead; ignore
+# both so local builds keep the worktree clean.
+watcher/gc-board-watcher
+watcher/watcher
+
+# Python test artifacts (tests/test_schemas.py runs under pytest).
+__pycache__/
+.pytest_cache/
+*.pyc
