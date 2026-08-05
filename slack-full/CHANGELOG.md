@@ -10,6 +10,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `gc slack read` (gp-lie): native channel + thread history reads via
+  `conversations.history`/`conversations.replies` using the pack's bot
+  token, closing the last claude.ai-MCP dependency for Slack reads —
+  history recovery now works during MCP outages and even when the local
+  adapter is down. Channel mode returns the newest `--limit` messages
+  rendered oldest → newest; `--thread-ts` reads a thread from its
+  parent; `--oldest`/`--newest` bound the window; cursor pagination and
+  HTTP-429 `Retry-After` retries under the hood. Authors resolve via
+  `users.info` (`--no-names` to skip), attachments print as pointers
+  and `--download` spools them Bearer-authed into the adapter's
+  `$INBOUND_FILE_STORE/<channel>/<ts>-<name>` layout behind the same
+  Slack-host allowlist as the adapter (https, port 443,
+  `*.slack.com`/`*.slack-files.com`, redirects refused so the token
+  can't follow a 3xx off-host). `not_in_channel`, `channel_not_found`,
+  `thread_not_found`, `missing_scope`, and auth failures map to
+  actionable messages. Deliberately no `gc slack search`:
+  `search.messages` accepts only a user token with `search:read` and
+  the pack stays bot-token-only (the app must never act as a human
+  user); the limitation is documented in the verb help instead.
+
+### Fixed
+
+- `slack_intake_common._maybe_load_adapter_env` now strips the shell
+  `export ` prefix when parsing the adapter env file. The live file is
+  written shell-style (`export SLACK_BOT_TOKEN=...`, sourced by the
+  adapter's run.sh), so every key previously parsed as `export KEY` and
+  the loader silently loaded nothing — unnoticed until `gc slack read`
+  became the first pack command to need `SLACK_BOT_TOKEN` in-process.
+
 - Busy-reaction lifecycle (hq-xizo, ported from
   `feat/hq-xizo-slack-full-hardening`): a targeted inbound gets a busy
   reaction (`BUSY_REACTION`, default `hourglass`; set-but-empty

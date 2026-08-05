@@ -74,6 +74,19 @@ Implemented:
 - [x] `gc slack status` — read-only diagnostics (adapters, bindings,
       recent traffic). `--session SID` for one-session detail,
       `--since 5m` for a time window, `--json` for scripting.
+- [x] `gc slack read` — native channel + thread history reads
+      (`conversations.history` / `conversations.replies`) straight off
+      the Slack Web API with the pack's bot token, no claude.ai MCP and
+      no adapter process in the path. `--thread-ts` for threads,
+      `--limit`/`--oldest`/`--newest` for windows, `--download` to
+      spool attachments into the `$INBOUND_FILE_STORE` layout,
+      `--json` for scripting. The bot must be a member of the
+      conversation (`not_in_channel` maps to an invite-the-bot error).
+      There is deliberately NO `gc slack search`: Slack's
+      `search.messages` accepts only a user token with `search:read`,
+      and this pack stays bot-token-only — the app must never act as a
+      human user. Read known channels with `--oldest`/`--newest`
+      windows instead.
 - [x] `gc slack react` — add an emoji reaction to a Slack message
 - [x] `gc slack identity` — register/unregister a per-session
       `chat:write.customize` identity (display name + icon) so each

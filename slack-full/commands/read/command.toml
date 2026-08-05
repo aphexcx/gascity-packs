@@ -1,0 +1,2 @@
+description = "Read Slack channel or thread history natively via the app's bot token"
+run = "../read.sh"

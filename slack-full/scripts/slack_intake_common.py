@@ -45,6 +45,11 @@ def _maybe_load_adapter_env() -> None:
                 continue
             if "=" not in line:
                 continue
+            # The live env file is written shell-style (`export KEY=value`,
+            # sourced by the adapter's run.sh); without stripping the prefix
+            # every key parses as "export KEY" and nothing loads.
+            if line.startswith("export "):
+                line = line[len("export "):]
             key, _, value = line.partition("=")
             key = key.strip()
             value = value.strip()
